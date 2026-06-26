@@ -1,0 +1,9 @@
+# 偉電視管理中心 — 環境變數範本
+#
+# 一鍵部署(Deploy to Cloudflare)時,Cloudflare 會讀這個檔,
+# 在設定畫面「提示你輸入」下列值,並自動存成 Worker secret。
+#
+# 本機開發時可複製成 .dev.vars 使用。
+
+# 管理頁(/admin)的登入密碼 —— 請設一個只有你知道的密碼。
+ADMIN_PASSWORD=

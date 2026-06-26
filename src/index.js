@@ -1,0 +1,777 @@
+/**
+ * 偉電視（WeiTV）直播源同步控制平面 — Cloudflare Worker
+ * ----------------------------------------------------------------
+ * 用途：
+ *   1. 提供安卓電視盒 App 開機/定時輪詢的設定端點（GET /api/config）。
+ *   2. 提供管理員用手機瀏覽器登入的管理頁（GET /admin），可遠端更新「訂閱網址」、
+ *      公告、輪詢間隔、強制刷新旗標。
+ *   3. 提供「測試來源」功能，讓管理員存檔前先確認新 token 的清單網址有效。
+ *
+ * 設計重點：
+ *   - 不依賴任何框架/npm 套件，只用原生 fetch handler。
+ *   - 設定資料存在 KV（binding 名稱：CONFIG_KV，key：config）。
+ *   - 管理頁用 HTTP Basic Auth 比對 secret（env.ADMIN_PASSWORD），密碼不寫死。
+ *   - 影片串流不經過本 Worker（盒子直連），故流量極小，可跑在免費額度內。
+ */
+
+// KV 中儲存設定用的 key 名稱
+const CONFIG_KEY = "config";
+
+// 預設設定：第一次讀取時若 KV 還沒有資料，就回傳這份並寫入 KV。
+// subscriptionUrl 預設「留空」（公開範本不含任何 token）。
+// 部署完成後，到 /admin 登入並貼上你的直播源網址即可。
+const DEFAULT_CONFIG = {
+  version: 1,
+  subscriptionUrl: "",
+  pollIntervalMinutes: 180,
+  forceRefresh: false,
+  notice: "",
+  updatedAt: "2026-06-26T00:00:00Z",
+};
+
+// CORS 標頭：App 端（或網頁端）跨網域讀取設定時需要。
+const CORS_HEADERS = {
+  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+  "Access-Control-Allow-Headers": "Content-Type, Authorization",
+};
+
+export default {
+  /**
+   * Worker 進入點：依路徑分派到各個處理函式。
+   */
+  async fetch(request, env, ctx) {
+    const url = new URL(request.url);
+    const { pathname } = url;
+    const method = request.method;
+
+    try {
+      // 統一處理 CORS preflight
+      if (method === "OPTIONS") {
+        return new Response(null, { status: 204, headers: CORS_HEADERS });
+      }
+
+      // ── App 端：讀取設定 ──────────────────────────────
+      if (pathname === "/api/config" && method === "GET") {
+        return await handleGetConfig(env);
+      }
+
+      // ── 管理頁：顯示 HTML 介面（需驗證）────────────────
+      if (pathname === "/admin" && method === "GET") {
+        return await handleAdminPage(request, env);
+      }
+
+      // ── 管理頁：存檔（需驗證）──────────────────────────
+      if (pathname === "/admin/save" && method === "POST") {
+        return await handleAdminSave(request, env);
+      }
+
+      // ── 管理頁：測試來源（需驗證）──────────────────────
+      if (pathname === "/admin/test" && method === "POST") {
+        return await handleAdminTest(request, env);
+      }
+
+      // 首頁簡單導引
+      if (pathname === "/" && method === "GET") {
+        return new Response(
+          "WeiTV 控制平面運作中。App 設定端點：/api/config，管理頁：/admin",
+          { status: 200, headers: { "Content-Type": "text/plain; charset=utf-8" } }
+        );
+      }
+
+      return new Response("Not Found", { status: 404 });
+    } catch (err) {
+      // 全域錯誤處理：避免把堆疊細節外洩，只回傳簡短訊息。
+      console.error("Unhandled error:", err && err.stack ? err.stack : err);
+      return new Response("Internal Server Error", {
+        status: 500,
+        headers: { "Content-Type": "text/plain; charset=utf-8" },
+      });
+    }
+  },
+};
+
+/* ================================================================
+ *  設定讀寫工具
+ * ================================================================ */
+
+/**
+ * 從 KV 讀取設定；若不存在則寫入並回傳預設值。
+ * 回傳一個保證欄位齊全的設定物件。
+ */
+async function loadConfig(env) {
+  let stored = null;
+  try {
+    stored = await env.CONFIG_KV.get(CONFIG_KEY, { type: "json" });
+  } catch (err) {
+    console.error("KV 讀取失敗:", err);
+    // KV 讀取失敗時退回預設值（讓盒子至少有可用設定），但不寫入。
+    return { ...DEFAULT_CONFIG };
+  }
+
+  if (!stored) {
+    // 第一次：寫入預設值。寫入失敗也不致命，照樣回傳預設值。
+    try {
+      await env.CONFIG_KV.put(CONFIG_KEY, JSON.stringify(DEFAULT_CONFIG));
+    } catch (err) {
+      console.error("KV 初始化寫入失敗:", err);
+    }
+    return { ...DEFAULT_CONFIG };
+  }
+
+  // 合併預設值，確保舊資料缺欄位時也能補齊。
+  return { ...DEFAULT_CONFIG, ...stored };
+}
+
+/**
+ * 把設定寫回 KV。
+ */
+async function saveConfig(env, config) {
+  await env.CONFIG_KV.put(CONFIG_KEY, JSON.stringify(config));
+}
+
+/* ================================================================
+ *  App 端端點
+ * ================================================================ */
+
+/**
+ * GET /api/config — 回傳目前設定給盒子。
+ * 注意：forceRefresh 採「不自動清除」策略——讀取後維持原值，
+ * 由管理員在管理頁手動切回 false。這樣簡單可靠，不會因為多台盒子
+ * 輪詢時序問題導致只有第一台讀到 true。
+ */
+async function handleGetConfig(env) {
+  const config = await loadConfig(env);
+  return new Response(JSON.stringify(config), {
+    status: 200,
+    headers: {
+      "Content-Type": "application/json; charset=utf-8",
+      "Cache-Control": "no-store",
+      ...CORS_HEADERS,
+    },
+  });
+}
+
+/* ================================================================
+ *  驗證（HTTP Basic Auth）
+ * ================================================================ */
+
+/**
+ * 驗證 Basic Auth。
+ * 規則：使用者名稱不限（建議填 admin），密碼必須等於 env.ADMIN_PASSWORD。
+ * 通過回傳 null；未通過回傳一個 401 Response（含 WWW-Authenticate）。
+ */
+function checkAuth(request, env) {
+  const expected = env.ADMIN_PASSWORD;
+
+  // 沒設定密碼 secret：直接擋下，提醒部署者去設定。
+  if (!expected) {
+    return new Response(
+      "尚未設定 ADMIN_PASSWORD secret，請參考 README 用 wrangler secret put 設定。",
+      { status: 500, headers: { "Content-Type": "text/plain; charset=utf-8" } }
+    );
+  }
+
+  const header = request.headers.get("Authorization") || "";
+  if (header.startsWith("Basic ")) {
+    try {
+      const decoded = atob(header.slice(6)); // "username:password"
+      const idx = decoded.indexOf(":");
+      const password = idx >= 0 ? decoded.slice(idx + 1) : "";
+      if (timingSafeEqual(password, expected)) {
+        return null; // 通過
+      }
+    } catch (_) {
+      // 解碼失敗 → 視為未授權，往下走。
+    }
+  }
+
+  // 未授權：要求瀏覽器跳出帳密輸入框。
+  return new Response("需要授權（請輸入管理密碼）", {
+    status: 401,
+    headers: {
+      "WWW-Authenticate": 'Basic realm="WeiTV Admin", charset="UTF-8"',
+      "Content-Type": "text/plain; charset=utf-8",
+    },
+  });
+}
+
+/**
+ * 等長度安全比對，降低 timing attack 風險。
+ */
+function timingSafeEqual(a, b) {
+  if (typeof a !== "string" || typeof b !== "string") return false;
+  if (a.length !== b.length) return false;
+  let result = 0;
+  for (let i = 0; i < a.length; i++) {
+    result |= a.charCodeAt(i) ^ b.charCodeAt(i);
+  }
+  return result === 0;
+}
+
+/* ================================================================
+ *  管理頁端點
+ * ================================================================ */
+
+/**
+ * GET /admin — 回傳手機友善的管理 HTML。
+ */
+async function handleAdminPage(request, env) {
+  const unauthorized = checkAuth(request, env);
+  if (unauthorized) return unauthorized;
+
+  const config = await loadConfig(env);
+  const html = renderAdminHtml(config);
+  return new Response(html, {
+    status: 200,
+    headers: { "Content-Type": "text/html; charset=utf-8" },
+  });
+}
+
+/**
+ * POST /admin/save — 寫入設定、version +1、更新 updatedAt。
+ * 接受 application/x-www-form-urlencoded（管理頁表單送出）。
+ */
+async function handleAdminSave(request, env) {
+  const unauthorized = checkAuth(request, env);
+  if (unauthorized) return unauthorized;
+
+  const current = await loadConfig(env);
+
+  let form;
+  try {
+    form = await request.formData();
+  } catch (err) {
+    return new Response("表單解析失敗", {
+      status: 400,
+      headers: { "Content-Type": "text/plain; charset=utf-8" },
+    });
+  }
+
+  // 取值與基本清理
+  const subscriptionUrl = (form.get("subscriptionUrl") || "").toString().trim();
+  const notice = (form.get("notice") || "").toString();
+  let pollIntervalMinutes = parseInt(
+    (form.get("pollIntervalMinutes") || "").toString(),
+    10
+  );
+  // forceRefresh：表單用 checkbox，有勾才會送出 "on"
+  const forceRefresh = form.get("forceRefresh") === "on";
+
+  // 驗證
+  if (!subscriptionUrl || !/^https?:\/\//i.test(subscriptionUrl)) {
+    return renderResultPage(
+      false,
+      "訂閱網址格式不正確（必須以 http(s):// 開頭）。",
+      current
+    );
+  }
+  if (!Number.isFinite(pollIntervalMinutes) || pollIntervalMinutes < 1) {
+    // 給個合理下限，避免盒子過度頻繁輪詢。
+    pollIntervalMinutes = current.pollIntervalMinutes || 180;
+  }
+
+  const updated = {
+    ...current,
+    version: (current.version || 0) + 1,
+    subscriptionUrl,
+    notice,
+    pollIntervalMinutes,
+    forceRefresh,
+    updatedAt: new Date().toISOString(),
+  };
+
+  try {
+    await saveConfig(env, updated);
+  } catch (err) {
+    console.error("KV 寫入失敗:", err);
+    return renderResultPage(false, "KV 寫入失敗，請稍後再試。", current);
+  }
+
+  return renderResultPage(
+    true,
+    `已儲存（版本 v${updated.version}）。盒子下次輪詢就會更新。`,
+    updated
+  );
+}
+
+/**
+ * POST /admin/test — 後端去 fetch 指定的 subscriptionUrl，
+ * 回報 HTTP 狀態與解析到的頻道數（數 #EXTINF 行數）。
+ * 回傳 JSON，由管理頁前端 fetch 後顯示。
+ */
+async function handleAdminTest(request, env) {
+  const unauthorized = checkAuth(request, env);
+  if (unauthorized) return unauthorized;
+
+  let targetUrl = "";
+  try {
+    const form = await request.formData();
+    targetUrl = (form.get("subscriptionUrl") || "").toString().trim();
+  } catch (_) {
+    // 忽略，往下檢查
+  }
+
+  if (!targetUrl || !/^https?:\/\//i.test(targetUrl)) {
+    return jsonResponse({ ok: false, error: "網址格式不正確" }, 400);
+  }
+
+  try {
+    // 設 10 秒逾時，避免卡住。
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 10000);
+    const resp = await fetch(targetUrl, {
+      method: "GET",
+      headers: { "User-Agent": "WeiTV-Admin-Test/1.0" },
+      signal: controller.signal,
+    });
+    clearTimeout(timer);
+
+    const text = await resp.text();
+    // 數 #EXTINF 行數（每行一個頻道）
+    const channelCount = (text.match(/#EXTINF/gi) || []).length;
+
+    return jsonResponse({
+      ok: true,
+      httpStatus: resp.status,
+      httpOk: resp.ok,
+      channelCount,
+      bytes: text.length,
+      looksLikeM3u: /#EXTM3U/i.test(text),
+    });
+  } catch (err) {
+    const msg =
+      err && err.name === "AbortError"
+        ? "連線逾時（10 秒）"
+        : "連線失敗：" + (err && err.message ? err.message : "未知錯誤");
+    return jsonResponse({ ok: false, error: msg }, 200);
+  }
+}
+
+/* ================================================================
+ *  HTML / 回應產生器
+ * ================================================================ */
+
+function jsonResponse(obj, status) {
+  return new Response(JSON.stringify(obj), {
+    status: status || 200,
+    headers: { "Content-Type": "application/json; charset=utf-8" },
+  });
+}
+
+/**
+ * 簡易 HTML escape，避免設定值內容破壞頁面或注入。
+ */
+function escapeHtml(str) {
+  return String(str == null ? "" : str)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
+/**
+ * 產生管理頁主畫面 HTML（深色、大按鈕、RWD）。
+ */
+function renderAdminHtml(config) {
+  return `<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>偉電視 · 管理中心</title>
+<style>
+  :root {
+    color-scheme: dark;
+    --bg-0: #07090E;
+    --bg-1: #0C1119;
+    --surface: #141A28;
+    --surface-2: #0F1420;
+    --border: #273043;
+    --accent: #2DD4BF;
+    --accent-deep: #0EA5A0;
+    --gold: #FBBF24;
+    --danger: #FF4D5E;
+    --text: #EEF2F7;
+    --text-dim: #97A2B4;
+  }
+  * { box-sizing: border-box; }
+  html, body { min-height: 100%; }
+  body {
+    margin: 0;
+    background:
+      radial-gradient(1200px 600px at 50% -10%, rgba(45,212,191,0.07), transparent 60%),
+      linear-gradient(165deg, #07090E 0%, #0C1119 100%);
+    background-attachment: fixed;
+    color: var(--text);
+    font-family: -apple-system, "PingFang TC", "Microsoft JhengHei", system-ui, sans-serif;
+    padding: 22px 16px 48px;
+    line-height: 1.55;
+    -webkit-font-smoothing: antialiased;
+  }
+  .wrap { max-width: 640px; margin: 0 auto; }
+
+  /* 品牌標題 */
+  .brand { display: flex; align-items: center; gap: 11px; margin: 6px 2px 4px; }
+  .brand .dot {
+    width: 11px; height: 11px; border-radius: 50%;
+    background: var(--accent);
+    box-shadow: 0 0 0 4px rgba(45,212,191,0.16), 0 0 14px rgba(45,212,191,0.6);
+  }
+  h1 {
+    font-size: 21px; font-weight: 700; letter-spacing: 0.3px;
+    margin: 0; color: var(--text);
+  }
+  .accent-line {
+    height: 3px; width: 64px; margin: 11px 2px 8px;
+    border-radius: 3px;
+    background: linear-gradient(90deg, var(--accent), var(--accent-deep) 70%, transparent);
+  }
+  .sub { color: var(--text-dim); font-size: 13.5px; margin: 0 2px 22px; }
+
+  /* 卡片 */
+  .card {
+    background: linear-gradient(180deg, var(--surface) 0%, var(--surface-2) 130%);
+    border: 1px solid var(--border);
+    border-radius: 16px;
+    padding: 20px;
+    margin-bottom: 16px;
+    box-shadow: 0 10px 30px -18px rgba(0,0,0,0.85), inset 0 1px 0 rgba(255,255,255,0.02);
+  }
+  .card-title {
+    font-size: 12px; font-weight: 700; letter-spacing: 1.4px;
+    text-transform: uppercase; color: var(--accent);
+    margin: 0 0 14px; display: flex; align-items: center; gap: 8px;
+  }
+
+  /* 狀態資訊列 */
+  .info-grid { display: flex; flex-wrap: wrap; gap: 10px; }
+  .chip {
+    flex: 1 1 160px;
+    background: var(--surface-2);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 12px 14px;
+  }
+  .chip .k { font-size: 11.5px; color: var(--text-dim); letter-spacing: 0.4px; margin-bottom: 4px; }
+  .chip .v { font-size: 16px; font-weight: 700; color: var(--text); word-break: break-all; }
+  .chip .v.mono { font-size: 13px; font-weight: 500; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+  .badge {
+    display: inline-flex; align-items: center; gap: 6px;
+    font-size: 13px; font-weight: 700; padding: 4px 10px; border-radius: 999px;
+  }
+  .badge.on { color: var(--gold); background: rgba(251,191,36,0.12); border: 1px solid rgba(251,191,36,0.35); }
+  .badge.off { color: var(--text-dim); background: rgba(151,162,180,0.10); border: 1px solid var(--border); }
+
+  /* 表單 */
+  label { display: block; font-size: 13.5px; color: var(--text); font-weight: 600; margin: 18px 0 7px; }
+  label:first-of-type { margin-top: 4px; }
+  label .hint { display: block; font-weight: 400; font-size: 12px; color: var(--text-dim); margin-top: 2px; }
+  input[type="text"], input[type="number"], textarea {
+    width: 100%;
+    padding: 14px 15px;
+    font-size: 16px; /* 16px 以上避免 iOS 自動放大 */
+    border-radius: 13px;
+    border: 1px solid var(--border);
+    background: var(--surface-2);
+    color: var(--text);
+    transition: border-color .15s, box-shadow .15s;
+    font-family: inherit;
+  }
+  textarea { min-height: 76px; resize: vertical; line-height: 1.5; }
+  input:focus, textarea:focus {
+    outline: none;
+    border-color: var(--accent);
+    box-shadow: 0 0 0 3px rgba(45,212,191,0.18);
+  }
+  input::placeholder, textarea::placeholder { color: #5A647A; }
+
+  /* checkbox 列 */
+  .switch-row {
+    display: flex; align-items: center; gap: 13px; margin-top: 18px;
+    background: var(--surface-2); border: 1px solid var(--border);
+    border-radius: 13px; padding: 14px 15px;
+  }
+  .switch-row input[type="checkbox"] {
+    width: 24px; height: 24px; flex: none;
+    accent-color: var(--accent); cursor: pointer;
+  }
+  .switch-row label { margin: 0; font-weight: 500; font-size: 14px; }
+
+  /* 按鈕 */
+  .btn {
+    display: flex; align-items: center; justify-content: center; gap: 8px;
+    width: 100%;
+    padding: 16px;
+    font-size: 16px;
+    font-weight: 700;
+    border: 1px solid transparent;
+    border-radius: 13px;
+    margin-top: 16px;
+    cursor: pointer;
+    font-family: inherit;
+    transition: transform .08s, filter .15s, background .15s;
+  }
+  .btn:active { transform: translateY(1px); }
+  .btn-primary {
+    background: linear-gradient(135deg, var(--accent), var(--accent-deep));
+    color: #04201E;
+    box-shadow: 0 8px 22px -10px rgba(45,212,191,0.6);
+  }
+  .btn-primary:hover { filter: brightness(1.05); }
+  .btn-secondary {
+    background: transparent; color: var(--text);
+    border: 1px solid var(--border);
+  }
+  .btn-secondary:hover { border-color: var(--accent); color: var(--accent); }
+
+  /* 測試結果狀態卡 */
+  #testResult { margin-top: 14px; display: none; }
+  .result-card {
+    border-radius: 14px; padding: 16px;
+    border: 1px solid var(--border);
+    background: var(--surface-2);
+  }
+  .result-head { display: flex; align-items: center; gap: 12px; }
+  .result-icon {
+    width: 38px; height: 38px; flex: none; border-radius: 11px;
+    display: flex; align-items: center; justify-content: center;
+    font-size: 20px; font-weight: 800;
+  }
+  .result-card.ok { border-color: rgba(45,212,191,0.4); background: rgba(45,212,191,0.07); }
+  .result-card.ok .result-icon { background: rgba(45,212,191,0.16); color: var(--accent); }
+  .result-card.bad { border-color: rgba(255,77,94,0.4); background: rgba(255,77,94,0.07); }
+  .result-card.bad .result-icon { background: rgba(255,77,94,0.16); color: var(--danger); }
+  .result-card.pending { color: var(--text-dim); }
+  .result-title { font-size: 15px; font-weight: 700; }
+  .result-sub { font-size: 12.5px; color: var(--text-dim); margin-top: 1px; }
+  .result-stats { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 14px; }
+  .stat {
+    flex: 1 1 90px; background: rgba(0,0,0,0.25);
+    border: 1px solid var(--border); border-radius: 10px; padding: 9px 11px;
+  }
+  .stat .sk { font-size: 11px; color: var(--text-dim); }
+  .stat .sv { font-size: 16px; font-weight: 700; color: var(--text); margin-top: 2px; }
+
+  code {
+    background: var(--surface-2); border: 1px solid var(--border);
+    padding: 2px 8px; border-radius: 7px; word-break: break-all;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 13px;
+    color: var(--accent);
+  }
+  .footnote { text-align: center; color: var(--text-dim); font-size: 12.5px; margin-top: 24px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="brand">
+    <span class="dot"></span>
+    <h1>偉電視 · 管理中心</h1>
+  </div>
+  <div class="accent-line"></div>
+  <div class="sub">遠端同步直播源訂閱網址。存檔後盒子下次輪詢自動更新。</div>
+
+  <div class="card">
+    <div class="card-title">目前設定</div>
+    <div class="info-grid">
+      <div class="chip">
+        <div class="k">版本</div>
+        <div class="v">v${escapeHtml(config.version)}</div>
+      </div>
+      <div class="chip">
+        <div class="k">強制刷新旗標</div>
+        <div class="v">
+          <span class="badge ${config.forceRefresh ? "on" : "off"}">${
+            config.forceRefresh ? "開啟中" : "關閉"
+          }</span>
+        </div>
+      </div>
+      <div class="chip" style="flex-basis:100%;">
+        <div class="k">最後更新</div>
+        <div class="v mono">${escapeHtml(config.updatedAt)}</div>
+      </div>
+      <div class="chip" style="flex-basis:100%;">
+        <div class="k">目前訂閱網址</div>
+        <div class="v mono">${escapeHtml(config.subscriptionUrl)}</div>
+      </div>
+    </div>
+  </div>
+
+  <form class="card" method="POST" action="/admin/save">
+    <div class="card-title">編輯設定</div>
+
+    <label for="subscriptionUrl">訂閱網址
+      <span class="hint">含 token 的 m3u8 清單網址</span>
+    </label>
+    <textarea id="subscriptionUrl" name="subscriptionUrl">${escapeHtml(
+      config.subscriptionUrl
+    )}</textarea>
+
+    <button type="button" class="btn btn-secondary" onclick="testSource()">測試來源</button>
+    <div id="testResult"></div>
+
+    <label for="pollIntervalMinutes">盒子輪詢間隔（分鐘）</label>
+    <input type="number" id="pollIntervalMinutes" name="pollIntervalMinutes" min="1"
+      value="${escapeHtml(config.pollIntervalMinutes)}">
+
+    <label for="notice">公告
+      <span class="hint">可留空，盒子會顯示</span>
+    </label>
+    <textarea id="notice" name="notice">${escapeHtml(config.notice)}</textarea>
+
+    <div class="switch-row">
+      <input type="checkbox" id="forceRefresh" name="forceRefresh" ${
+        config.forceRefresh ? "checked" : ""
+      }>
+      <label for="forceRefresh">強制刷新（讓盒子下次輪詢立即重載來源）</label>
+    </div>
+
+    <button type="submit" class="btn btn-primary">儲存設定</button>
+  </form>
+
+  <div class="footnote">App 設定端點 <code>/api/config</code></div>
+</div>
+
+<script>
+async function testSource() {
+  var el = document.getElementById('testResult');
+  var url = document.getElementById('subscriptionUrl').value.trim();
+  el.style.display = 'block';
+  el.innerHTML = '<div class="result-card pending"><div class="result-head">' +
+    '<div class="result-icon" style="background:rgba(151,162,180,0.12);color:#97A2B4;">…</div>' +
+    '<div><div class="result-title">測試中</div>' +
+    '<div class="result-sub">正在連線並解析來源</div></div></div></div>';
+  try {
+    var fd = new FormData();
+    fd.append('subscriptionUrl', url);
+    var r = await fetch('/admin/test', { method: 'POST', body: fd });
+    var data = await r.json();
+    if (data.ok) {
+      var good = data.httpOk && data.channelCount > 0;
+      var cls = good ? 'ok' : 'bad';
+      var icon = good ? '\\u2713' : '\\u2715';
+      var title = good ? '來源正常' : '來源有問題';
+      var subtxt = good ? '可以儲存使用' : 'HTTP 異常或未解析到頻道';
+      el.innerHTML =
+        '<div class="result-card ' + cls + '">' +
+          '<div class="result-head">' +
+            '<div class="result-icon">' + icon + '</div>' +
+            '<div><div class="result-title">' + title + '</div>' +
+            '<div class="result-sub">' + subtxt + '</div></div>' +
+          '</div>' +
+          '<div class="result-stats">' +
+            '<div class="stat"><div class="sk">HTTP 狀態</div><div class="sv">' + data.httpStatus + '</div></div>' +
+            '<div class="stat"><div class="sk">M3U 格式</div><div class="sv">' + (data.looksLikeM3u ? '是' : '否') + '</div></div>' +
+            '<div class="stat"><div class="sk">頻道數</div><div class="sv">' + data.channelCount + '</div></div>' +
+            '<div class="stat"><div class="sk">回應大小</div><div class="sv">' + data.bytes + ' B</div></div>' +
+          '</div>' +
+        '</div>';
+    } else {
+      el.innerHTML =
+        '<div class="result-card bad"><div class="result-head">' +
+          '<div class="result-icon">\\u2715</div>' +
+          '<div><div class="result-title">測試失敗</div>' +
+          '<div class="result-sub">' + (data.error || '未知錯誤') + '</div></div>' +
+        '</div></div>';
+    }
+  } catch (e) {
+    el.innerHTML =
+      '<div class="result-card bad"><div class="result-head">' +
+        '<div class="result-icon">\\u2715</div>' +
+        '<div><div class="result-title">測試請求失敗</div>' +
+        '<div class="result-sub">' + e.message + '</div></div>' +
+      '</div></div>';
+  }
+}
+</script>
+</body>
+</html>`;
+}
+
+/**
+ * 產生存檔結果頁（成功/失敗），並提供回管理頁連結。
+ */
+function renderResultPage(success, message, config) {
+  const accent = success ? "#2DD4BF" : "#FF4D5E";
+  const iconBg = success ? "rgba(45,212,191,0.16)" : "rgba(255,77,94,0.16)";
+  const cardBg = success ? "rgba(45,212,191,0.07)" : "rgba(255,77,94,0.07)";
+  const cardBorder = success ? "rgba(45,212,191,0.4)" : "rgba(255,77,94,0.4)";
+  const icon = success ? "✓" : "✕";
+  const heading = success ? "儲存成功" : "操作失敗";
+  const html = `<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>偉電視 · ${success ? "儲存成功" : "操作失敗"}</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background:
+      radial-gradient(1200px 600px at 50% -10%, rgba(45,212,191,0.07), transparent 60%),
+      linear-gradient(165deg, #07090E 0%, #0C1119 100%);
+    background-attachment: fixed;
+    color: #EEF2F7;
+    font-family: -apple-system, "PingFang TC", "Microsoft JhengHei", system-ui, sans-serif;
+    padding: 40px 16px; line-height: 1.6;
+    -webkit-font-smoothing: antialiased;
+  }
+  .wrap { max-width: 640px; margin: 0 auto; }
+  .card {
+    background: linear-gradient(180deg, #141A28 0%, #0F1420 130%);
+    border: 1px solid ${cardBorder};
+    border-radius: 16px; padding: 22px;
+    box-shadow: 0 10px 30px -18px rgba(0,0,0,0.85);
+  }
+  .head { display: flex; align-items: center; gap: 14px; }
+  .icon {
+    width: 46px; height: 46px; flex: none; border-radius: 13px;
+    display: flex; align-items: center; justify-content: center;
+    font-size: 24px; font-weight: 800;
+    background: ${iconBg}; color: ${accent};
+  }
+  .title { font-size: 18px; font-weight: 700; }
+  .msg {
+    margin-top: 16px; padding: 14px 15px; border-radius: 12px;
+    background: ${cardBg}; border: 1px solid ${cardBorder};
+    color: #EEF2F7; font-size: 15px;
+  }
+  .meta {
+    color: #97A2B4; font-size: 13px; margin-top: 16px;
+    display: flex; flex-wrap: wrap; gap: 6px 18px;
+  }
+  .meta b { color: #EEF2F7; font-weight: 600; }
+  a.btn {
+    display: flex; align-items: center; justify-content: center;
+    text-decoration: none; margin-top: 22px;
+    background: linear-gradient(135deg, #2DD4BF, #0EA5A0); color: #04201E;
+    padding: 16px; border-radius: 13px; font-size: 16px; font-weight: 700;
+    box-shadow: 0 8px 22px -10px rgba(45,212,191,0.6);
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="card">
+    <div class="head">
+      <div class="icon">${icon}</div>
+      <div class="title">${heading}</div>
+    </div>
+    <div class="msg">${escapeHtml(message)}</div>
+    <div class="meta">
+      <span>版本 <b>v${escapeHtml(config.version)}</b></span>
+      <span>更新時間 <b>${escapeHtml(config.updatedAt)}</b></span>
+    </div>
+    <a class="btn" href="/admin">返回管理中心</a>
+  </div>
+</div>
+</body>
+</html>`;
+  return new Response(html, {
+    status: success ? 200 : 400,
+    headers: { "Content-Type": "text/html; charset=utf-8" },
+  });
+}

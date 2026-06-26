@@ -1,0 +1,27 @@
+# ─────────────────────────────────────────────────────────────
+# 偉電視（WeiTV）控制平面 — Cloudflare Worker 設定檔
+# ─────────────────────────────────────────────────────────────
+
+# Worker 名稱（部署後網址會是 https://<name>.<你的子網域>.workers.dev）
+name = "weitv-control"
+
+# 進入點
+main = "src/index.js"
+
+# Cloudflare 相容日期（用近期日期即可，影響 runtime 行為版本）
+compatibility_date = "2024-09-01"
+
+# ── KV namespace 綁定 ────────────────────────────────────────
+# 程式中以 env.CONFIG_KV 存取。
+# 下方的 id 是「佔位值」，請依 README 用 wrangler 建立 namespace 後，
+# 把真正的 id 填進來再部署。
+[[kv_namespaces]]
+binding = "CONFIG_KV"
+id = "REPLACE_WITH_YOUR_KV_NAMESPACE_ID"
+# 若要本機 dev 用獨立的 preview namespace，可加上 preview_id：
+# preview_id = "REPLACE_WITH_YOUR_PREVIEW_KV_NAMESPACE_ID"
+
+# ── 環境變數說明 ─────────────────────────────────────────────
+# ADMIN_PASSWORD 不要寫在這裡（這個檔會進版控）。
+# 請改用 secret 設定，指令見 README：
+#   wrangler secret put ADMIN_PASSWORD
