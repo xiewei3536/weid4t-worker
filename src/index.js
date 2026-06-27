@@ -170,8 +170,12 @@ async function handleGetConfig(request, env) {
 
   // 在原本欄位外，附加該裝置的封鎖與傳話狀態。
   const blocked = !!(dev && dev.blocked);
+  // 開機自啟改為每台為準：該裝置有設過布林就用它，否則回全域 config.autostart（預設 true）。
+  const autostart =
+    dev && typeof dev.autostart === "boolean" ? dev.autostart : config.autostart;
   const payload = {
     ...config,
+    autostart,
     blocked,
     message: (dev && dev.msg) || "",
     messageLevel: (dev && dev.msgLevel) || "info",
@@ -433,6 +437,12 @@ async function touchDevice(request, env) {
     dev.lastOk = url.searchParams.get("ok") === "1";
     dev.lastCount = parseInt(url.searchParams.get("ch"), 10) || 0;
     dev.lastResultAt = now;
+  }
+
+  // 開機自啟回報：只有帶 as 參數時才更新（一般輪詢不帶 as，避免覆蓋管理頁設定）。
+  // as=1 → 開、as=0 → 關，存成布林記在該裝置上。
+  if (url.searchParams.has("as")) {
+    dev.autostart = url.searchParams.get("as") === "1";
   }
 
   await env.CONFIG_KV.put(key, JSON.stringify(dev));
@@ -783,6 +793,34 @@ async function handleAdminDevice(request, env) {
   const value = (form.get("value") || "").toString();
   const level = (form.get("level") || "").toString().trim();
 
+  // 一鍵全部：不針對單一 id，故先於 id 檢查處理。
+  if (action === "autostart_all") {
+    const on = value === "on";
+    let devices = [];
+    try {
+      devices = await loadDevices(env);
+    } catch (err) {
+      console.error("裝置列舉失敗:", err);
+      return renderResultPage(false, "列舉裝置失敗，請稍後再試。", { version: "-", updatedAt: "-" });
+    }
+    let n = 0;
+    for (const dev of devices) {
+      if (!dev || typeof dev !== "object" || !dev.id) continue;
+      dev.autostart = on;
+      try {
+        await env.CONFIG_KV.put(DEVICE_PREFIX + dev.id, JSON.stringify(dev));
+        n++;
+      } catch (err) {
+        console.error("裝置寫入失敗:", err);
+      }
+    }
+    return renderResultPage(
+      true,
+      `已將 ${n} 台裝置的開機自啟設為「${on ? "開" : "關"}」。`,
+      { version: "-", updatedAt: new Date().toISOString() }
+    );
+  }
+
   if (!id || !action) {
     return renderResultPage(false, "缺少裝置 id 或動作。", { version: "-", updatedAt: "-" });
   }
@@ -834,6 +872,10 @@ async function handleAdminDevice(request, env) {
     case "rename":
       dev.nick = value;
       summary = `已更新裝置 ${id} 暱稱。`;
+      break;
+    case "autostart":
+      dev.autostart = value === "on";
+      summary = `已將裝置 ${id} 的開機自啟設為「${dev.autostart ? "開" : "關"}」。`;
       break;
     default:
       return renderResultPage(false, `未知動作：${action}。`, { version: "-", updatedAt: "-" });
@@ -929,6 +971,19 @@ function renderDevicesSection(devices) {
   }
   return `<div class="card">
     <div class="card-title">📺 裝置管理 · 共 ${list.length} 台</div>
+    <div class="dev-bulk">
+      <span class="dev-bulk-label">全部裝置開機自啟</span>
+      <form class="dev-form" method="POST" action="/admin/device">
+        <input type="hidden" name="action" value="autostart_all">
+        <input type="hidden" name="value" value="on">
+        <button type="submit" class="btn-mini btn-ok">全部開啟</button>
+      </form>
+      <form class="dev-form" method="POST" action="/admin/device">
+        <input type="hidden" name="action" value="autostart_all">
+        <input type="hidden" name="value" value="off">
+        <button type="submit" class="btn-mini">全部關閉</button>
+      </form>
+    </div>
     ${body}
   </div>`;
 }
@@ -944,6 +999,18 @@ function renderDeviceCard(d) {
   const msg = String(d && d.msg ? d.msg : "");
   const msgLevel = d && d.msgLevel === "warn" ? "warn" : "info";
   const idAttr = escapeHtml(id);
+
+  // 開機自啟：該裝置設過布林就顯示開/關，否則顯示「預設(全域)」。
+  const hasAutostart = d && typeof d.autostart === "boolean";
+  const autostartOn = hasAutostart ? d.autostart : false;
+  const autostartText = !hasAutostart
+    ? "預設（全域）"
+    : autostartOn
+    ? "開"
+    : "關";
+  // 切換目標：目前是開（或未設）就送 off，目前是關就送 on。
+  const autostartNext = hasAutostart && autostartOn ? "off" : "on";
+  const autostartBtnLabel = autostartNext === "on" ? "開機自啟 開" : "開機自啟 關";
 
   const statusBadge = blocked
     ? `<span class="badge dev-blocked">已封鎖</span>`
@@ -1000,6 +1067,9 @@ function renderDeviceCard(d) {
       <span class="mono">IP：${escapeHtml(d && d.ip ? d.ip : "-")}</span>
     </div>
     ${sourceLine}
+    <div class="dev-source ${hasAutostart ? (autostartOn ? "ok" : "bad") : "none"}">⚡ 開機自啟：${escapeHtml(
+    autostartText
+  )}</div>
     ${currentMsg}
     <div class="dev-actions">
       ${blockForm}
@@ -1030,6 +1100,15 @@ function renderDeviceCard(d) {
           nick
         )}">
         <button type="submit" class="btn-mini">改暱稱</button>
+      </form>
+
+      <form class="dev-form" method="POST" action="/admin/device">
+        <input type="hidden" name="id" value="${idAttr}">
+        <input type="hidden" name="action" value="autostart">
+        <input type="hidden" name="value" value="${autostartNext}">
+        <button type="submit" class="btn-mini${
+          autostartNext === "on" ? " btn-ok" : ""
+        }">${autostartBtnLabel}</button>
       </form>
 
       <form class="dev-form" method="POST" action="/admin/device" onsubmit="return confirm('確定刪除這台裝置紀錄？');">
@@ -1235,6 +1314,12 @@ function renderAdminHtml(config, devices) {
   .log-empty {
     color: var(--text-dim); font-size: 14px; padding: 10px 2px;
   }
+  .dev-bulk {
+    display: flex; flex-wrap: wrap; align-items: center; gap: 8px;
+    padding: 11px 13px; margin-bottom: 14px;
+    background: var(--surface-2); border: 1px solid var(--border); border-radius: 12px;
+  }
+  .dev-bulk-label { font-size: 13px; font-weight: 600; color: var(--text); margin-right: auto; }
   .badge.dev-active { color: var(--accent); background: rgba(45,212,191,0.12); border: 1px solid rgba(45,212,191,0.35); }
   .badge.dev-blocked { color: var(--danger); background: rgba(255,77,94,0.12); border: 1px solid rgba(255,77,94,0.4); }
   .dev-card {
