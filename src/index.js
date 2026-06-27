@@ -27,6 +27,15 @@ const DEFAULT_CONFIG = {
   forceRefresh: false,
   autostart: true,
   notice: "",
+  // ── 授權機制 ──────────────────────────────────────────────
+  // requireActivation：總開關。開啟後,未授權/到期裝置拿不到 subscriptionUrl,
+  // App 會要求輸入啟動碼。預設關閉,不影響既有盒子運作。
+  requireActivation: false,
+  // 啟動畫面(App 開啟即顯示,亦用於啟動碼輸入頁)
+  activationTitle: "歡迎使用偉電視",
+  activationText: "請輸入啟動碼以開通本機。\n如需協助,請聯絡您的服務人員。",
+  // 啟動碼位數(方便遙控器輸入,預設 8 位數字)
+  codeDigits: 8,
   updatedAt: "2026-06-26T00:00:00Z",
 };
 
@@ -57,6 +66,11 @@ export default {
         return await handleGetConfig(request, env);
       }
 
+      // ── App 端：啟動碼激活 ────────────────────────────
+      if (pathname === "/api/activate" && method === "GET") {
+        return await handleActivate(request, env);
+      }
+
       // ── App OTA：查詢最新版本（公開，不需 Basic Auth）──
       if (pathname === "/api/update" && method === "GET") {
         return await handleUpdateInfo(request, env);
@@ -85,6 +99,11 @@ export default {
       // ── 管理頁：裝置管理動作（需驗證）──────────────────
       if (pathname === "/admin/device" && method === "POST") {
         return await handleAdminDevice(request, env);
+      }
+
+      // ── 管理頁：啟動碼管理動作（需驗證）────────────────
+      if (pathname === "/admin/codes" && method === "POST") {
+        return await handleAdminCodes(request, env);
       }
 
       // 首頁簡單導引
@@ -173,15 +192,21 @@ async function handleGetConfig(request, env) {
   // 開機自啟改為每台為準：該裝置有設過布林就用它，否則回全域 config.autostart（預設 true）。
   const autostart =
     dev && typeof dev.autostart === "boolean" ? dev.autostart : config.autostart;
+
+  // 授權狀態：requireActivation 關閉時一律視為已授權；開啟時看裝置 authorized + 是否到期。
+  const auth = computeAuth(dev, config);
+
   const payload = {
     ...config,
     autostart,
     blocked,
     message: (dev && dev.msg) || "",
     messageLevel: (dev && dev.msgLevel) || "info",
+    authorized: auth.authorized,
+    expireAt: auth.expireAt,
   };
-  // 封鎖時雙重保險：訂閱網址清空，盒子拿不到來源。
-  if (blocked) {
+  // 封鎖、或（需授權但未授權/到期）→ 不下發來源，雙重保險。
+  if (blocked || !auth.authorized) {
     payload.subscriptionUrl = "";
   }
 
@@ -193,6 +218,29 @@ async function handleGetConfig(request, env) {
       ...CORS_HEADERS,
     },
   });
+}
+
+/**
+ * 計算裝置授權狀態。
+ * requireActivation 關閉 → 一律授權（回傳裝置既有 expireAt 供顯示）。
+ * 開啟 → 需 dev.authorized 為真且未過期（expireAt 空 = 永久）。
+ * 回傳 { authorized:boolean, expireAt:string }。
+ */
+function computeAuth(dev, config) {
+  const expireAt = (dev && dev.expireAt) || "";
+  if (!config.requireActivation) {
+    return { authorized: true, expireAt };
+  }
+  if (!dev || dev.authorized !== true) {
+    return { authorized: false, expireAt };
+  }
+  if (expireAt) {
+    const t = Date.parse(expireAt);
+    if (Number.isFinite(t) && t <= Date.now()) {
+      return { authorized: false, expireAt }; // 已到期
+    }
+  }
+  return { authorized: true, expireAt };
 }
 
 /* ================================================================
@@ -485,6 +533,132 @@ async function loadDevices(env) {
 }
 
 /* ================================================================
+ *  啟動碼授權（每碼一個 KV key，前綴 code:）
+ * ================================================================ */
+
+const CODE_PREFIX = "code:";
+const CODE_LIST_MAX = 500;
+
+/**
+ * 產生隨機數字啟動碼（digits 位，限 4~12）。首位避免 0，方便辨識位數。
+ */
+function genCodeString(digits) {
+  const n = Math.max(4, Math.min(12, digits || 8));
+  const arr = new Uint8Array(n);
+  crypto.getRandomValues(arr);
+  let s = "";
+  for (let i = 0; i < n; i++) s += (arr[i] % 10).toString();
+  if (s[0] === "0") s = (1 + (arr[0] % 9)).toString() + s.slice(1);
+  return s;
+}
+
+/**
+ * 標記某裝置為已授權，寫入到期日（expireAt 空 = 永久）。
+ * 裝置不存在時建立一筆。回傳裝置物件。
+ */
+async function authorizeDevice(env, id, expireAt, codeUsed) {
+  const key = DEVICE_PREFIX + id;
+  let dev = null;
+  try {
+    dev = await env.CONFIG_KV.get(key, { type: "json" });
+  } catch (_) {
+    dev = null;
+  }
+  const now = new Date().toISOString();
+  if (!dev || typeof dev !== "object") {
+    dev = {
+      id, nick: "", m: "", v: "", ip: "",
+      firstSeen: now, lastSeen: now, count: 0,
+      blocked: false, msg: "", msgLevel: "info",
+    };
+  }
+  dev.authorized = true;
+  dev.authedAt = now;
+  dev.expireAt = expireAt || "";
+  if (codeUsed) dev.codeUsed = codeUsed;
+  await env.CONFIG_KV.put(key, JSON.stringify(dev));
+  return dev;
+}
+
+/**
+ * GET /api/activate?id=&code= — 盒子輸入啟動碼後呼叫。
+ * 未使用碼：綁定本機、依 days 算到期、標記裝置授權。
+ * 已使用碼：僅允許原綁定裝置（重裝情境）。回 JSON。
+ */
+async function handleActivate(request, env) {
+  const url = new URL(request.url);
+  const id = (url.searchParams.get("id") || "").trim();
+  const code = (url.searchParams.get("code") || "").trim();
+  if (!id || !code) {
+    return jsonResponse({ ok: false, error: "缺少裝置或啟動碼" }, 400);
+  }
+
+  const codeKey = CODE_PREFIX + code;
+  let rec = null;
+  try {
+    rec = await env.CONFIG_KV.get(codeKey, { type: "json" });
+  } catch (_) {
+    rec = null;
+  }
+
+  if (!rec || typeof rec !== "object" || rec.status === "revoked") {
+    return jsonResponse({ ok: false, error: "啟動碼錯誤或已失效" }, 200);
+  }
+  if (rec.status === "used" && rec.device && rec.device !== id) {
+    return jsonResponse({ ok: false, error: "此啟動碼已被其他裝置使用" }, 200);
+  }
+
+  const now = new Date();
+  let expireAt = rec.expireAt || "";
+  if (rec.status !== "used") {
+    const days = typeof rec.days === "number" ? rec.days : 0;
+    expireAt = days > 0 ? new Date(now.getTime() + days * 86400000).toISOString() : "";
+    rec.status = "used";
+    rec.device = id;
+    rec.usedAt = now.toISOString();
+    rec.expireAt = expireAt;
+    try {
+      await env.CONFIG_KV.put(codeKey, JSON.stringify(rec));
+    } catch (_) {
+      return jsonResponse({ ok: false, error: "啟動碼寫入失敗，請重試" }, 200);
+    }
+  }
+
+  try {
+    await authorizeDevice(env, id, expireAt, code);
+  } catch (_) {
+    return jsonResponse({ ok: false, error: "授權寫入失敗，請重試" }, 200);
+  }
+
+  return jsonResponse({ ok: true, expireAt, message: "啟動成功" }, 200);
+}
+
+/**
+ * 列出所有啟動碼（前綴 code:），依建立時間新到舊排序，上限 CODE_LIST_MAX。
+ */
+async function loadCodes(env) {
+  let keys = [];
+  try {
+    const listed = await env.CONFIG_KV.list({ prefix: CODE_PREFIX });
+    keys = (listed && Array.isArray(listed.keys) ? listed.keys : []).slice(0, CODE_LIST_MAX);
+  } catch (err) {
+    console.error("啟動碼列舉失敗:", err);
+    return [];
+  }
+  const codes = [];
+  for (const k of keys) {
+    try {
+      const c = await env.CONFIG_KV.get(k.name, { type: "json" });
+      if (c && typeof c === "object") codes.push(c);
+    } catch (_) {}
+  }
+  codes.sort(
+    (a, b) => (Date.parse(b && b.createdAt) || 0) - (Date.parse(a && a.createdAt) || 0)
+  );
+  return codes;
+}
+
+/* ================================================================
  *  驗證（HTTP Basic Auth）
  * ================================================================ */
 
@@ -590,7 +764,8 @@ async function handleAdminPage(request, env) {
 
   const config = await loadConfig(env);
   const devices = await loadDevices(env);
-  const html = renderAdminHtml(config, devices);
+  const codes = await loadCodes(env);
+  const html = renderAdminHtml(config, devices, codes);
   return new Response(html, {
     status: 200,
     headers: { "Content-Type": "text/html; charset=utf-8" },
@@ -628,6 +803,13 @@ async function handleAdminSave(request, env) {
   const forceRefresh = form.get("forceRefresh") === "on";
   // autostart：開機自動啟動。checkbox 沒勾時表單不會送該欄位，故用「是否等於 on」判斷，沒送即 false。
   const autostart = form.get("autostart") === "on";
+  // 授權 / 啟動畫面設定
+  const requireActivation = form.get("requireActivation") === "on";
+  const activationTitle = (form.get("activationTitle") || "").toString();
+  const activationText = (form.get("activationText") || "").toString();
+  let codeDigits = parseInt((form.get("codeDigits") || "").toString(), 10);
+  if (!Number.isFinite(codeDigits)) codeDigits = current.codeDigits || 8;
+  codeDigits = Math.max(4, Math.min(12, codeDigits));
 
   // 驗證
   if (!subscriptionUrl || !/^https?:\/\//i.test(subscriptionUrl)) {
@@ -650,6 +832,10 @@ async function handleAdminSave(request, env) {
     pollIntervalMinutes,
     forceRefresh,
     autostart,
+    requireActivation,
+    activationTitle,
+    activationText,
+    codeDigits,
     updatedAt: new Date().toISOString(),
   };
 
@@ -821,6 +1007,32 @@ async function handleAdminDevice(request, env) {
     );
   }
 
+  // 一鍵授權所有現有裝置（啟用授權機制時，避免既有盒子被鎖在外）。
+  if (action === "authorize_all") {
+    let days = parseInt(value, 10);
+    if (!Number.isFinite(days) || days < 0) days = 0;
+    const expireAt = days > 0 ? new Date(Date.now() + days * 86400000).toISOString() : "";
+    let devices = [];
+    try {
+      devices = await loadDevices(env);
+    } catch (_) {
+      return renderResultPage(false, "列舉裝置失敗，請稍後再試。", { version: "-", updatedAt: "-" });
+    }
+    let n = 0;
+    for (const dev of devices) {
+      if (!dev || !dev.id) continue;
+      try {
+        await authorizeDevice(env, dev.id, expireAt, "");
+        n++;
+      } catch (_) {}
+    }
+    return renderResultPage(
+      true,
+      `已授權 ${n} 台現有裝置（${days > 0 ? days + " 天" : "永久"}）。`,
+      { version: "-", updatedAt: new Date().toISOString() }
+    );
+  }
+
   if (!id || !action) {
     return renderResultPage(false, "缺少裝置 id 或動作。", { version: "-", updatedAt: "-" });
   }
@@ -877,6 +1089,20 @@ async function handleAdminDevice(request, env) {
       dev.autostart = value === "on";
       summary = `已將裝置 ${id} 的開機自啟設為「${dev.autostart ? "開" : "關"}」。`;
       break;
+    case "authorize": {
+      let days = parseInt(value, 10);
+      if (!Number.isFinite(days) || days < 0) days = 0;
+      dev.authorized = true;
+      dev.authedAt = new Date().toISOString();
+      dev.expireAt = days > 0 ? new Date(Date.now() + days * 86400000).toISOString() : "";
+      summary = `已授權裝置 ${id}（${days > 0 ? days + " 天" : "永久"}）。`;
+      break;
+    }
+    case "deauthorize":
+      dev.authorized = false;
+      dev.expireAt = "";
+      summary = `已撤銷裝置 ${id} 的授權。`;
+      break;
     default:
       return renderResultPage(false, `未知動作：${action}。`, { version: "-", updatedAt: "-" });
   }
@@ -889,6 +1115,167 @@ async function handleAdminDevice(request, env) {
   }
 
   return renderResultPage(true, summary, { version: "-", updatedAt: new Date().toISOString() });
+}
+
+/**
+ * POST /admin/codes — 啟動碼管理（需 Basic Auth）。
+ * action：gen_single（產 1 組）/ gen_batch（產 count 組）/ revoke（撤銷）/ delete（刪除）。
+ * 參數：days（有效天數，0=永久）、note（備註）、count（批量數）、code（指定碼）。
+ */
+async function handleAdminCodes(request, env) {
+  const unauthorized = checkAuth(request, env);
+  if (unauthorized) return unauthorized;
+
+  let form;
+  try {
+    form = await request.formData();
+  } catch (_) {
+    return renderResultPage(false, "表單解析失敗。", { version: "-", updatedAt: "-" });
+  }
+
+  const action = (form.get("action") || "").toString().trim();
+  const note = (form.get("note") || "").toString().trim();
+  let days = parseInt((form.get("days") || "").toString(), 10);
+  if (!Number.isFinite(days) || days < 0) days = 0;
+
+  const nowIso = new Date().toISOString();
+
+  // 產生啟動碼（單筆或批量）
+  if (action === "gen_single" || action === "gen_batch") {
+    const config = await loadConfig(env);
+    const digits = config.codeDigits || 8;
+    let count =
+      action === "gen_batch" ? parseInt((form.get("count") || "").toString(), 10) : 1;
+    if (!Number.isFinite(count) || count < 1) count = 1;
+    count = Math.min(count, 200); // 單次上限，避免誤觸大量寫入
+
+    const created = [];
+    for (let i = 0; i < count; i++) {
+      let code = "";
+      for (let tries = 0; tries < 6; tries++) {
+        const c = genCodeString(digits);
+        let exists = null;
+        try {
+          exists = await env.CONFIG_KV.get(CODE_PREFIX + c);
+        } catch (_) {}
+        if (!exists) {
+          code = c;
+          break;
+        }
+      }
+      if (!code) continue;
+      const rec = {
+        code,
+        status: "unused",
+        device: null,
+        note,
+        days,
+        createdAt: nowIso,
+        usedAt: "",
+        expireAt: "",
+      };
+      try {
+        await env.CONFIG_KV.put(CODE_PREFIX + code, JSON.stringify(rec));
+        created.push(code);
+      } catch (_) {}
+    }
+    return renderCodesResultPage(created, days, note);
+  }
+
+  // 以下動作需指定 code
+  const code = (form.get("code") || "").toString().trim();
+  if (!code) {
+    return renderResultPage(false, "缺少啟動碼。", { version: "-", updatedAt: "-" });
+  }
+  const key = CODE_PREFIX + code;
+
+  if (action === "delete") {
+    try {
+      await env.CONFIG_KV.delete(key);
+    } catch (_) {
+      return renderResultPage(false, "刪除失敗。", { version: "-", updatedAt: "-" });
+    }
+    return renderResultPage(true, `已刪除啟動碼 ${code}。`, { version: "-", updatedAt: nowIso });
+  }
+
+  if (action === "revoke") {
+    let rec = null;
+    try {
+      rec = await env.CONFIG_KV.get(key, { type: "json" });
+    } catch (_) {}
+    if (!rec) {
+      return renderResultPage(false, `找不到啟動碼 ${code}。`, { version: "-", updatedAt: "-" });
+    }
+    rec.status = "revoked";
+    // 若已綁定裝置，一併撤銷該裝置授權。
+    if (rec.device) {
+      try {
+        const dkey = DEVICE_PREFIX + rec.device;
+        const dev = await env.CONFIG_KV.get(dkey, { type: "json" });
+        if (dev) {
+          dev.authorized = false;
+          dev.expireAt = "";
+          await env.CONFIG_KV.put(dkey, JSON.stringify(dev));
+        }
+      } catch (_) {}
+    }
+    try {
+      await env.CONFIG_KV.put(key, JSON.stringify(rec));
+    } catch (_) {
+      return renderResultPage(false, "撤銷失敗。", { version: "-", updatedAt: "-" });
+    }
+    return renderResultPage(
+      true,
+      `已撤銷啟動碼 ${code}${rec.device ? "（並停用綁定裝置）" : ""}。`,
+      { version: "-", updatedAt: nowIso }
+    );
+  }
+
+  return renderResultPage(false, `未知動作：${action}。`, { version: "-", updatedAt: "-" });
+}
+
+/**
+ * 產生「啟動碼已生成」結果頁，列出新碼並提供一鍵複製。
+ */
+function renderCodesResultPage(codes, days, note) {
+  const list = Array.isArray(codes) ? codes : [];
+  const term = days > 0 ? days + " 天" : "永久";
+  const rows = list
+    .map((c) => `<div class="cg-row"><span class="mono">${escapeHtml(c)}</span></div>`)
+    .join("");
+  const allText = list.join("\n");
+  const html = `<!DOCTYPE html><html lang="zh-Hant"><head><meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>偉電視 · 啟動碼已產生</title>
+<style>
+  :root{color-scheme:dark}*{box-sizing:border-box}
+  body{margin:0;background:radial-gradient(1200px 600px at 50% -10%,rgba(45,212,191,.07),transparent 60%),linear-gradient(165deg,#07090E,#0C1119);background-attachment:fixed;color:#EEF2F7;font-family:-apple-system,"PingFang TC","Microsoft JhengHei",system-ui,sans-serif;padding:40px 16px;line-height:1.6}
+  .wrap{max-width:640px;margin:0 auto}
+  .card{background:linear-gradient(180deg,#141A28,#0F1420 130%);border:1px solid rgba(45,212,191,.4);border-radius:16px;padding:22px;box-shadow:0 10px 30px -18px rgba(0,0,0,.85)}
+  .head{display:flex;align-items:center;gap:14px}
+  .icon{width:46px;height:46px;flex:none;border-radius:13px;display:flex;align-items:center;justify-content:center;font-size:24px;font-weight:800;background:rgba(45,212,191,.16);color:#2DD4BF}
+  .title{font-size:18px;font-weight:700}
+  .meta{color:#97A2B4;font-size:13px;margin-top:14px;display:flex;flex-wrap:wrap;gap:6px 18px}.meta b{color:#EEF2F7}
+  .code-box{margin-top:16px;max-height:340px;overflow:auto;border:1px solid #273043;border-radius:12px;background:#0F1420;padding:6px}
+  .cg-row{padding:9px 12px;border-bottom:1px solid #1b2231;font-size:19px;letter-spacing:2px}.cg-row:last-child{border-bottom:0}
+  .mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;color:#2DD4BF;font-weight:700}
+  .btn{display:flex;align-items:center;justify-content:center;text-decoration:none;margin-top:16px;background:linear-gradient(135deg,#2DD4BF,#0EA5A0);color:#04201E;padding:15px;border-radius:13px;font-size:16px;font-weight:700;border:none;width:100%;cursor:pointer;font-family:inherit}
+  .btn2{background:transparent;color:#EEF2F7;border:1px solid #273043}
+</style></head><body>
+<div class="wrap"><div class="card">
+  <div class="head"><div class="icon">✓</div><div class="title">已產生 ${list.length} 組啟動碼</div></div>
+  <div class="meta"><span>有效期 <b>${term}</b></span>${note ? `<span>備註 <b>${escapeHtml(note)}</b></span>` : ""}</div>
+  <div class="code-box">${rows || '<div class="cg-row">（沒有產生，請重試）</div>'}</div>
+  <button class="btn" onclick="copyAll()">📋 複製全部</button>
+  <a class="btn btn2" href="/admin">返回管理中心</a>
+</div></div>
+<textarea id="allcodes" style="position:absolute;left:-9999px;top:0">${escapeHtml(allText)}</textarea>
+<script>function copyAll(){var t=document.getElementById('allcodes');t.focus();t.select();try{document.execCommand('copy');alert('已複製 ${list.length} 組啟動碼');}catch(e){alert('複製失敗，請手動選取');}}</script>
+</body></html>`;
+  return new Response(html, {
+    status: 200,
+    headers: { "Content-Type": "text/html; charset=utf-8" },
+  });
 }
 
 /* ================================================================
@@ -958,6 +1345,111 @@ function formatTaipeiFull(iso) {
 }
 
 /**
+ * 產生「啟動碼管理」區塊：生成表單 + 一鍵授權現有 + 啟動碼清單。
+ */
+function renderCodesSection(codes, config) {
+  const list = Array.isArray(codes) ? codes : [];
+  const now = Date.now();
+  let rows;
+  if (list.length === 0) {
+    rows = `<div class="log-empty">尚無啟動碼，用上方表單產生。</div>`;
+  } else {
+    rows = list.map((c) => renderCodeRow(c, now)).join("");
+  }
+  return `<div class="card">
+    <div class="card-title">🎟️ 啟動碼管理 · 共 ${list.length} 組</div>
+
+    <form method="POST" action="/admin/codes" class="gen-form">
+      <input type="hidden" name="action" value="gen_batch">
+      <div class="gen-grid">
+        <div class="gen-field">
+          <label>產生數量</label>
+          <input type="number" name="count" value="1" min="1" max="200">
+        </div>
+        <div class="gen-field">
+          <label>有效天數（0＝永久）</label>
+          <input type="number" name="days" value="0" min="0">
+        </div>
+      </div>
+      <label class="gen-label">備註（選填）</label>
+      <input type="text" name="note" class="gen-input" placeholder="例如：某經銷商 / 王先生 / 春節檔">
+      <button type="submit" class="btn btn-primary">＋ 產生啟動碼</button>
+    </form>
+
+    <form method="POST" action="/admin/device" class="gen-existing" onsubmit="return confirm('確定把目前所有現有裝置設為已授權（永久）？');">
+      <input type="hidden" name="action" value="authorize_all">
+      <input type="hidden" name="value" value="0">
+      <button type="submit" class="btn btn-secondary">🔓 一鍵授權所有現有裝置（永久）</button>
+    </form>
+
+    <div class="code-list">${rows}</div>
+  </div>`;
+}
+
+/**
+ * 單一啟動碼列。狀態：未使用 / 已啟用 / 已到期 / 已撤銷。
+ */
+function renderCodeRow(c, now) {
+  const code = String(c && c.code != null ? c.code : "");
+  const status = c && c.status ? c.status : "unused";
+  const note = String(c && c.note ? c.note : "");
+  const device = String(c && c.device ? c.device : "");
+  const expireAt = c && c.expireAt ? c.expireAt : "";
+  const days = c && typeof c.days === "number" ? c.days : 0;
+  const codeAttr = escapeHtml(code);
+
+  let badge;
+  if (status === "revoked") {
+    badge = `<span class="badge dev-blocked">已撤銷</span>`;
+  } else if (status === "used") {
+    if (expireAt && (Date.parse(expireAt) || 0) <= now) {
+      badge = `<span class="badge dev-blocked">已到期</span>`;
+    } else {
+      badge = `<span class="badge on">已啟用</span>`;
+    }
+  } else {
+    badge = `<span class="badge dev-active">未使用</span>`;
+  }
+
+  const termText =
+    status === "unused"
+      ? days > 0
+        ? days + " 天"
+        : "永久"
+      : expireAt
+      ? "到期 " + formatTaipeiFull(expireAt)
+      : "永久";
+
+  const metaParts = [];
+  if (device) metaParts.push("綁定 " + escapeHtml(device));
+  metaParts.push(escapeHtml(termText));
+  if (note) metaParts.push("📝 " + escapeHtml(note));
+
+  const revokeBtn =
+    status !== "revoked"
+      ? `<form class="dev-form" method="POST" action="/admin/codes">
+          <input type="hidden" name="code" value="${codeAttr}">
+          <input type="hidden" name="action" value="revoke">
+          <button type="submit" class="btn-mini btn-danger">撤銷</button>
+        </form>`
+      : "";
+  const delBtn = `<form class="dev-form" method="POST" action="/admin/codes" onsubmit="return confirm('刪除此啟動碼？');">
+      <input type="hidden" name="code" value="${codeAttr}">
+      <input type="hidden" name="action" value="delete">
+      <button type="submit" class="btn-mini">刪除</button>
+    </form>`;
+
+  return `<div class="code-row">
+    <div class="code-row-top">
+      <span class="code-val mono">${codeAttr}</span>
+      ${badge}
+    </div>
+    <div class="code-row-meta">${metaParts.join(" · ")}</div>
+    <div class="code-row-actions">${revokeBtn}${delBtn}</div>
+  </div>`;
+}
+
+/**
  * 產生「裝置管理」區塊 HTML（沿用既有深色卡片樣式）。
  * 每台一張卡片，附封鎖/解封、傳話、改暱稱、刪除操作。
  */
@@ -999,6 +1491,18 @@ function renderDeviceCard(d) {
   const msg = String(d && d.msg ? d.msg : "");
   const msgLevel = d && d.msgLevel === "warn" ? "warn" : "info";
   const idAttr = escapeHtml(id);
+  // 授權狀態
+  const authed = !!(d && d.authorized);
+  const dExpireAt = d && d.expireAt ? d.expireAt : "";
+  const dExpired = authed && dExpireAt && (Date.parse(dExpireAt) || 0) <= Date.now();
+  const authActive = authed && !dExpired;
+  const authText = !authed
+    ? "未授權"
+    : dExpired
+    ? "已到期"
+    : dExpireAt
+    ? "至 " + formatTaipeiFull(dExpireAt)
+    : "永久";
 
   // 開機自啟：該裝置設過布林就顯示開/關，否則顯示「預設(全域)」。
   const hasAutostart = d && typeof d.autostart === "boolean";
@@ -1070,6 +1574,7 @@ function renderDeviceCard(d) {
     <div class="dev-source ${hasAutostart ? (autostartOn ? "ok" : "bad") : "none"}">⚡ 開機自啟：${escapeHtml(
     autostartText
   )}</div>
+    <div class="dev-source ${authActive ? "ok" : "bad"}">🔑 授權：${escapeHtml(authText)}</div>
     ${currentMsg}
     <div class="dev-actions">
       ${blockForm}
@@ -1111,6 +1616,23 @@ function renderDeviceCard(d) {
         }">${autostartBtnLabel}</button>
       </form>
 
+      <form class="dev-form dev-auth-form" method="POST" action="/admin/device">
+        <input type="hidden" name="id" value="${idAttr}">
+        <input type="hidden" name="action" value="authorize">
+        <input type="number" name="value" class="dev-input dev-days" placeholder="天數" value="0" min="0">
+        <button type="submit" class="btn-mini btn-ok">授權(天,0=永久)</button>
+      </form>
+
+      ${
+        authed
+          ? `<form class="dev-form" method="POST" action="/admin/device">
+        <input type="hidden" name="id" value="${idAttr}">
+        <input type="hidden" name="action" value="deauthorize">
+        <button type="submit" class="btn-mini btn-danger">撤銷授權</button>
+      </form>`
+          : ""
+      }
+
       <form class="dev-form" method="POST" action="/admin/device" onsubmit="return confirm('確定刪除這台裝置紀錄？');">
         <input type="hidden" name="id" value="${idAttr}">
         <input type="hidden" name="action" value="delete">
@@ -1123,7 +1645,26 @@ function renderDeviceCard(d) {
 /**
  * 產生管理頁主畫面 HTML（深色、大按鈕、RWD）。
  */
-function renderAdminHtml(config, devices) {
+function renderAdminHtml(config, devices, codes) {
+  const devList = Array.isArray(devices) ? devices : [];
+  const codeList = Array.isArray(codes) ? codes : [];
+  const now = Date.now();
+  const DAY = 86400000;
+  const devAuthed = (d) =>
+    d && d.authorized === true && (!d.expireAt || (Date.parse(d.expireAt) || 0) > now);
+  const stat = {
+    total: devList.length,
+    online: devList.filter(
+      (d) => d && d.lastSeen && now - (Date.parse(d.lastSeen) || 0) < DAY
+    ).length,
+    authed: devList.filter(devAuthed).length,
+  };
+  stat.unauth = stat.total - stat.authed;
+  const codeStat = {
+    total: codeList.length,
+    used: codeList.filter((c) => c && c.status === "used").length,
+    unused: codeList.filter((c) => c && c.status === "unused").length,
+  };
   return `<!DOCTYPE html>
 <html lang="zh-Hant">
 <head>
@@ -1376,6 +1917,44 @@ function renderAdminHtml(config, devices) {
   @media (max-width: 480px) {
     .dev-input { flex-basis: 100%; }
   }
+
+  /* 概覽儀表板 */
+  .stat-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 9px; }
+  .stat-box { background: var(--surface-2); border: 1px solid var(--border); border-radius: 12px; padding: 13px 10px; text-align: center; }
+  .sb-num { font-size: 26px; font-weight: 800; color: var(--text); line-height: 1.1; }
+  .sb-num.accent { color: var(--accent); }
+  .sb-num.ok { color: #34D399; }
+  .sb-num.warn { color: var(--gold); }
+  .sb-label { font-size: 11.5px; color: var(--text-dim); margin-top: 4px; }
+  .auth-banner { margin-top: 13px; padding: 11px 13px; border-radius: 11px; font-size: 13px; line-height: 1.6; border: 1px solid var(--border); }
+  .auth-banner b { font-weight: 700; }
+  .auth-banner.on { color: var(--accent); background: rgba(45,212,191,0.08); border-color: rgba(45,212,191,0.32); }
+  .auth-banner.off { color: var(--text-dim); background: var(--surface-2); }
+
+  /* 區段分隔 */
+  .section-sep { margin: 24px 0 6px; padding-top: 16px; border-top: 1px dashed var(--border); font-size: 13px; font-weight: 700; color: var(--accent); letter-spacing: 0.5px; }
+
+  /* 啟動碼生成表單 */
+  .gen-form { background: var(--surface-2); border: 1px solid var(--border); border-radius: 13px; padding: 14px; margin-bottom: 12px; }
+  .gen-grid { display: flex; gap: 10px; }
+  .gen-field { flex: 1; }
+  .gen-field label, .gen-label { display: block; font-size: 12.5px; color: var(--text-dim); font-weight: 600; margin: 0 0 6px; }
+  .gen-label { margin-top: 12px; }
+  .gen-field input, .gen-input { width: 100%; padding: 12px 13px; font-size: 16px; border-radius: 11px; border: 1px solid var(--border); background: var(--bg-1); color: var(--text); font-family: inherit; }
+  .gen-field input:focus, .gen-input:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px rgba(45,212,191,0.16); }
+  .gen-form .btn { margin-top: 14px; }
+  .gen-existing { margin-bottom: 14px; }
+  .gen-existing .btn { margin-top: 0; }
+
+  /* 啟動碼清單 */
+  .code-list { display: flex; flex-direction: column; gap: 8px; max-height: 460px; overflow-y: auto; }
+  .code-row { background: var(--surface-2); border: 1px solid var(--border); border-radius: 12px; padding: 12px 13px; }
+  .code-row-top { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+  .code-val { font-size: 20px; font-weight: 700; color: var(--accent); letter-spacing: 2px; word-break: break-all; }
+  .code-row-meta { color: var(--text-dim); font-size: 12.5px; margin-top: 7px; word-break: break-all; }
+  .code-row-actions { display: flex; gap: 8px; margin-top: 10px; }
+  .dev-days { flex: 0 0 92px !important; min-width: 0; }
+
   .footnote { text-align: center; color: var(--text-dim); font-size: 12.5px; margin-top: 24px; }
 </style>
 </head>
@@ -1386,7 +1965,26 @@ function renderAdminHtml(config, devices) {
     <h1>偉電視 · 管理中心</h1>
   </div>
   <div class="accent-line"></div>
-  <div class="sub">遠端同步直播源訂閱網址。存檔後盒子下次輪詢自動更新。</div>
+  <div class="sub">遠端管理直播源、授權與裝置。存檔後盒子下次輪詢自動更新。</div>
+
+  <div class="card">
+    <div class="card-title">📊 營運概覽</div>
+    <div class="stat-grid">
+      <div class="stat-box"><div class="sb-num">${stat.total}</div><div class="sb-label">總裝置</div></div>
+      <div class="stat-box"><div class="sb-num accent">${stat.online}</div><div class="sb-label">24h 在線</div></div>
+      <div class="stat-box"><div class="sb-num ok">${stat.authed}</div><div class="sb-label">已授權</div></div>
+      <div class="stat-box"><div class="sb-num ${stat.unauth > 0 ? "warn" : ""}">${stat.unauth}</div><div class="sb-label">未授權</div></div>
+      <div class="stat-box"><div class="sb-num">${codeStat.unused}</div><div class="sb-label">未用碼</div></div>
+      <div class="stat-box"><div class="sb-num">${codeStat.used}</div><div class="sb-label">已用碼</div></div>
+    </div>
+    <div class="auth-banner ${config.requireActivation ? "on" : "off"}">
+      ${
+        config.requireActivation
+          ? "🔒 授權機制 <b>已啟用</b>：未授權或到期的盒子無法取得直播源。"
+          : "🔓 授權機制 <b>未啟用</b>：目前所有盒子皆可觀看（到下方「授權與啟動畫面」開啟）。"
+      }
+    </div>
+  </div>
 
   <div class="card">
     <div class="card-title">目前設定</div>
@@ -1458,12 +2056,42 @@ function renderAdminHtml(config, devices) {
       <label for="autostart">開機自動啟動（所有盒子開機後自動開啟 App）</label>
     </div>
 
+    <div class="section-sep">🔐 授權與啟動畫面</div>
+
+    <div class="switch-row">
+      <input type="checkbox" id="requireActivation" name="requireActivation" ${
+        config.requireActivation ? "checked" : ""
+      }>
+      <label for="requireActivation">啟用啟動碼授權（未授權／到期盒子無法觀看）</label>
+    </div>
+
+    <label for="activationTitle">啟動畫面標題
+      <span class="hint">App 開啟與輸入啟動碼時顯示</span>
+    </label>
+    <input type="text" id="activationTitle" name="activationTitle" value="${escapeHtml(
+      config.activationTitle || ""
+    )}">
+
+    <label for="activationText">啟動畫面說明文字
+      <span class="hint">可換行；可放歡迎語、客服聯絡方式等</span>
+    </label>
+    <textarea id="activationText" name="activationText">${escapeHtml(
+      config.activationText || ""
+    )}</textarea>
+
+    <label for="codeDigits">啟動碼位數（4～12，方便遙控器輸入）</label>
+    <input type="number" id="codeDigits" name="codeDigits" min="4" max="12" value="${escapeHtml(
+      config.codeDigits || 8
+    )}">
+
     <button type="submit" class="btn btn-primary">儲存設定</button>
   </form>
 
+  ${renderCodesSection(codeList, config)}
+
   ${renderDevicesSection(devices)}
 
-  <div class="footnote">App 設定端點 <code>/api/config</code></div>
+  <div class="footnote">App 設定端點 <code>/api/config</code> · 啟動端點 <code>/api/activate</code></div>
 </div>
 
 <script>
