@@ -1114,8 +1114,12 @@ async function testSource() {
       var good = data.httpOk && data.channelCount > 0;
       var cls = good ? 'ok' : 'bad';
       var icon = good ? '\\u2713' : '\\u2715';
-      var title = good ? '來源正常' : '來源有問題';
-      var subtxt = good ? '可以儲存使用' : 'HTTP 異常或未解析到頻道';
+      var title = good ? '來源正常' : '雲端測試未通過';
+      var subtxt = good ? '可以儲存使用' : '雲端連不到(不代表盒子連不到,見下方說明)';
+      var hint = good ? '' :
+        '<div style="margin-top:12px;padding:11px 13px;border-radius:10px;background:rgba(251,191,36,0.10);border:1px solid rgba(251,191,36,0.35);color:#FBBF24;font-size:13px;line-height:1.7;">' +
+        '\\u26A0 此測試是從 Cloudflare 雲端 IP 去打來源。若你的源只允許台灣/家用 IP(很常見),雲端會被擋(例如 403);但電視盒是從你家網路<b>直接連源</b>,通常仍可正常使用 \\u2014 可直接按「儲存設定」。' +
+        '</div>';
       el.innerHTML =
         '<div class="result-card ' + cls + '">' +
           '<div class="result-head">' +
@@ -1128,7 +1132,7 @@ async function testSource() {
             '<div class="stat"><div class="sk">M3U 格式</div><div class="sv">' + (data.looksLikeM3u ? '是' : '否') + '</div></div>' +
             '<div class="stat"><div class="sk">頻道數</div><div class="sv">' + data.channelCount + '</div></div>' +
             '<div class="stat"><div class="sk">回應大小</div><div class="sv">' + data.bytes + ' B</div></div>' +
-          '</div>' +
+          '</div>' + hint +
         '</div>';
     } else {
       el.innerHTML =
