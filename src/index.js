@@ -234,6 +234,13 @@ async function touchDevice(request, env) {
   dev.m = url.searchParams.get("m") || "";
   dev.v = url.searchParams.get("v") || "";
 
+  // 盒子實測來源健康：只有帶 ok 參數時才更新這三個欄位。
+  if (url.searchParams.has("ok")) {
+    dev.lastOk = url.searchParams.get("ok") === "1";
+    dev.lastCount = parseInt(url.searchParams.get("ch"), 10) || 0;
+    dev.lastResultAt = now;
+  }
+
   await env.CONFIG_KV.put(key, JSON.stringify(dev));
   return dev;
 }
@@ -474,6 +481,9 @@ async function handleAdminTest(request, env) {
     return jsonResponse({ ok: false, error: "網址格式不正確" }, 400);
   }
 
+  // 盒子實測健康彙整（雲端被擋時也有真實判斷依據）。
+  const boxes = await summarizeBoxes(env);
+
   try {
     // 設 10 秒逾時，避免卡住。
     const controller = new AbortController();
@@ -496,14 +506,58 @@ async function handleAdminTest(request, env) {
       channelCount,
       bytes: text.length,
       looksLikeM3u: /#EXTM3U/i.test(text),
+      boxes,
     });
   } catch (err) {
     const msg =
       err && err.name === "AbortError"
         ? "連線逾時（10 秒）"
         : "連線失敗：" + (err && err.message ? err.message : "未知錯誤");
-    return jsonResponse({ ok: false, error: msg }, 200);
+    return jsonResponse({ ok: false, error: msg, boxes }, 200);
   }
+}
+
+/**
+ * 用 loadDevices 彙整盒子實測來源健康。
+ * 回傳：reported（有回報數）、ok（成功數）、maxCount（ok 裝置最大頻道數）、
+ * recentAt（最新 lastResultAt ISO，沒有為 ""）、recentRel（recentAt 的相對時間）。
+ */
+async function summarizeBoxes(env) {
+  let devices = [];
+  try {
+    devices = await loadDevices(env);
+  } catch (_) {
+    devices = [];
+  }
+
+  let reported = 0;
+  let ok = 0;
+  let maxCount = 0;
+  let recentMs = 0;
+  let recentAt = "";
+
+  for (const d of devices) {
+    if (!d || !d.lastResultAt) continue;
+    reported++;
+    const ms = Date.parse(d.lastResultAt) || 0;
+    if (ms > recentMs) {
+      recentMs = ms;
+      recentAt = d.lastResultAt;
+    }
+    if (d.lastOk === true) {
+      ok++;
+      const c = typeof d.lastCount === "number" ? d.lastCount : 0;
+      if (c > maxCount) maxCount = c;
+    }
+  }
+
+  return {
+    reported,
+    ok,
+    maxCount,
+    recentAt,
+    recentRel: recentAt ? relativeTime(recentAt) : "",
+  };
 }
 
 /* ================================================================
@@ -717,6 +771,20 @@ function renderDeviceCard(d) {
       }）：${escapeHtml(msg)}</div>`
     : "";
 
+  // 盒子實測來源健康狀態列。
+  let sourceLine;
+  if (d && d.lastResultAt) {
+    const rel = escapeHtml(relativeTime(d.lastResultAt) || "");
+    if (d.lastOk) {
+      const cnt = escapeHtml(d.lastCount != null ? d.lastCount : 0);
+      sourceLine = `<div class="dev-source ok">📡 來源 ✓ ${cnt} 台 · ${rel}</div>`;
+    } else {
+      sourceLine = `<div class="dev-source bad">📡 來源 ✕ 失敗 · ${rel}</div>`;
+    }
+  } else {
+    sourceLine = `<div class="dev-source none">📡 來源 尚未回報</div>`;
+  }
+
   return `<div class="dev-card">
     <div class="dev-head">
       <div class="dev-name">${escapeHtml(title)}</div>
@@ -734,6 +802,7 @@ function renderDeviceCard(d) {
       <span>累計：${escapeHtml(d && d.count != null ? d.count : 0)} 次</span>
       <span class="mono">IP：${escapeHtml(d && d.ip ? d.ip : "-")}</span>
     </div>
+    ${sourceLine}
     ${currentMsg}
     <div class="dev-actions">
       ${blockForm}
@@ -993,6 +1062,10 @@ function renderAdminHtml(config, devices) {
   }
   .dev-curmsg.lv-info { color: var(--accent); background: rgba(45,212,191,0.08); border-color: rgba(45,212,191,0.3); }
   .dev-curmsg.lv-warn { color: var(--gold); background: rgba(251,191,36,0.10); border-color: rgba(251,191,36,0.35); }
+  .dev-source { margin-top: 8px; font-size: 12.5px; font-weight: 600; }
+  .dev-source.ok { color: var(--accent); }
+  .dev-source.bad { color: var(--danger); }
+  .dev-source.none { color: var(--text-dim); }
   .dev-actions { margin-top: 12px; display: flex; flex-direction: column; gap: 8px; }
   .dev-form { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin: 0; }
   .dev-input {
@@ -1097,6 +1170,24 @@ function renderAdminHtml(config, devices) {
 </div>
 
 <script>
+function renderBoxesHtml(b) {
+  if (!b) return '';
+  var inner;
+  if (b.ok > 0) {
+    inner = '<div style="margin-top:12px;padding:11px 13px;border-radius:10px;background:rgba(45,212,191,0.10);border:1px solid rgba(45,212,191,0.35);color:#2DD4BF;font-size:13px;line-height:1.7;">' +
+      '\\u2705 盒子實測：' + b.ok + ' 台盒子最近成功載入(最多 ' + b.maxCount + ' 台,' + (b.recentRel || '') + ')\\u2014 這是真實結果,可放心儲存。' +
+      '</div>';
+  } else if (b.reported > 0) {
+    inner = '<div style="margin-top:12px;padding:11px 13px;border-radius:10px;background:rgba(255,77,94,0.08);border:1px solid rgba(255,77,94,0.35);color:#FF4D5E;font-size:13px;line-height:1.7;">' +
+      '盒子有回報,但最近未成功載入來源。' +
+      '</div>';
+  } else {
+    inner = '<div style="margin-top:12px;padding:11px 13px;border-radius:10px;background:rgba(151,162,180,0.08);border:1px solid #273043;color:#97A2B4;font-size:13px;line-height:1.7;">' +
+      '尚無盒子回報實測(盒子裝好 App 開過後,這裡會顯示真實載入結果)。' +
+      '</div>';
+  }
+  return inner;
+}
 async function testSource() {
   var el = document.getElementById('testResult');
   var url = document.getElementById('subscriptionUrl').value.trim();
@@ -1110,6 +1201,7 @@ async function testSource() {
     fd.append('subscriptionUrl', url);
     var r = await fetch('/admin/test', { method: 'POST', body: fd });
     var data = await r.json();
+    var boxesHtml = renderBoxesHtml(data.boxes);
     if (data.ok) {
       var good = data.httpOk && data.channelCount > 0;
       var cls = good ? 'ok' : 'bad';
@@ -1133,14 +1225,14 @@ async function testSource() {
             '<div class="stat"><div class="sk">頻道數</div><div class="sv">' + data.channelCount + '</div></div>' +
             '<div class="stat"><div class="sk">回應大小</div><div class="sv">' + data.bytes + ' B</div></div>' +
           '</div>' + hint +
-        '</div>';
+        '</div>' + boxesHtml;
     } else {
       el.innerHTML =
         '<div class="result-card bad"><div class="result-head">' +
           '<div class="result-icon">\\u2715</div>' +
           '<div><div class="result-title">測試失敗</div>' +
           '<div class="result-sub">' + (data.error || '未知錯誤') + '</div></div>' +
-        '</div></div>';
+        '</div></div>' + boxesHtml;
     }
   } catch (e) {
     el.innerHTML =
