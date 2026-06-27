@@ -94,17 +94,16 @@
 
 ---
 
-## 🛠 手動部署 / 改完程式後重新部署(CLI)
+## 🛠 改完程式後怎麼部署
 
-本資料夾改了 `src/index.js` 後,要重新部署才會生效:
+**主要方式:push 到 GitHub 自動部署。** 本 repo 接了 Cloudflare Workers Builds——只要把改動 push 到 `weid4t-worker` 的 `main`,Cloudflare 會**自動重新部署**(幾分鐘生效),不必下任何部署指令:
 
 ```bash
-npx wrangler login     # 第一次,或登入過期時(會開瀏覽器授權)
-npx wrangler deploy    # 部署
+git push origin main
 ```
 
-> wrangler 的登入 token **會過期**;過期時在「互動終端」重跑 `npx wrangler login`,或設環境變數 `CLOUDFLARE_API_TOKEN`。
-> 部署前可先驗證打包:`npx wrangler deploy --dry-run`。
+> 備選(CLI 手動部署):`npx wrangler login` 後 `npx wrangler deploy`。wrangler 登入 token 會過期,過期時需在互動終端重跑 `login`。
+> 改完想先驗證打包:`npx wrangler deploy --dry-run`。
 
 ---
 
