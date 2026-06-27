@@ -56,6 +56,16 @@ export default {
         return await handleGetConfig(request, env);
       }
 
+      // ── App OTA：查詢最新版本（公開，不需 Basic Auth）──
+      if (pathname === "/api/update" && method === "GET") {
+        return await handleUpdateInfo(request, env);
+      }
+
+      // ── App OTA：下載最新 APK（公開，串流代理）────────
+      if (pathname === "/dl/latest.apk" && method === "GET") {
+        return await handleDownloadApk(request, env);
+      }
+
       // ── 管理頁：顯示 HTML 介面（需驗證）────────────────
       if (pathname === "/admin" && method === "GET") {
         return await handleAdminPage(request, env);
@@ -176,6 +186,189 @@ async function handleGetConfig(request, env) {
       "Content-Type": "application/json; charset=utf-8",
       "Cache-Control": "no-store",
       ...CORS_HEADERS,
+    },
+  });
+}
+
+/* ================================================================
+ *  App OTA 自動更新（私有 repo Releases 代理）
+ * ================================================================ */
+
+// 私有 APK repo
+const OTA_REPO = "xiewei3536/weid4t-app";
+// 最新 release 結果在 KV 的快取 key
+const OTA_CACHE_KEY = "update_cache";
+// 快取有效時間（毫秒）：15 分鐘
+const OTA_CACHE_TTL_MS = 15 * 60 * 1000;
+// 打 GitHub API 共用 User-Agent
+const OTA_USER_AGENT = "weitv-worker";
+
+/**
+ * 取得最新 release 的精簡資訊（含 KV 快取，15 分鐘）。
+ * 回傳物件：{ version, name, notes, size, assetId, fetchedAt }；
+ * token 未設或 GitHub 失敗時回傳 null（呼叫端自行決定降級行為）。
+ */
+async function getLatestRelease(env) {
+  // 1) 先讀 KV 快取，未過期就直接用。
+  try {
+    const cached = await env.CONFIG_KV.get(OTA_CACHE_KEY, { type: "json" });
+    if (
+      cached &&
+      typeof cached.fetchedAt === "number" &&
+      Date.now() - cached.fetchedAt < OTA_CACHE_TTL_MS
+    ) {
+      return cached;
+    }
+  } catch (_) {
+    // 快取讀取失敗就當沒有，往下打 API。
+  }
+
+  // 2) 沒有 token 無法存取私有 repo。
+  if (!env.GITHUB_TOKEN) return null;
+
+  // 3) 打 GitHub API 取 latest release。
+  let release;
+  try {
+    const resp = await fetch(
+      `https://api.github.com/repos/${OTA_REPO}/releases/latest`,
+      {
+        headers: {
+          Authorization: `Bearer ${env.GITHUB_TOKEN}`,
+          "User-Agent": OTA_USER_AGENT,
+          Accept: "application/vnd.github+json",
+        },
+      }
+    );
+    if (!resp.ok) return null;
+    release = await resp.json();
+  } catch (err) {
+    console.error("OTA 取 release 失敗:", err);
+    return null;
+  }
+
+  if (!release || typeof release !== "object") return null;
+
+  // 解析欄位
+  const tag = (release.tag_name || "").toString();
+  const m = tag.match(/(\d+)$/);
+  const version = m ? parseInt(m[1], 10) : 0;
+  const notes = (release.body || "").toString();
+
+  // 找出 .apk 資產的 size 與 id。
+  let size = 0;
+  let assetId = 0;
+  const assets = Array.isArray(release.assets) ? release.assets : [];
+  for (const a of assets) {
+    if (a && typeof a.name === "string" && /\.apk$/i.test(a.name)) {
+      size = typeof a.size === "number" ? a.size : 0;
+      assetId = typeof a.id === "number" ? a.id : 0;
+      break;
+    }
+  }
+
+  const result = {
+    version,
+    name: tag,
+    notes,
+    size,
+    assetId,
+    fetchedAt: Date.now(),
+  };
+
+  // 4) 寫回 KV 快取（失敗不致命）。
+  try {
+    await env.CONFIG_KV.put(OTA_CACHE_KEY, JSON.stringify(result));
+  } catch (err) {
+    console.error("OTA 快取寫入失敗:", err);
+  }
+
+  return result;
+}
+
+/**
+ * GET /api/update — 公開查詢最新 App 版本。
+ * 回 JSON：{ version, name, notes, url, size }。
+ * token 未設或 GitHub 失敗時回「無更新」的零值，避免 App 報錯。
+ */
+async function handleUpdateInfo(request, env) {
+  const rel = await getLatestRelease(env);
+
+  let payload;
+  if (!rel) {
+    payload = { version: 0, name: "", notes: "", url: "", size: 0 };
+  } else {
+    payload = {
+      version: rel.version,
+      name: rel.name,
+      notes: rel.notes,
+      url: new URL("/dl/latest.apk", request.url).toString(),
+      size: rel.size,
+    };
+  }
+
+  return new Response(JSON.stringify(payload), {
+    status: 200,
+    headers: {
+      "Content-Type": "application/json; charset=utf-8",
+      "Cache-Control": "no-store",
+      ...CORS_HEADERS,
+    },
+  });
+}
+
+/**
+ * GET /dl/latest.apk — 公開串流代理最新 APK 資產。
+ * 透過 release asset API（Accept: application/octet-stream）讓 GitHub 302 到
+ * 實際檔案，再把 body 串流回盒子；token 未設或找不到資產回 404。
+ */
+async function handleDownloadApk(request, env) {
+  if (!env.GITHUB_TOKEN) {
+    return new Response("更新服務尚未設定", {
+      status: 404,
+      headers: { "Content-Type": "text/plain; charset=utf-8" },
+    });
+  }
+
+  const rel = await getLatestRelease(env);
+  if (!rel || !rel.assetId) {
+    return new Response("找不到可下載的 APK", {
+      status: 404,
+      headers: { "Content-Type": "text/plain; charset=utf-8" },
+    });
+  }
+
+  let resp;
+  try {
+    resp = await fetch(
+      `https://api.github.com/repos/${OTA_REPO}/releases/assets/${rel.assetId}`,
+      {
+        headers: {
+          Authorization: `Bearer ${env.GITHUB_TOKEN}`,
+          "User-Agent": OTA_USER_AGENT,
+          Accept: "application/octet-stream",
+        },
+      }
+    );
+  } catch (err) {
+    console.error("OTA 下載資產失敗:", err);
+    return new Response("下載失敗", {
+      status: 404,
+      headers: { "Content-Type": "text/plain; charset=utf-8" },
+    });
+  }
+
+  if (!resp.ok || !resp.body) {
+    return new Response("下載失敗", {
+      status: 404,
+      headers: { "Content-Type": "text/plain; charset=utf-8" },
+    });
+  }
+
+  return new Response(resp.body, {
+    status: 200,
+    headers: {
+      "Content-Type": "application/vnd.android.package-archive",
+      "Content-Disposition": 'attachment; filename="WeiTV.apk"',
     },
   });
 }
