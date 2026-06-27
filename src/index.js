@@ -53,7 +53,7 @@ export default {
 
       // ── App 端：讀取設定 ──────────────────────────────
       if (pathname === "/api/config" && method === "GET") {
-        return await handleGetConfig(env);
+        return await handleGetConfig(request, env);
       }
 
       // ── 管理頁：顯示 HTML 介面（需驗證）────────────────
@@ -140,8 +140,16 @@ async function saveConfig(env, config) {
  * 由管理員在管理頁手動切回 false。這樣簡單可靠，不會因為多台盒子
  * 輪詢時序問題導致只有第一台讀到 true。
  */
-async function handleGetConfig(env) {
+async function handleGetConfig(request, env) {
   const config = await loadConfig(env);
+
+  // 記錄這次盒子存取（失敗絕不影響正常回應）。
+  try {
+    await recordAccess(request, env);
+  } catch (err) {
+    console.error("存取紀錄寫入失敗:", err);
+  }
+
   return new Response(JSON.stringify(config), {
     status: 200,
     headers: {
@@ -150,6 +158,58 @@ async function handleGetConfig(env) {
       ...CORS_HEADERS,
     },
   });
+}
+
+/* ================================================================
+ *  電視盒存取紀錄
+ * ================================================================ */
+
+// KV 中儲存存取紀錄用的 key 名稱
+const ACCESS_LOG_KEY = "access_log";
+// 保留最新筆數
+const ACCESS_LOG_MAX = 50;
+
+/**
+ * 把這次 /api/config 的存取記到 KV（key=access_log）。
+ * 每筆欄位：t(ISO 時間)、id(裝置 id)、v(App 版本)、m(機型)、ip(來源 IP)。
+ * 最新在前，保留最新 ACCESS_LOG_MAX 筆。
+ * 呼叫端已用 try/catch 包住，這裡的任何錯誤都不會影響 /api/config 回應。
+ */
+async function recordAccess(request, env) {
+  const url = new URL(request.url);
+  const entry = {
+    t: new Date().toISOString(),
+    id: url.searchParams.get("id") || "",
+    v: url.searchParams.get("v") || "",
+    m: url.searchParams.get("m") || "",
+    ip: request.headers.get("cf-connecting-ip") || "",
+  };
+
+  let log = [];
+  try {
+    const stored = await env.CONFIG_KV.get(ACCESS_LOG_KEY, { type: "json" });
+    if (Array.isArray(stored)) log = stored;
+  } catch (_) {
+    // 讀取失敗就當作空陣列，照樣寫入這一筆。
+  }
+
+  log.unshift(entry);
+  log = log.slice(0, ACCESS_LOG_MAX);
+
+  await env.CONFIG_KV.put(ACCESS_LOG_KEY, JSON.stringify(log));
+}
+
+/**
+ * 讀取存取紀錄（最新在前）；讀取失敗或無資料回傳空陣列。
+ */
+async function loadAccessLog(env) {
+  try {
+    const stored = await env.CONFIG_KV.get(ACCESS_LOG_KEY, { type: "json" });
+    if (Array.isArray(stored)) return stored;
+  } catch (err) {
+    console.error("存取紀錄讀取失敗:", err);
+  }
+  return [];
 }
 
 /* ================================================================
@@ -257,7 +317,8 @@ async function handleAdminPage(request, env) {
   if (unauthorized) return unauthorized;
 
   const config = await loadConfig(env);
-  const html = renderAdminHtml(config);
+  const accessLog = await loadAccessLog(env);
+  const html = renderAdminHtml(config, accessLog);
   return new Response(html, {
     status: 200,
     headers: { "Content-Type": "text/html; charset=utf-8" },
@@ -408,9 +469,62 @@ function escapeHtml(str) {
 }
 
 /**
+ * 把 ISO 時間字串轉成台灣時間（GMT+8）並格式化為 MM/DD HH:mm。
+ * 解析失敗時回傳原字串。
+ */
+function formatTaipeiTime(iso) {
+  const d = new Date(iso);
+  if (isNaN(d.getTime())) return String(iso == null ? "" : iso);
+  // 以 UTC 毫秒 + 8 小時，再用 getUTC* 取出 +8 後的各欄位。
+  const t = new Date(d.getTime() + 8 * 60 * 60 * 1000);
+  const pad = (n) => String(n).padStart(2, "0");
+  return (
+    pad(t.getUTCMonth() + 1) +
+    "/" +
+    pad(t.getUTCDate()) +
+    " " +
+    pad(t.getUTCHours()) +
+    ":" +
+    pad(t.getUTCMinutes())
+  );
+}
+
+/**
+ * 產生「電視盒存取紀錄」區塊 HTML（沿用既有深色卡片樣式）。
+ * 顯示最新約 30 筆：時間 | 裝置 id | 版本 | 機型 | IP。
+ */
+function renderAccessLogSection(accessLog) {
+  const list = Array.isArray(accessLog) ? accessLog.slice(0, 30) : [];
+  let body;
+  if (list.length === 0) {
+    body = `<div class="log-empty">尚無存取紀錄</div>`;
+  } else {
+    const rows = list
+      .map(
+        (e) => `<tr>
+          <td class="mono">${escapeHtml(formatTaipeiTime(e.t))}</td>
+          <td class="mono">${escapeHtml(e.id)}</td>
+          <td>${escapeHtml(e.v)}</td>
+          <td>${escapeHtml(e.m)}</td>
+          <td class="mono">${escapeHtml(e.ip)}</td>
+        </tr>`
+      )
+      .join("");
+    body = `<div class="log-scroll"><table class="log-table">
+      <thead><tr><th>時間</th><th>裝置 id</th><th>版本</th><th>機型</th><th>IP</th></tr></thead>
+      <tbody>${rows}</tbody>
+    </table></div>`;
+  }
+  return `<div class="card">
+    <div class="card-title">📡 電視盒存取紀錄</div>
+    ${body}
+  </div>`;
+}
+
+/**
  * 產生管理頁主畫面 HTML（深色、大按鈕、RWD）。
  */
-function renderAdminHtml(config) {
+function renderAdminHtml(config, accessLog) {
   return `<!DOCTYPE html>
 <html lang="zh-Hant">
 <head>
@@ -596,6 +710,30 @@ function renderAdminHtml(config) {
     font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 13px;
     color: var(--accent);
   }
+
+  /* 電視盒存取紀錄 */
+  .log-empty {
+    color: var(--text-dim); font-size: 14px; padding: 10px 2px;
+  }
+  .log-scroll { overflow-x: auto; -webkit-overflow-scrolling: touch; }
+  .log-table {
+    width: 100%; border-collapse: collapse; font-size: 13px;
+  }
+  .log-table th, .log-table td {
+    text-align: left; padding: 9px 10px;
+    border-bottom: 1px solid var(--border); white-space: nowrap;
+  }
+  .log-table thead th {
+    color: var(--text-dim); font-size: 11.5px; font-weight: 700;
+    letter-spacing: 0.4px; text-transform: uppercase;
+  }
+  .log-table tbody tr:last-child td { border-bottom: 0; }
+  .log-table td.mono {
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12.5px;
+  }
+  @media (max-width: 480px) {
+    .log-table th, .log-table td { padding: 8px 8px; }
+  }
   .footnote { text-align: center; color: var(--text-dim); font-size: 12.5px; margin-top: 24px; }
 </style>
 </head>
@@ -665,6 +803,8 @@ function renderAdminHtml(config) {
 
     <button type="submit" class="btn btn-primary">儲存設定</button>
   </form>
+
+  ${renderAccessLogSection(accessLog)}
 
   <div class="footnote">App 設定端點 <code>/api/config</code></div>
 </div>
