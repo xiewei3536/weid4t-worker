@@ -25,6 +25,7 @@ const DEFAULT_CONFIG = {
   subscriptionUrl: "",
   pollIntervalMinutes: 180,
   forceRefresh: false,
+  autostart: true,
   notice: "",
   updatedAt: "2026-06-26T00:00:00Z",
 };
@@ -615,6 +616,8 @@ async function handleAdminSave(request, env) {
   );
   // forceRefresh：表單用 checkbox，有勾才會送出 "on"
   const forceRefresh = form.get("forceRefresh") === "on";
+  // autostart：開機自動啟動。checkbox 沒勾時表單不會送該欄位，故用「是否等於 on」判斷，沒送即 false。
+  const autostart = form.get("autostart") === "on";
 
   // 驗證
   if (!subscriptionUrl || !/^https?:\/\//i.test(subscriptionUrl)) {
@@ -636,6 +639,7 @@ async function handleAdminSave(request, env) {
     notice,
     pollIntervalMinutes,
     forceRefresh,
+    autostart,
     updatedAt: new Date().toISOString(),
   };
 
@@ -1314,6 +1318,14 @@ function renderAdminHtml(config, devices) {
           }</span>
         </div>
       </div>
+      <div class="chip">
+        <div class="k">開機自動啟動</div>
+        <div class="v">
+          <span class="badge ${config.autostart ? "on" : "off"}">${
+            config.autostart ? "開啟" : "關閉"
+          }</span>
+        </div>
+      </div>
       <div class="chip" style="flex-basis:100%;">
         <div class="k">最後更新</div>
         <div class="v mono">${escapeHtml(config.updatedAt)}</div>
@@ -1352,6 +1364,13 @@ function renderAdminHtml(config, devices) {
         config.forceRefresh ? "checked" : ""
       }>
       <label for="forceRefresh">強制刷新（讓盒子下次輪詢立即重載來源）</label>
+    </div>
+
+    <div class="switch-row">
+      <input type="checkbox" id="autostart" name="autostart" ${
+        config.autostart ? "checked" : ""
+      }>
+      <label for="autostart">開機自動啟動（所有盒子開機後自動開啟 App）</label>
     </div>
 
     <button type="submit" class="btn btn-primary">儲存設定</button>
