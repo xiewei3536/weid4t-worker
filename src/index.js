@@ -71,6 +71,11 @@ export default {
         return await handleAdminTest(request, env);
       }
 
+      // ── 管理頁：裝置管理動作（需驗證）──────────────────
+      if (pathname === "/admin/device" && method === "POST") {
+        return await handleAdminDevice(request, env);
+      }
+
       // 首頁簡單導引
       if (pathname === "/" && method === "GET") {
         return new Response(
@@ -143,14 +148,29 @@ async function saveConfig(env, config) {
 async function handleGetConfig(request, env) {
   const config = await loadConfig(env);
 
-  // 記錄這次盒子存取（失敗絕不影響正常回應）。
+  // 更新裝置註冊表，並取得該裝置狀態（封鎖/傳話）。
+  // 整段以 try/catch 包住，任何失敗都不可影響正常回應。
+  let dev = null;
   try {
-    await recordAccess(request, env);
+    dev = await touchDevice(request, env);
   } catch (err) {
-    console.error("存取紀錄寫入失敗:", err);
+    console.error("裝置註冊表更新失敗:", err);
   }
 
-  return new Response(JSON.stringify(config), {
+  // 在原本欄位外，附加該裝置的封鎖與傳話狀態。
+  const blocked = !!(dev && dev.blocked);
+  const payload = {
+    ...config,
+    blocked,
+    message: (dev && dev.msg) || "",
+    messageLevel: (dev && dev.msgLevel) || "info",
+  };
+  // 封鎖時雙重保險：訂閱網址清空，盒子拿不到來源。
+  if (blocked) {
+    payload.subscriptionUrl = "";
+  }
+
+  return new Response(JSON.stringify(payload), {
     status: 200,
     headers: {
       "Content-Type": "application/json; charset=utf-8",
@@ -161,55 +181,96 @@ async function handleGetConfig(request, env) {
 }
 
 /* ================================================================
- *  電視盒存取紀錄
+ *  裝置註冊表（每台一個 KV key，前綴 dev:）
  * ================================================================ */
 
-// KV 中儲存存取紀錄用的 key 名稱
-const ACCESS_LOG_KEY = "access_log";
-// 保留最新筆數
-const ACCESS_LOG_MAX = 50;
+// 裝置 KV key 前綴
+const DEVICE_PREFIX = "dev:";
+// 列舉裝置時的上限
+const DEVICE_LIST_MAX = 200;
 
 /**
- * 把這次 /api/config 的存取記到 KV（key=access_log）。
- * 每筆欄位：t(ISO 時間)、id(裝置 id)、v(App 版本)、m(機型)、ip(來源 IP)。
- * 最新在前，保留最新 ACCESS_LOG_MAX 筆。
- * 呼叫端已用 try/catch 包住，這裡的任何錯誤都不會影響 /api/config 回應。
+ * 依 query 的 id 讀取/新建裝置，更新 lastSeen/count/ip/m/v 後寫回。
+ * 回傳更新後的裝置物件；若沒有 id 則回傳 null（不寫入）。
+ * 呼叫端已用 try/catch 包住；本函式內任何錯誤都不應外洩影響回應。
  */
-async function recordAccess(request, env) {
+async function touchDevice(request, env) {
   const url = new URL(request.url);
-  const entry = {
-    t: new Date().toISOString(),
-    id: url.searchParams.get("id") || "",
-    v: url.searchParams.get("v") || "",
-    m: url.searchParams.get("m") || "",
-    ip: request.headers.get("cf-connecting-ip") || "",
-  };
+  const id = (url.searchParams.get("id") || "").trim();
+  if (!id) return null; // 沒帶 id，不記錄。
 
-  let log = [];
+  const now = new Date().toISOString();
+  const key = DEVICE_PREFIX + id;
+
+  let dev = null;
   try {
-    const stored = await env.CONFIG_KV.get(ACCESS_LOG_KEY, { type: "json" });
-    if (Array.isArray(stored)) log = stored;
+    dev = await env.CONFIG_KV.get(key, { type: "json" });
   } catch (_) {
-    // 讀取失敗就當作空陣列，照樣寫入這一筆。
+    dev = null;
   }
 
-  log.unshift(entry);
-  log = log.slice(0, ACCESS_LOG_MAX);
+  if (!dev || typeof dev !== "object") {
+    // 新建一筆裝置紀錄。
+    dev = {
+      id,
+      nick: "",
+      m: "",
+      v: "",
+      ip: "",
+      firstSeen: now,
+      lastSeen: now,
+      count: 0,
+      blocked: false,
+      msg: "",
+      msgLevel: "info",
+    };
+  }
 
-  await env.CONFIG_KV.put(ACCESS_LOG_KEY, JSON.stringify(log));
+  // 更新動態欄位，保留 nick/blocked/msg/msgLevel/firstSeen。
+  dev.id = id;
+  dev.lastSeen = now;
+  dev.count = (typeof dev.count === "number" ? dev.count : 0) + 1;
+  dev.ip = request.headers.get("cf-connecting-ip") || "";
+  dev.m = url.searchParams.get("m") || "";
+  dev.v = url.searchParams.get("v") || "";
+
+  await env.CONFIG_KV.put(key, JSON.stringify(dev));
+  return dev;
 }
 
 /**
- * 讀取存取紀錄（最新在前）；讀取失敗或無資料回傳空陣列。
+ * 列出所有裝置（前綴 dev:），逐一讀取組成清單，依 lastSeen 由新到舊排序。
+ * 上限約 DEVICE_LIST_MAX 筆。讀取失敗回傳空陣列。
  */
-async function loadAccessLog(env) {
+async function loadDevices(env) {
+  let keys = [];
   try {
-    const stored = await env.CONFIG_KV.get(ACCESS_LOG_KEY, { type: "json" });
-    if (Array.isArray(stored)) return stored;
+    const listed = await env.CONFIG_KV.list({ prefix: DEVICE_PREFIX });
+    keys = (listed && Array.isArray(listed.keys) ? listed.keys : []).slice(
+      0,
+      DEVICE_LIST_MAX
+    );
   } catch (err) {
-    console.error("存取紀錄讀取失敗:", err);
+    console.error("裝置列舉失敗:", err);
+    return [];
   }
-  return [];
+
+  const devices = [];
+  for (const k of keys) {
+    try {
+      const dev = await env.CONFIG_KV.get(k.name, { type: "json" });
+      if (dev && typeof dev === "object") devices.push(dev);
+    } catch (_) {
+      // 單筆讀取失敗就略過。
+    }
+  }
+
+  devices.sort((a, b) => {
+    const ta = Date.parse(a && a.lastSeen) || 0;
+    const tb = Date.parse(b && b.lastSeen) || 0;
+    return tb - ta;
+  });
+  return devices;
 }
 
 /* ================================================================
@@ -317,8 +378,8 @@ async function handleAdminPage(request, env) {
   if (unauthorized) return unauthorized;
 
   const config = await loadConfig(env);
-  const accessLog = await loadAccessLog(env);
-  const html = renderAdminHtml(config, accessLog);
+  const devices = await loadDevices(env);
+  const html = renderAdminHtml(config, devices);
   return new Response(html, {
     status: 200,
     headers: { "Content-Type": "text/html; charset=utf-8" },
@@ -446,6 +507,98 @@ async function handleAdminTest(request, env) {
 }
 
 /* ================================================================
+ *  裝置管理動作端點
+ * ================================================================ */
+
+/**
+ * POST /admin/device — 對單一裝置執行管理動作（需 Basic Auth）。
+ * 接受 application/x-www-form-urlencoded：id、action、value、level。
+ * 動作：block / unblock / message / clearmsg / rename / delete。
+ * 完成後回傳成功頁（沿用 renderResultPage 風格）。
+ */
+async function handleAdminDevice(request, env) {
+  const unauthorized = checkAuth(request, env);
+  if (unauthorized) return unauthorized;
+
+  let form;
+  try {
+    form = await request.formData();
+  } catch (err) {
+    return renderResultPage(false, "表單解析失敗。", { version: "-", updatedAt: "-" });
+  }
+
+  const id = (form.get("id") || "").toString().trim();
+  const action = (form.get("action") || "").toString().trim();
+  const value = (form.get("value") || "").toString();
+  const level = (form.get("level") || "").toString().trim();
+
+  if (!id || !action) {
+    return renderResultPage(false, "缺少裝置 id 或動作。", { version: "-", updatedAt: "-" });
+  }
+
+  const key = DEVICE_PREFIX + id;
+
+  // 刪除動作不需先讀取既有資料。
+  if (action === "delete") {
+    try {
+      await env.CONFIG_KV.delete(key);
+    } catch (err) {
+      console.error("裝置刪除失敗:", err);
+      return renderResultPage(false, "刪除失敗，請稍後再試。", { version: "-", updatedAt: "-" });
+    }
+    return renderResultPage(true, `已刪除裝置 ${id}。`, { version: "-", updatedAt: new Date().toISOString() });
+  }
+
+  // 其餘動作：讀取現有裝置，套用變更後寫回。
+  let dev = null;
+  try {
+    dev = await env.CONFIG_KV.get(key, { type: "json" });
+  } catch (_) {
+    dev = null;
+  }
+  if (!dev || typeof dev !== "object") {
+    return renderResultPage(false, `找不到裝置 ${id}（可能已下線或被刪除）。`, { version: "-", updatedAt: "-" });
+  }
+
+  let summary = "";
+  switch (action) {
+    case "block":
+      dev.blocked = true;
+      summary = `已封鎖裝置 ${id}。`;
+      break;
+    case "unblock":
+      dev.blocked = false;
+      summary = `已解除封鎖裝置 ${id}。`;
+      break;
+    case "message":
+      dev.msg = value;
+      dev.msgLevel = level === "warn" ? "warn" : "info";
+      summary = `已對裝置 ${id} 傳話。`;
+      break;
+    case "clearmsg":
+      dev.msg = "";
+      dev.msgLevel = "info";
+      summary = `已清除裝置 ${id} 的訊息。`;
+      break;
+    case "rename":
+      dev.nick = value;
+      summary = `已更新裝置 ${id} 暱稱。`;
+      break;
+    default:
+      return renderResultPage(false, `未知動作：${action}。`, { version: "-", updatedAt: "-" });
+  }
+
+  try {
+    await env.CONFIG_KV.put(key, JSON.stringify(dev));
+  } catch (err) {
+    console.error("裝置寫入失敗:", err);
+    return renderResultPage(false, "寫入失敗，請稍後再試。", { version: "-", updatedAt: "-" });
+  }
+
+  return renderResultPage(true, summary, { version: "-", updatedAt: new Date().toISOString() });
+}
+
+/* ================================================================
  *  HTML / 回應產生器
  * ================================================================ */
 
@@ -469,16 +622,38 @@ function escapeHtml(str) {
 }
 
 /**
- * 把 ISO 時間字串轉成台灣時間（GMT+8）並格式化為 MM/DD HH:mm。
- * 解析失敗時回傳原字串。
+ * 把 ISO 時間轉成「相對時間」（如「3 分鐘前」）。解析失敗回傳空字串。
  */
-function formatTaipeiTime(iso) {
+function relativeTime(iso) {
+  const d = new Date(iso);
+  if (isNaN(d.getTime())) return "";
+  const diff = Date.now() - d.getTime();
+  if (diff < 0) return "剛剛";
+  const sec = Math.floor(diff / 1000);
+  if (sec < 60) return "剛剛";
+  const min = Math.floor(sec / 60);
+  if (min < 60) return min + " 分鐘前";
+  const hr = Math.floor(min / 60);
+  if (hr < 24) return hr + " 小時前";
+  const day = Math.floor(hr / 24);
+  if (day < 30) return day + " 天前";
+  const mon = Math.floor(day / 30);
+  if (mon < 12) return mon + " 個月前";
+  return Math.floor(mon / 12) + " 年前";
+}
+
+/**
+ * 把 ISO 時間轉成台灣（GMT+8）絕對時間，格式 YYYY/MM/DD HH:mm。
+ * 解析失敗回傳原字串。
+ */
+function formatTaipeiFull(iso) {
   const d = new Date(iso);
   if (isNaN(d.getTime())) return String(iso == null ? "" : iso);
-  // 以 UTC 毫秒 + 8 小時，再用 getUTC* 取出 +8 後的各欄位。
   const t = new Date(d.getTime() + 8 * 60 * 60 * 1000);
   const pad = (n) => String(n).padStart(2, "0");
   return (
+    t.getUTCFullYear() +
+    "/" +
     pad(t.getUTCMonth() + 1) +
     "/" +
     pad(t.getUTCDate()) +
@@ -490,41 +665,120 @@ function formatTaipeiTime(iso) {
 }
 
 /**
- * 產生「電視盒存取紀錄」區塊 HTML（沿用既有深色卡片樣式）。
- * 顯示最新約 30 筆：時間 | 裝置 id | 版本 | 機型 | IP。
+ * 產生「裝置管理」區塊 HTML（沿用既有深色卡片樣式）。
+ * 每台一張卡片，附封鎖/解封、傳話、改暱稱、刪除操作。
  */
-function renderAccessLogSection(accessLog) {
-  const list = Array.isArray(accessLog) ? accessLog.slice(0, 30) : [];
+function renderDevicesSection(devices) {
+  const list = Array.isArray(devices) ? devices : [];
   let body;
   if (list.length === 0) {
-    body = `<div class="log-empty">尚無存取紀錄</div>`;
+    body = `<div class="log-empty">尚無裝置上線</div>`;
   } else {
-    const rows = list
-      .map(
-        (e) => `<tr>
-          <td class="mono">${escapeHtml(formatTaipeiTime(e.t))}</td>
-          <td class="mono">${escapeHtml(e.id)}</td>
-          <td>${escapeHtml(e.v)}</td>
-          <td>${escapeHtml(e.m)}</td>
-          <td class="mono">${escapeHtml(e.ip)}</td>
-        </tr>`
-      )
-      .join("");
-    body = `<div class="log-scroll"><table class="log-table">
-      <thead><tr><th>時間</th><th>裝置 id</th><th>版本</th><th>機型</th><th>IP</th></tr></thead>
-      <tbody>${rows}</tbody>
-    </table></div>`;
+    body = list.map((d) => renderDeviceCard(d)).join("");
   }
   return `<div class="card">
-    <div class="card-title">📡 電視盒存取紀錄</div>
+    <div class="card-title">📺 裝置管理 · 共 ${list.length} 台</div>
     ${body}
+  </div>`;
+}
+
+/**
+ * 產生單一裝置卡片 HTML。所有使用者字串皆 escapeHtml 跳脫。
+ */
+function renderDeviceCard(d) {
+  const id = String(d && d.id != null ? d.id : "");
+  const nick = String(d && d.nick ? d.nick : "");
+  const title = nick || id || "（未命名）";
+  const blocked = !!(d && d.blocked);
+  const msg = String(d && d.msg ? d.msg : "");
+  const msgLevel = d && d.msgLevel === "warn" ? "warn" : "info";
+  const idAttr = escapeHtml(id);
+
+  const statusBadge = blocked
+    ? `<span class="badge dev-blocked">已封鎖</span>`
+    : `<span class="badge dev-active">使用中</span>`;
+
+  // 封鎖/解封：依目前狀態顯示其一。
+  const blockForm = blocked
+    ? `<form class="dev-form" method="POST" action="/admin/device">
+        <input type="hidden" name="id" value="${idAttr}">
+        <input type="hidden" name="action" value="unblock">
+        <button type="submit" class="btn-mini btn-ok">解除封鎖</button>
+      </form>`
+    : `<form class="dev-form" method="POST" action="/admin/device">
+        <input type="hidden" name="id" value="${idAttr}">
+        <input type="hidden" name="action" value="block">
+        <button type="submit" class="btn-mini btn-danger">封鎖</button>
+      </form>`;
+
+  const currentMsg = msg
+    ? `<div class="dev-curmsg ${msgLevel === "warn" ? "lv-warn" : "lv-info"}">目前訊息（${
+        msgLevel === "warn" ? "警告" : "一般"
+      }）：${escapeHtml(msg)}</div>`
+    : "";
+
+  return `<div class="dev-card">
+    <div class="dev-head">
+      <div class="dev-name">${escapeHtml(title)}</div>
+      ${statusBadge}
+    </div>
+    <div class="dev-meta">
+      <span class="dev-id mono">${idAttr}</span>
+      <span>機型：${escapeHtml(d && d.m ? d.m : "-")}</span>
+      <span>版本：${escapeHtml(d && d.v ? d.v : "-")}</span>
+    </div>
+    <div class="dev-meta">
+      <span title="${escapeHtml(formatTaipeiFull(d && d.lastSeen))}">最後上線：${escapeHtml(
+    relativeTime(d && d.lastSeen) || "-"
+  )}（${escapeHtml(formatTaipeiFull(d && d.lastSeen))}）</span>
+      <span>累計：${escapeHtml(d && d.count != null ? d.count : 0)} 次</span>
+      <span class="mono">IP：${escapeHtml(d && d.ip ? d.ip : "-")}</span>
+    </div>
+    ${currentMsg}
+    <div class="dev-actions">
+      ${blockForm}
+
+      <form class="dev-form dev-msg-form" method="POST" action="/admin/device">
+        <input type="hidden" name="id" value="${idAttr}">
+        <input type="hidden" name="action" value="message">
+        <input type="text" name="value" class="dev-input" placeholder="傳話內容…" value="${escapeHtml(
+          msg
+        )}">
+        <select name="level" class="dev-select">
+          <option value="info"${msgLevel === "info" ? " selected" : ""}>一般</option>
+          <option value="warn"${msgLevel === "warn" ? " selected" : ""}>警告</option>
+        </select>
+        <button type="submit" class="btn-mini btn-ok">送出</button>
+      </form>
+
+      <form class="dev-form" method="POST" action="/admin/device">
+        <input type="hidden" name="id" value="${idAttr}">
+        <input type="hidden" name="action" value="clearmsg">
+        <button type="submit" class="btn-mini">清除訊息</button>
+      </form>
+
+      <form class="dev-form dev-rename-form" method="POST" action="/admin/device">
+        <input type="hidden" name="id" value="${idAttr}">
+        <input type="hidden" name="action" value="rename">
+        <input type="text" name="value" class="dev-input" placeholder="暱稱…" value="${escapeHtml(
+          nick
+        )}">
+        <button type="submit" class="btn-mini">改暱稱</button>
+      </form>
+
+      <form class="dev-form" method="POST" action="/admin/device" onsubmit="return confirm('確定刪除這台裝置紀錄？');">
+        <input type="hidden" name="id" value="${idAttr}">
+        <input type="hidden" name="action" value="delete">
+        <button type="submit" class="btn-mini btn-danger">刪除</button>
+      </form>
+    </div>
   </div>`;
 }
 
 /**
  * 產生管理頁主畫面 HTML（深色、大按鈕、RWD）。
  */
-function renderAdminHtml(config, accessLog) {
+function renderAdminHtml(config, devices) {
   return `<!DOCTYPE html>
 <html lang="zh-Hant">
 <head>
@@ -711,28 +965,61 @@ function renderAdminHtml(config, accessLog) {
     color: var(--accent);
   }
 
-  /* 電視盒存取紀錄 */
+  /* 裝置管理 */
   .log-empty {
     color: var(--text-dim); font-size: 14px; padding: 10px 2px;
   }
-  .log-scroll { overflow-x: auto; -webkit-overflow-scrolling: touch; }
-  .log-table {
-    width: 100%; border-collapse: collapse; font-size: 13px;
+  .badge.dev-active { color: var(--accent); background: rgba(45,212,191,0.12); border: 1px solid rgba(45,212,191,0.35); }
+  .badge.dev-blocked { color: var(--danger); background: rgba(255,77,94,0.12); border: 1px solid rgba(255,77,94,0.4); }
+  .dev-card {
+    background: var(--surface-2);
+    border: 1px solid var(--border);
+    border-radius: 14px;
+    padding: 14px 15px;
+    margin-bottom: 12px;
   }
-  .log-table th, .log-table td {
-    text-align: left; padding: 9px 10px;
-    border-bottom: 1px solid var(--border); white-space: nowrap;
+  .dev-card:last-child { margin-bottom: 0; }
+  .dev-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+  .dev-name { font-size: 16px; font-weight: 700; color: var(--text); word-break: break-all; }
+  .dev-meta {
+    display: flex; flex-wrap: wrap; gap: 4px 14px;
+    color: var(--text-dim); font-size: 12.5px; margin-top: 8px;
   }
-  .log-table thead th {
-    color: var(--text-dim); font-size: 11.5px; font-weight: 700;
-    letter-spacing: 0.4px; text-transform: uppercase;
+  .dev-id { color: var(--accent); }
+  .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+  .dev-curmsg {
+    margin-top: 10px; padding: 9px 11px; border-radius: 9px; font-size: 13px;
+    border: 1px solid var(--border); word-break: break-word;
   }
-  .log-table tbody tr:last-child td { border-bottom: 0; }
-  .log-table td.mono {
-    font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12.5px;
+  .dev-curmsg.lv-info { color: var(--accent); background: rgba(45,212,191,0.08); border-color: rgba(45,212,191,0.3); }
+  .dev-curmsg.lv-warn { color: var(--gold); background: rgba(251,191,36,0.10); border-color: rgba(251,191,36,0.35); }
+  .dev-actions { margin-top: 12px; display: flex; flex-direction: column; gap: 8px; }
+  .dev-form { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin: 0; }
+  .dev-input {
+    flex: 1 1 120px; min-width: 0;
+    padding: 9px 11px; font-size: 15px; border-radius: 10px;
+    border: 1px solid var(--border); background: var(--bg-1); color: var(--text);
+    font-family: inherit;
   }
+  .dev-input:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px rgba(45,212,191,0.16); }
+  .dev-select {
+    padding: 9px 10px; font-size: 14px; border-radius: 10px;
+    border: 1px solid var(--border); background: var(--bg-1); color: var(--text);
+    font-family: inherit;
+  }
+  .btn-mini {
+    padding: 9px 14px; font-size: 14px; font-weight: 700;
+    border-radius: 10px; border: 1px solid var(--border);
+    background: var(--surface); color: var(--text);
+    cursor: pointer; font-family: inherit; white-space: nowrap;
+    transition: filter .15s, border-color .15s;
+  }
+  .btn-mini:active { transform: translateY(1px); }
+  .btn-mini.btn-ok { background: linear-gradient(135deg, var(--accent), var(--accent-deep)); color: #04201E; border-color: transparent; }
+  .btn-mini.btn-danger { color: var(--danger); border-color: rgba(255,77,94,0.4); background: rgba(255,77,94,0.07); }
+  .btn-mini:hover { filter: brightness(1.06); }
   @media (max-width: 480px) {
-    .log-table th, .log-table td { padding: 8px 8px; }
+    .dev-input { flex-basis: 100%; }
   }
   .footnote { text-align: center; color: var(--text-dim); font-size: 12.5px; margin-top: 24px; }
 </style>
@@ -804,7 +1091,7 @@ function renderAdminHtml(config, accessLog) {
     <button type="submit" class="btn btn-primary">儲存設定</button>
   </form>
 
-  ${renderAccessLogSection(accessLog)}
+  ${renderDevicesSection(devices)}
 
   <div class="footnote">App 設定端點 <code>/api/config</code></div>
 </div>
