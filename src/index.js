@@ -157,6 +157,42 @@ async function handleGetConfig(env) {
  * ================================================================ */
 
 /**
+ * ADMIN_PASSWORD 尚未設定時顯示的「完成設定」說明頁(深色,步驟清楚)。
+ */
+function setupPasswordHtml() {
+  return `<!doctype html><html lang="zh-Hant"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>偉電視 · 完成最後一步</title>
+<style>
+:root{--bg0:#07090E;--bg1:#0C1119;--surface:#141A28;--stroke:#273043;--accent:#2DD4BF;--gold:#FBBF24;--text:#EEF2F7;--dim:#97A2B4}
+*{box-sizing:border-box}body{margin:0;font-family:-apple-system,"PingFang TC","Microsoft JhengHei",system-ui,sans-serif;background:linear-gradient(180deg,var(--bg1),var(--bg0));color:var(--text);min-height:100vh;display:flex;align-items:center;justify-content:center;padding:20px}
+.card{width:100%;max-width:580px;background:var(--surface);border:1px solid var(--stroke);border-radius:18px;padding:30px;box-shadow:0 20px 50px rgba(0,0,0,.4)}
+h1{font-size:22px;margin:0 0 6px}.sub{color:var(--dim);font-size:14px;margin-bottom:22px;line-height:1.7}
+.dot{display:inline-block;width:11px;height:11px;border-radius:50%;background:var(--gold);box-shadow:0 0 12px var(--gold);margin-right:9px;vertical-align:middle}
+ol{padding:0;margin:0;list-style:none;counter-reset:s}
+li{counter-increment:s;position:relative;padding:13px 0 13px 46px;border-bottom:1px solid #1b2231;line-height:1.7}
+li:last-child{border-bottom:0}
+li::before{content:counter(s);position:absolute;left:0;top:11px;width:29px;height:29px;border-radius:9px;background:var(--accent);color:#052A26;font-weight:700;font-size:15px;display:flex;align-items:center;justify-content:center}
+code{background:#0e1422;border:1px solid var(--stroke);border-radius:6px;padding:2px 8px;color:var(--accent);font-size:13px}
+.k{color:var(--gold);font-weight:700}
+.foot{margin-top:20px;color:var(--dim);font-size:13px;line-height:1.8}
+</style></head><body>
+<div class="card">
+<h1><span class="dot"></span>還差最後一步:設定管理密碼</h1>
+<div class="sub">Worker 已經部署成功、資料庫也建好了 ✅<br>只要設一組管理密碼,就能登入這個管理頁。</div>
+<ol>
+<li>到 Cloudflare 後台 → 左側 <span class="k">Workers &amp; Pages</span> → 點開這個 Worker(<code>weid4t-worker</code>)</li>
+<li>上方分頁切到 <span class="k">Settings</span> → 找到 <span class="k">Variables and Secrets</span>(變數與密鑰)</li>
+<li>按 <span class="k">+ Add</span>;Type 選 <span class="k">Secret</span>(加密,不是 Text)</li>
+<li>Variable name 填 <code>ADMIN_PASSWORD</code>,Value 填你想要的密碼</li>
+<li>按 <span class="k">Deploy</span> 儲存,等十幾秒,再 <span class="k">重新整理本頁</span></li>
+</ol>
+<div class="foot">完成後本頁會跳出帳密框:<b>帳號隨便填</b>、<b>密碼 = 你剛設的那組</b>。<br>
+進階(CLI):<code>npx wrangler secret put ADMIN_PASSWORD</code></div>
+</div></body></html>`;
+}
+
+/**
  * 驗證 Basic Auth。
  * 規則：使用者名稱不限（建議填 admin），密碼必須等於 env.ADMIN_PASSWORD。
  * 通過回傳 null；未通過回傳一個 401 Response（含 WWW-Authenticate）。
@@ -164,12 +200,12 @@ async function handleGetConfig(env) {
 function checkAuth(request, env) {
   const expected = env.ADMIN_PASSWORD;
 
-  // 沒設定密碼 secret：直接擋下，提醒部署者去設定。
+  // 沒設定密碼 secret：顯示「如何設定」的說明頁(深色,步驟清楚)。
   if (!expected) {
-    return new Response(
-      "尚未設定 ADMIN_PASSWORD secret，請參考 README 用 wrangler secret put 設定。",
-      { status: 500, headers: { "Content-Type": "text/plain; charset=utf-8" } }
-    );
+    return new Response(setupPasswordHtml(), {
+      status: 200,
+      headers: { "Content-Type": "text/html; charset=utf-8" },
+    });
   }
 
   const header = request.headers.get("Authorization") || "";

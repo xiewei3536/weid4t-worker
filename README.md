@@ -25,6 +25,19 @@
 
 ---
 
+## 🔑 設定 / 修改管理密碼(ADMIN_PASSWORD)
+
+一鍵部署時若沒跳出輸入框、或之後想改密碼,到 Cloudflare 後台設定(**這是用後台,不是 CLI**):
+
+1. Cloudflare 後台 → **Workers & Pages** → 點開 `weid4t-worker`
+2. 上方 **Settings** → **Variables and Secrets**(變數與密鑰)
+3. **+ Add** → Type 選 **Secret**(加密)→ Name 填 `ADMIN_PASSWORD`、Value 填你的密碼 → **Deploy**
+
+設好後重新整理 `/admin` 就能登入(帳號隨意、密碼 = 你設的)。
+> 還沒設密碼時開 `/admin`,頁面會**直接畫出上面這幾步**,照著做即可。
+
+---
+
 ## 🔁 日常維護:換 token
 
 手機開 `/admin` → 把新的 m3u8 直播源網址貼進「訂閱網址」→ 按「儲存」。完成。
