@@ -27,6 +27,14 @@ const DEFAULT_CONFIG = {
   forceRefresh: false,
   autostart: true,
   notice: "",
+  // 公告自動消失時間(ISO 字串,空=常駐不消失)
+  noticeUntil: "",
+  // 臨時跑馬燈(滾動通知)文字 + 自動消失時間(空=不顯示)
+  marquee: "",
+  marqueeUntil: "",
+  // 聯絡資訊:說明文字 + QR 圖版本戳(0=尚未上傳)
+  contactText: "",
+  contactQrVer: 0,
   // ── 授權機制 ──────────────────────────────────────────────
   // requireActivation：總開關。開啟後,未授權/到期裝置拿不到 subscriptionUrl,
   // App 會要求輸入啟動碼。預設關閉,不影響既有盒子運作。
@@ -104,6 +112,16 @@ export default {
       // ── 管理頁：啟動碼管理動作（需驗證）────────────────
       if (pathname === "/admin/codes" && method === "POST") {
         return await handleAdminCodes(request, env);
+      }
+
+      // ── 管理頁：上傳/移除聯絡 QR（需驗證）──────────────
+      if (pathname === "/admin/upload" && method === "POST") {
+        return await handleAdminUpload(request, env);
+      }
+
+      // ── 公開：聯絡 QR 圖（App 下載顯示）────────────────
+      if (pathname === "/asset/qr" && method === "GET") {
+        return await handleAssetQr(request, env);
       }
 
       // 首頁簡單導引
@@ -209,6 +227,19 @@ async function handleGetConfig(request, env) {
   if (blocked || !auth.authorized) {
     payload.subscriptionUrl = "";
   }
+  // 公告 / 跑馬燈到期過濾（過期就不下發）
+  const nowMs = Date.now();
+  if (config.noticeUntil && (Date.parse(config.noticeUntil) || 0) <= nowMs) {
+    payload.notice = "";
+  }
+  if (!config.marqueeUntil || (Date.parse(config.marqueeUntil) || 0) <= nowMs) {
+    payload.marquee = "";
+  }
+  // 聯絡 QR 網址（有上傳才給，附版本戳供更新快取）
+  payload.contactQrUrl =
+    config.contactQrVer > 0
+      ? new URL("/asset/qr?v=" + config.contactQrVer, request.url).toString()
+      : "";
 
   return new Response(JSON.stringify(payload), {
     status: 200,
@@ -808,8 +839,26 @@ async function handleAdminSave(request, env) {
     updated.subscriptionUrl = subscriptionUrl;
   }
 
-  if (fields === "all" || fields === "system") {
+  if (fields === "all" || fields === "notice") {
     updated.notice = (form.get("notice") || "").toString();
+    let nh = parseFloat((form.get("noticeHours") || "0").toString());
+    if (!Number.isFinite(nh) || nh < 0) nh = 0;
+    updated.noticeUntil = nh > 0 ? new Date(Date.now() + nh * 3600000).toISOString() : "";
+  }
+
+  if (fields === "all" || fields === "marquee") {
+    updated.marquee = (form.get("marquee") || "").toString();
+    let mm = parseFloat((form.get("marqueeMinutes") || "0").toString());
+    if (!Number.isFinite(mm) || mm < 0) mm = 0;
+    updated.marqueeUntil =
+      mm > 0 && updated.marquee ? new Date(Date.now() + mm * 60000).toISOString() : "";
+  }
+
+  if (fields === "all" || fields === "contact") {
+    updated.contactText = (form.get("contactText") || "").toString();
+  }
+
+  if (fields === "all" || fields === "system") {
     let poll = parseInt((form.get("pollIntervalMinutes") || "").toString(), 10);
     if (!Number.isFinite(poll) || poll < 1) poll = current.pollIntervalMinutes || 180;
     updated.pollIntervalMinutes = poll;
@@ -1262,6 +1311,93 @@ function renderCodesResultPage(codes, days, note) {
   return new Response(html, {
     status: 200,
     headers: { "Content-Type": "text/html; charset=utf-8" },
+  });
+}
+
+/**
+ * POST /admin/upload — 上傳或移除聯絡 QR 圖（存 KV，需 Basic Auth）。
+ * action=remove 移除；否則讀 file 欄位存成 asset:qr 並把 contactQrVer +1。
+ */
+async function handleAdminUpload(request, env) {
+  const unauthorized = checkAuth(request, env);
+  if (unauthorized) return unauthorized;
+
+  let form;
+  try {
+    form = await request.formData();
+  } catch (_) {
+    return renderResultPage(false, "上傳解析失敗。", { version: "-", updatedAt: "-" });
+  }
+
+  const action = (form.get("action") || "").toString();
+  const config = await loadConfig(env);
+
+  if (action === "remove") {
+    try {
+      await env.CONFIG_KV.delete("asset:qr");
+    } catch (_) {}
+    config.version = (config.version || 0) + 1;
+    config.contactQrVer = 0;
+    config.updatedAt = new Date().toISOString();
+    try {
+      await saveConfig(env, config);
+    } catch (_) {}
+    return renderResultPage(true, "已移除聯絡 QR 圖。", config);
+  }
+
+  const file = form.get("file");
+  if (!file || typeof file === "string" || typeof file.arrayBuffer !== "function") {
+    return renderResultPage(false, "請選擇要上傳的圖檔。", { version: "-", updatedAt: "-" });
+  }
+  const ct = file.type || "image/png";
+  if (!/^image\//.test(ct)) {
+    return renderResultPage(false, "只接受圖片檔（PNG / JPG 等）。", { version: "-", updatedAt: "-" });
+  }
+  let buf;
+  try {
+    buf = await file.arrayBuffer();
+  } catch (_) {
+    return renderResultPage(false, "讀取圖檔失敗。", { version: "-", updatedAt: "-" });
+  }
+  if (buf.byteLength > 2 * 1024 * 1024) {
+    return renderResultPage(false, "圖檔太大，請小於 2MB。", { version: "-", updatedAt: "-" });
+  }
+  try {
+    await env.CONFIG_KV.put("asset:qr", buf, { metadata: { ct } });
+  } catch (_) {
+    return renderResultPage(false, "圖檔儲存失敗，請稍後再試。", { version: "-", updatedAt: "-" });
+  }
+  config.version = (config.version || 0) + 1;
+  config.contactQrVer = (config.contactQrVer || 0) + 1;
+  config.updatedAt = new Date().toISOString();
+  try {
+    await saveConfig(env, config);
+  } catch (_) {}
+  return renderResultPage(true, "已上傳聯絡 QR 圖，盒子下次輪詢就會看到。", config);
+}
+
+/**
+ * GET /asset/qr — 公開回傳聯絡 QR 圖（從 KV）。沒有則 404。
+ */
+async function handleAssetQr(request, env) {
+  let value = null;
+  let metadata = null;
+  try {
+    const r = await env.CONFIG_KV.getWithMetadata("asset:qr", { type: "arrayBuffer" });
+    value = r.value;
+    metadata = r.metadata;
+  } catch (_) {
+    value = null;
+  }
+  if (!value) return new Response("Not Found", { status: 404 });
+  const ct = (metadata && metadata.ct) || "image/png";
+  return new Response(value, {
+    status: 200,
+    headers: {
+      "Content-Type": ct,
+      "Cache-Control": "public, max-age=86400",
+      ...CORS_HEADERS,
+    },
   });
 }
 
@@ -2022,6 +2158,12 @@ function renderAdminHtml(config, devices, codes) {
   .bulk-row { display:flex; flex-wrap:wrap; align-items:center; gap:8px; padding:10px 12px; margin-bottom:13px; background:var(--surface-2); border:1px solid var(--border); border-radius:11px; }
   .bulk-label { font-size:13px; font-weight:600; margin-right:auto; }
 
+  .hint-line { font-size:12.5px; color:var(--gold); background:rgba(251,191,36,.08); border:1px solid rgba(251,191,36,.25); border-radius:9px; padding:9px 11px; margin-top:10px; }
+  .hint-line b { color:var(--gold); }
+  .qr-preview { display:flex; justify-content:center; padding:12px; background:#fff; border-radius:12px; margin-bottom:6px; }
+  .qr-preview img { max-width:200px; max-height:200px; width:auto; height:auto; display:block; }
+  .file-input { width:100%; padding:11px; font-size:14px; border-radius:11px; border:1px dashed var(--border); background:var(--surface-2); color:var(--text-dim); font-family:inherit; margin-bottom:4px; }
+
   .footnote { text-align: center; color: var(--text-dim); font-size: 12.5px; margin-top: 24px; }
 </style>
 </head>
@@ -2039,6 +2181,7 @@ function renderAdminHtml(config, devices, codes) {
     <button type="button" class="tab" data-tab="devices" onclick="showTab('devices',this)">📺 裝置${
       stat.unauth > 0 ? ' <span class="tdot"></span>' : ""
     }</button>
+    <button type="button" class="tab" data-tab="notice" onclick="showTab('notice',this)">📣 通知</button>
     <button type="button" class="tab" data-tab="system" onclick="showTab('system',this)">⚙️ 系統</button>
   </nav>
 
@@ -2108,12 +2251,73 @@ function renderAdminHtml(config, devices, codes) {
     ${renderDevicesSection(devices)}
   </section>
 
+  <section class="panel" data-panel="notice">
+    <form class="block" method="POST" action="/admin/save">
+      <input type="hidden" name="_fields" value="notice">
+      <div class="block-head"><span class="block-title">📢 公告（固定膠囊）</span></div>
+      <label for="notice">公告文字<span class="hint">顯示在盒子畫面；留空則不顯示</span></label>
+      <textarea id="notice" name="notice">${escapeHtml(config.notice)}</textarea>
+      <label for="noticeHours">自動消失時數<span class="hint">0＝常駐不消失；例如 24＝一天後自動撤下</span></label>
+      <input type="number" id="noticeHours" name="noticeHours" min="0" step="0.5" value="0" placeholder="0">
+      ${
+        config.noticeUntil
+          ? `<div class="hint-line">⏱ 目前公告將於 <b>${escapeHtml(
+              formatTaipeiFull(config.noticeUntil)
+            )}</b> 自動消失</div>`
+          : ""
+      }
+      <button type="submit" class="btn btn-primary">儲存公告</button>
+    </form>
+
+    <form class="block" method="POST" action="/admin/save">
+      <input type="hidden" name="_fields" value="marquee">
+      <div class="block-head"><span class="block-title">🏃 臨時跑馬燈（滾動）</span></div>
+      <label for="marquee">跑馬燈文字<span class="hint">在畫面頂部滾動；適合臨時通知</span></label>
+      <textarea id="marquee" name="marquee">${escapeHtml(config.marquee || "")}</textarea>
+      <label for="marqueeMinutes">顯示分鐘數<span class="hint">時間到自動消失；0＝不顯示／清除</span></label>
+      <input type="number" id="marqueeMinutes" name="marqueeMinutes" min="0" value="0" placeholder="例如 30">
+      ${
+        config.marqueeUntil && (Date.parse(config.marqueeUntil) || 0) > Date.now()
+          ? `<div class="hint-line">⏱ 跑馬燈將於 <b>${escapeHtml(
+              formatTaipeiFull(config.marqueeUntil)
+            )}</b> 自動消失</div>`
+          : ""
+      }
+      <button type="submit" class="btn btn-primary">發送跑馬燈</button>
+    </form>
+
+    <div class="block">
+      <div class="block-head"><span class="block-title">📷 聯絡我們 QR（顯示在 App）</span></div>
+      ${
+        config.contactQrVer > 0
+          ? `<div class="qr-preview"><img src="/asset/qr?v=${config.contactQrVer}" alt="聯絡 QR"></div>`
+          : `<div class="empty">尚未上傳 QR 圖</div>`
+      }
+      <form method="POST" action="/admin/save">
+        <input type="hidden" name="_fields" value="contact">
+        <label for="contactText">聯絡說明文字<span class="hint">顯示在 QR 旁，例如「掃碼加 LINE 客服」</span></label>
+        <input type="text" id="contactText" name="contactText" value="${escapeHtml(
+          config.contactText || ""
+        )}">
+        <button type="submit" class="btn btn-secondary">儲存聯絡文字</button>
+      </form>
+      <form method="POST" action="/admin/upload" enctype="multipart/form-data" style="margin-top:12px">
+        <label>上傳 QR 圖檔<span class="hint">PNG / JPG，小於 2MB</span></label>
+        <input type="file" name="file" accept="image/*" class="file-input">
+        <button type="submit" class="btn btn-primary">上傳 QR</button>
+      </form>
+      ${
+        config.contactQrVer > 0
+          ? `<form method="POST" action="/admin/upload" onsubmit="return confirm('確定移除 QR 圖？');" style="margin-top:8px"><input type="hidden" name="action" value="remove"><button class="btn btn-secondary">移除 QR</button></form>`
+          : ""
+      }
+    </div>
+  </section>
+
   <section class="panel" data-panel="system">
     <form class="block" method="POST" action="/admin/save">
       <input type="hidden" name="_fields" value="system">
       <div class="block-head"><span class="block-title">⚙️ 系統設定</span></div>
-      <label for="notice">公告<span class="hint">可留空；會顯示在盒子上</span></label>
-      <textarea id="notice" name="notice">${escapeHtml(config.notice)}</textarea>
       <label for="pollIntervalMinutes">盒子輪詢間隔（分鐘）</label>
       <input type="number" id="pollIntervalMinutes" name="pollIntervalMinutes" min="1" value="${escapeHtml(config.pollIntervalMinutes)}">
       <div class="switch-row">
