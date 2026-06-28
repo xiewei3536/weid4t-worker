@@ -792,52 +792,39 @@ async function handleAdminSave(request, env) {
     });
   }
 
-  // 取值與基本清理
-  const subscriptionUrl = (form.get("subscriptionUrl") || "").toString().trim();
-  const notice = (form.get("notice") || "").toString();
-  let pollIntervalMinutes = parseInt(
-    (form.get("pollIntervalMinutes") || "").toString(),
-    10
-  );
-  // forceRefresh：表單用 checkbox，有勾才會送出 "on"
-  const forceRefresh = form.get("forceRefresh") === "on";
-  // autostart：開機自動啟動。checkbox 沒勾時表單不會送該欄位，故用「是否等於 on」判斷，沒送即 false。
-  const autostart = form.get("autostart") === "on";
-  // 授權 / 啟動畫面設定
-  const requireActivation = form.get("requireActivation") === "on";
-  const activationTitle = (form.get("activationTitle") || "").toString();
-  const activationText = (form.get("activationText") || "").toString();
-  let codeDigits = parseInt((form.get("codeDigits") || "").toString(), 10);
-  if (!Number.isFinite(codeDigits)) codeDigits = current.codeDigits || 8;
-  codeDigits = Math.max(4, Math.min(12, codeDigits));
-
-  // 驗證
-  if (!subscriptionUrl || !/^https?:\/\//i.test(subscriptionUrl)) {
-    return renderResultPage(
-      false,
-      "訂閱網址格式不正確（必須以 http(s):// 開頭）。",
-      current
-    );
-  }
-  if (!Number.isFinite(pollIntervalMinutes) || pollIntervalMinutes < 1) {
-    // 給個合理下限，避免盒子過度頻繁輪詢。
-    pollIntervalMinutes = current.pollIntervalMinutes || 180;
-  }
-
+  // 分頁各自儲存：_fields 指明這次表單涵蓋哪一組欄位，只更新那組，其餘保留。
+  const fields = (form.get("_fields") || "all").toString();
   const updated = {
     ...current,
     version: (current.version || 0) + 1,
-    subscriptionUrl,
-    notice,
-    pollIntervalMinutes,
-    forceRefresh,
-    autostart,
-    requireActivation,
-    activationTitle,
-    activationText,
-    codeDigits,
     updatedAt: new Date().toISOString(),
   };
+
+  if (fields === "all" || fields === "source") {
+    const subscriptionUrl = (form.get("subscriptionUrl") || "").toString().trim();
+    if (!subscriptionUrl || !/^https?:\/\//i.test(subscriptionUrl)) {
+      return renderResultPage(false, "訂閱網址格式不正確（必須以 http(s):// 開頭）。", current);
+    }
+    updated.subscriptionUrl = subscriptionUrl;
+  }
+
+  if (fields === "all" || fields === "system") {
+    updated.notice = (form.get("notice") || "").toString();
+    let poll = parseInt((form.get("pollIntervalMinutes") || "").toString(), 10);
+    if (!Number.isFinite(poll) || poll < 1) poll = current.pollIntervalMinutes || 180;
+    updated.pollIntervalMinutes = poll;
+    updated.forceRefresh = form.get("forceRefresh") === "on";
+    updated.autostart = form.get("autostart") === "on";
+  }
+
+  if (fields === "all" || fields === "auth") {
+    updated.requireActivation = form.get("requireActivation") === "on";
+    updated.activationTitle = (form.get("activationTitle") || "").toString();
+    updated.activationText = (form.get("activationText") || "").toString();
+    let cd = parseInt((form.get("codeDigits") || "").toString(), 10);
+    if (!Number.isFinite(cd)) cd = current.codeDigits || 8;
+    updated.codeDigits = Math.max(4, Math.min(12, cd));
+  }
 
   try {
     await saveConfig(env, updated);
@@ -1350,40 +1337,45 @@ function formatTaipeiFull(iso) {
 function renderCodesSection(codes, config) {
   const list = Array.isArray(codes) ? codes : [];
   const now = Date.now();
-  let rows;
-  if (list.length === 0) {
-    rows = `<div class="log-empty">尚無啟動碼，用上方表單產生。</div>`;
-  } else {
-    rows = list.map((c) => renderCodeRow(c, now)).join("");
-  }
-  return `<div class="card">
-    <div class="card-title">🎟️ 啟動碼管理 · 共 ${list.length} 組</div>
+  const rows = list.length
+    ? list.map((c) => renderCodeRow(c, now)).join("")
+    : `<div class="empty">尚無啟動碼，用上方表單產生。</div>`;
+  const unused = list.filter((c) => c && c.status === "unused").length;
+  const used = list.filter((c) => c && c.status === "used").length;
+  return `
+    <div class="block">
+      <div class="block-head"><span class="block-title">產生啟動碼</span></div>
+      <form method="POST" action="/admin/codes" class="gen-form">
+        <input type="hidden" name="action" value="gen_batch">
+        <div class="gen-grid">
+          <div class="gen-field"><label>數量</label><input type="number" name="count" value="1" min="1" max="200"></div>
+          <div class="gen-field"><label>有效天數（0＝永久）</label><input type="number" name="days" value="0" min="0"></div>
+        </div>
+        <input type="text" name="note" class="gen-input" placeholder="備註（選填）：經銷商 / 客戶名 / 檔期" style="margin-top:10px">
+        <button class="btn btn-primary">＋ 產生啟動碼</button>
+      </form>
+      <form method="POST" action="/admin/device" class="gen-existing" onsubmit="return confirm('確定把目前所有現有裝置設為已授權（永久）？');">
+        <input type="hidden" name="action" value="authorize_all">
+        <input type="hidden" name="value" value="0">
+        <button class="btn btn-secondary">🔓 一鍵授權所有現有裝置（永久）</button>
+      </form>
+    </div>
 
-    <form method="POST" action="/admin/codes" class="gen-form">
-      <input type="hidden" name="action" value="gen_batch">
-      <div class="gen-grid">
-        <div class="gen-field">
-          <label>產生數量</label>
-          <input type="number" name="count" value="1" min="1" max="200">
-        </div>
-        <div class="gen-field">
-          <label>有效天數（0＝永久）</label>
-          <input type="number" name="days" value="0" min="0">
-        </div>
+    <div class="block">
+      <div class="block-head">
+        <span class="block-title">啟動碼清單</span>
+        <span class="count-pill">未用 ${unused} · 已用 ${used} · 共 ${list.length}</span>
       </div>
-      <label class="gen-label">備註（選填）</label>
-      <input type="text" name="note" class="gen-input" placeholder="例如：某經銷商 / 王先生 / 春節檔">
-      <button type="submit" class="btn btn-primary">＋ 產生啟動碼</button>
-    </form>
-
-    <form method="POST" action="/admin/device" class="gen-existing" onsubmit="return confirm('確定把目前所有現有裝置設為已授權（永久）？');">
-      <input type="hidden" name="action" value="authorize_all">
-      <input type="hidden" name="value" value="0">
-      <button type="submit" class="btn btn-secondary">🔓 一鍵授權所有現有裝置（永久）</button>
-    </form>
-
-    <div class="code-list">${rows}</div>
-  </div>`;
+      <input type="text" class="search" id="codeSearch" placeholder="🔍 搜尋啟動碼 / 備註 / 綁定裝置" oninput="filterCodes()">
+      <div class="filters">
+        <button type="button" class="fchip active" data-f="all" onclick="setCodeFilter(this)">全部</button>
+        <button type="button" class="fchip" data-f="unused" onclick="setCodeFilter(this)">未使用</button>
+        <button type="button" class="fchip" data-f="used" onclick="setCodeFilter(this)">已啟用</button>
+        <button type="button" class="fchip" data-f="expired" onclick="setCodeFilter(this)">已到期</button>
+        <button type="button" class="fchip" data-f="revoked" onclick="setCodeFilter(this)">已撤銷</button>
+      </div>
+      <div class="code-list" id="codeList">${rows}</div>
+    </div>`;
 }
 
 /**
@@ -1439,7 +1431,16 @@ function renderCodeRow(c, now) {
       <button type="submit" class="btn-mini">刪除</button>
     </form>`;
 
-  return `<div class="code-row">
+  const searchKey = (code + " " + note + " " + device).toLowerCase().replace(/"/g, "");
+  const statusKey =
+    status === "revoked"
+      ? "revoked"
+      : status === "used"
+      ? expireAt && (Date.parse(expireAt) || 0) <= now
+        ? "expired"
+        : "used"
+      : "unused";
+  return `<div class="code-row" data-status="${statusKey}" data-search="${escapeHtml(searchKey)}">
     <div class="code-row-top">
       <span class="code-val mono">${codeAttr}</span>
       ${badge}
@@ -1455,29 +1456,29 @@ function renderCodeRow(c, now) {
  */
 function renderDevicesSection(devices) {
   const list = Array.isArray(devices) ? devices : [];
-  let body;
-  if (list.length === 0) {
-    body = `<div class="log-empty">尚無裝置上線</div>`;
-  } else {
-    body = list.map((d) => renderDeviceCard(d)).join("");
-  }
-  return `<div class="card">
-    <div class="card-title">📺 裝置管理 · 共 ${list.length} 台</div>
-    <div class="dev-bulk">
-      <span class="dev-bulk-label">全部裝置開機自啟</span>
-      <form class="dev-form" method="POST" action="/admin/device">
-        <input type="hidden" name="action" value="autostart_all">
-        <input type="hidden" name="value" value="on">
-        <button type="submit" class="btn-mini btn-ok">全部開啟</button>
-      </form>
-      <form class="dev-form" method="POST" action="/admin/device">
-        <input type="hidden" name="action" value="autostart_all">
-        <input type="hidden" name="value" value="off">
-        <button type="submit" class="btn-mini">全部關閉</button>
-      </form>
-    </div>
-    ${body}
-  </div>`;
+  const body = list.length
+    ? list.map((d) => renderDeviceCard(d)).join("")
+    : `<div class="empty">尚無裝置上線（盒子裝好 App 開過後會出現）</div>`;
+  return `
+    <div class="block">
+      <div class="block-head">
+        <span class="block-title">裝置清單</span>
+        <span class="count-pill">共 ${list.length} 台</span>
+      </div>
+      <input type="text" class="search" id="devSearch" placeholder="🔍 搜尋編號 / 暱稱 / 機型" oninput="filterDevs()">
+      <div class="filters">
+        <button type="button" class="fchip active" data-f="all" onclick="setDevFilter(this)">全部</button>
+        <button type="button" class="fchip" data-f="online" onclick="setDevFilter(this)">在線</button>
+        <button type="button" class="fchip" data-f="unauth" onclick="setDevFilter(this)">未授權</button>
+        <button type="button" class="fchip" data-f="blocked" onclick="setDevFilter(this)">已封鎖</button>
+      </div>
+      <div class="bulk-row">
+        <span class="bulk-label">批量開機自啟</span>
+        <form class="row-form" method="POST" action="/admin/device"><input type="hidden" name="action" value="autostart_all"><input type="hidden" name="value" value="on"><button class="btn-mini btn-ok">全部開</button></form>
+        <form class="row-form" method="POST" action="/admin/device"><input type="hidden" name="action" value="autostart_all"><input type="hidden" name="value" value="off"><button class="btn-mini">全部關</button></form>
+      </div>
+      <div class="dev-list" id="devList">${body}</div>
+    </div>`;
 }
 
 /**
@@ -1491,10 +1492,14 @@ function renderDeviceCard(d) {
   const msg = String(d && d.msg ? d.msg : "");
   const msgLevel = d && d.msgLevel === "warn" ? "warn" : "info";
   const idAttr = escapeHtml(id);
-  // 授權狀態
+  const model = d && d.m ? d.m : "";
+  const ver = d && d.v ? d.v : "";
+  const now = Date.now();
+  const online = !!(d && d.lastSeen && now - (Date.parse(d.lastSeen) || 0) < 86400000);
+
   const authed = !!(d && d.authorized);
   const dExpireAt = d && d.expireAt ? d.expireAt : "";
-  const dExpired = authed && dExpireAt && (Date.parse(dExpireAt) || 0) <= Date.now();
+  const dExpired = authed && dExpireAt && (Date.parse(dExpireAt) || 0) <= now;
   const authActive = authed && !dExpired;
   const authText = !authed
     ? "未授權"
@@ -1504,142 +1509,133 @@ function renderDeviceCard(d) {
     ? "至 " + formatTaipeiFull(dExpireAt)
     : "永久";
 
-  // 開機自啟：該裝置設過布林就顯示開/關，否則顯示「預設(全域)」。
   const hasAutostart = d && typeof d.autostart === "boolean";
   const autostartOn = hasAutostart ? d.autostart : false;
-  const autostartText = !hasAutostart
-    ? "預設（全域）"
-    : autostartOn
-    ? "開"
-    : "關";
-  // 切換目標：目前是開（或未設）就送 off，目前是關就送 on。
+  const autostartText = !hasAutostart ? "預設" : autostartOn ? "開" : "關";
   const autostartNext = hasAutostart && autostartOn ? "off" : "on";
-  const autostartBtnLabel = autostartNext === "on" ? "開機自啟 開" : "開機自啟 關";
 
-  const statusBadge = blocked
-    ? `<span class="badge dev-blocked">已封鎖</span>`
-    : `<span class="badge dev-active">使用中</span>`;
+  const badges =
+    `<span class="sdot ${online ? "on" : "off"}" title="${online ? "24h 內在線" : "離線"}"></span>` +
+    (authActive
+      ? `<span class="badge ok-b">已授權</span>`
+      : dExpired
+      ? `<span class="badge warn-b">已到期</span>`
+      : `<span class="badge mute-b">未授權</span>`) +
+    (blocked ? `<span class="badge danger-b">已封鎖</span>` : "");
 
-  // 封鎖/解封：依目前狀態顯示其一。
-  const blockForm = blocked
-    ? `<form class="dev-form" method="POST" action="/admin/device">
-        <input type="hidden" name="id" value="${idAttr}">
-        <input type="hidden" name="action" value="unblock">
-        <button type="submit" class="btn-mini btn-ok">解除封鎖</button>
-      </form>`
-    : `<form class="dev-form" method="POST" action="/admin/device">
-        <input type="hidden" name="id" value="${idAttr}">
-        <input type="hidden" name="action" value="block">
-        <button type="submit" class="btn-mini btn-danger">封鎖</button>
-      </form>`;
+  let srcFact;
+  if (d && d.lastResultAt) {
+    srcFact = d.lastOk
+      ? ["來源", "✓ " + (d.lastCount != null ? d.lastCount : 0) + " 台", "ok"]
+      : ["來源", "✕ 失敗", "bad"];
+  } else {
+    srcFact = ["來源", "未回報", "mute"];
+  }
+  const facts = [
+    ["授權", authText, authActive ? "ok" : dExpired ? "bad" : "mute"],
+    srcFact,
+    ["開機自啟", autostartText, hasAutostart ? (autostartOn ? "ok" : "mute") : "mute"],
+    ["機型", model || "-", "mute"],
+    ["版本", ver || "-", "mute"],
+    ["最後上線", relativeTime(d && d.lastSeen) || "-", "mute"],
+    ["累計", (d && d.count != null ? d.count : 0) + " 次", "mute"],
+    ["IP", d && d.ip ? d.ip : "-", "mute"],
+  ];
+  const factsHtml = facts
+    .map(
+      (f) =>
+        `<div class="fact"><span class="fk">${f[0]}</span><span class="fv ${f[2]}">${escapeHtml(
+          f[1]
+        )}</span></div>`
+    )
+    .join("");
 
   const currentMsg = msg
-    ? `<div class="dev-curmsg ${msgLevel === "warn" ? "lv-warn" : "lv-info"}">目前訊息（${
-        msgLevel === "warn" ? "警告" : "一般"
-      }）：${escapeHtml(msg)}</div>`
+    ? `<div class="dev-curmsg ${
+        msgLevel === "warn" ? "lv-warn" : "lv-info"
+      }">💬 ${escapeHtml(msg)}</div>`
     : "";
 
-  // 盒子實測來源健康狀態列。
-  let sourceLine;
-  if (d && d.lastResultAt) {
-    const rel = escapeHtml(relativeTime(d.lastResultAt) || "");
-    if (d.lastOk) {
-      const cnt = escapeHtml(d.lastCount != null ? d.lastCount : 0);
-      sourceLine = `<div class="dev-source ok">📡 來源 ✓ ${cnt} 台 · ${rel}</div>`;
-    } else {
-      sourceLine = `<div class="dev-source bad">📡 來源 ✕ 失敗 · ${rel}</div>`;
-    }
-  } else {
-    sourceLine = `<div class="dev-source none">📡 來源 尚未回報</div>`;
-  }
+  const blockForm = blocked
+    ? devForm(idAttr, "unblock", "解除封鎖", "ok")
+    : devForm(idAttr, "block", "封鎖", "danger");
 
-  return `<div class="dev-card">
-    <div class="dev-head">
-      <div class="dev-name">${escapeHtml(title)}</div>
-      ${statusBadge}
-    </div>
-    <div class="dev-meta">
-      <span class="dev-id mono">${idAttr}</span>
-      <span>機型：${escapeHtml(d && d.m ? d.m : "-")}</span>
-      <span>版本：${escapeHtml(d && d.v ? d.v : "-")}</span>
-    </div>
-    <div class="dev-meta">
-      <span title="${escapeHtml(formatTaipeiFull(d && d.lastSeen))}">最後上線：${escapeHtml(
-    relativeTime(d && d.lastSeen) || "-"
-  )}（${escapeHtml(formatTaipeiFull(d && d.lastSeen))}）</span>
-      <span>累計：${escapeHtml(d && d.count != null ? d.count : 0)} 次</span>
-      <span class="mono">IP：${escapeHtml(d && d.ip ? d.ip : "-")}</span>
-    </div>
-    ${sourceLine}
-    <div class="dev-source ${hasAutostart ? (autostartOn ? "ok" : "bad") : "none"}">⚡ 開機自啟：${escapeHtml(
-    autostartText
-  )}</div>
-    <div class="dev-source ${authActive ? "ok" : "bad"}">🔑 授權：${escapeHtml(authText)}</div>
-    ${currentMsg}
-    <div class="dev-actions">
-      ${blockForm}
+  const primary = `
+      <form class="row-form" method="POST" action="/admin/device">
+        <input type="hidden" name="id" value="${idAttr}">
+        <input type="hidden" name="action" value="authorize">
+        <input type="number" name="value" class="mini-input mini-days" placeholder="天" value="0" min="0">
+        <button class="btn-mini btn-ok" title="0=永久">授權</button>
+      </form>
+      ${authed ? devForm(idAttr, "deauthorize", "撤銷授權", "danger") : ""}
+      ${blockForm}`;
 
-      <form class="dev-form dev-msg-form" method="POST" action="/admin/device">
+  const more = `
+      <form class="row-form wide" method="POST" action="/admin/device">
         <input type="hidden" name="id" value="${idAttr}">
         <input type="hidden" name="action" value="message">
-        <input type="text" name="value" class="dev-input" placeholder="傳話內容…" value="${escapeHtml(
+        <input type="text" name="value" class="mini-input grow" placeholder="傳話內容…" value="${escapeHtml(
           msg
         )}">
-        <select name="level" class="dev-select">
+        <select name="level" class="mini-select">
           <option value="info"${msgLevel === "info" ? " selected" : ""}>一般</option>
           <option value="warn"${msgLevel === "warn" ? " selected" : ""}>警告</option>
         </select>
-        <button type="submit" class="btn-mini btn-ok">送出</button>
+        <button class="btn-mini btn-ok">傳話</button>
       </form>
-
-      <form class="dev-form" method="POST" action="/admin/device">
-        <input type="hidden" name="id" value="${idAttr}">
-        <input type="hidden" name="action" value="clearmsg">
-        <button type="submit" class="btn-mini">清除訊息</button>
-      </form>
-
-      <form class="dev-form dev-rename-form" method="POST" action="/admin/device">
+      <div class="btn-row">
+        ${devForm(idAttr, "clearmsg", "清除訊息", "")}
+        <form class="row-form" method="POST" action="/admin/device">
+          <input type="hidden" name="id" value="${idAttr}">
+          <input type="hidden" name="action" value="autostart">
+          <input type="hidden" name="value" value="${autostartNext}">
+          <button class="btn-mini">開機自啟 ${autostartNext === "on" ? "開" : "關"}</button>
+        </form>
+      </div>
+      <form class="row-form wide" method="POST" action="/admin/device">
         <input type="hidden" name="id" value="${idAttr}">
         <input type="hidden" name="action" value="rename">
-        <input type="text" name="value" class="dev-input" placeholder="暱稱…" value="${escapeHtml(
+        <input type="text" name="value" class="mini-input grow" placeholder="裝置暱稱…" value="${escapeHtml(
           nick
         )}">
-        <button type="submit" class="btn-mini">改暱稱</button>
+        <button class="btn-mini">改暱稱</button>
       </form>
-
-      <form class="dev-form" method="POST" action="/admin/device">
-        <input type="hidden" name="id" value="${idAttr}">
-        <input type="hidden" name="action" value="autostart">
-        <input type="hidden" name="value" value="${autostartNext}">
-        <button type="submit" class="btn-mini${
-          autostartNext === "on" ? " btn-ok" : ""
-        }">${autostartBtnLabel}</button>
-      </form>
-
-      <form class="dev-form dev-auth-form" method="POST" action="/admin/device">
-        <input type="hidden" name="id" value="${idAttr}">
-        <input type="hidden" name="action" value="authorize">
-        <input type="number" name="value" class="dev-input dev-days" placeholder="天數" value="0" min="0">
-        <button type="submit" class="btn-mini btn-ok">授權(天,0=永久)</button>
-      </form>
-
-      ${
-        authed
-          ? `<form class="dev-form" method="POST" action="/admin/device">
-        <input type="hidden" name="id" value="${idAttr}">
-        <input type="hidden" name="action" value="deauthorize">
-        <button type="submit" class="btn-mini btn-danger">撤銷授權</button>
-      </form>`
-          : ""
-      }
-
-      <form class="dev-form" method="POST" action="/admin/device" onsubmit="return confirm('確定刪除這台裝置紀錄？');">
+      <form class="row-form" method="POST" action="/admin/device" onsubmit="return confirm('確定刪除這台裝置紀錄？');">
         <input type="hidden" name="id" value="${idAttr}">
         <input type="hidden" name="action" value="delete">
-        <button type="submit" class="btn-mini btn-danger">刪除</button>
-      </form>
+        <button class="btn-mini btn-danger">刪除裝置紀錄</button>
+      </form>`;
+
+  const searchKey = (id + " " + nick + " " + model).toLowerCase().replace(/"/g, "");
+
+  return `<div class="dev-card" data-search="${escapeHtml(searchKey)}" data-online="${
+    online ? 1 : 0
+  }" data-authed="${authActive ? 1 : 0}" data-blocked="${blocked ? 1 : 0}">
+    <div class="dev-head">
+      <div class="dev-title">
+        <div class="dev-name">${escapeHtml(title)}</div>
+        <div class="dev-id mono">${idAttr}</div>
+      </div>
+      <div class="dev-badges">${badges}</div>
     </div>
+    <div class="facts">${factsHtml}</div>
+    ${currentMsg}
+    <div class="dev-primary">${primary}</div>
+    <details class="dev-more">
+      <summary>更多操作 ▾</summary>
+      <div class="dev-more-body">${more}</div>
+    </details>
   </div>`;
+}
+
+/** 產生一個只有隱藏欄位 + 單一按鈕的裝置操作小表單 */
+function devForm(idAttr, action, label, kind) {
+  const cls = kind === "ok" ? " btn-ok" : kind === "danger" ? " btn-danger" : "";
+  return `<form class="row-form" method="POST" action="/admin/device">
+        <input type="hidden" name="id" value="${idAttr}">
+        <input type="hidden" name="action" value="${action}">
+        <button class="btn-mini${cls}">${label}</button>
+      </form>`;
 }
 
 /**
@@ -1700,7 +1696,7 @@ function renderAdminHtml(config, devices, codes) {
     line-height: 1.55;
     -webkit-font-smoothing: antialiased;
   }
-  .wrap { max-width: 640px; margin: 0 auto; }
+  .wrap { max-width: 720px; margin: 0 auto; }
 
   /* 品牌標題 */
   .brand { display: flex; align-items: center; gap: 11px; margin: 6px 2px 4px; }
@@ -1955,146 +1951,228 @@ function renderAdminHtml(config, devices, codes) {
   .code-row-actions { display: flex; gap: 8px; margin-top: 10px; }
   .dev-days { flex: 0 0 92px !important; min-width: 0; }
 
+  /* ── 頂欄 + 分頁 ── */
+  .topbar { display:flex; align-items:center; justify-content:space-between; gap:10px; margin:2px 2px 14px; }
+  .ver-pill { font-size:12px; color:var(--text-dim); border:1px solid var(--border); border-radius:999px; padding:5px 11px; white-space:nowrap; }
+  .tabs { display:flex; gap:6px; overflow-x:auto; padding-bottom:4px; margin-bottom:18px; }
+  .tabs::-webkit-scrollbar { display:none; }
+  .tab {
+    flex:0 0 auto; display:inline-flex; align-items:center; gap:6px;
+    padding:10px 15px; font-size:14px; font-weight:700; font-family:inherit;
+    color:var(--text-dim); background:var(--surface-2); border:1px solid var(--border);
+    border-radius:11px; cursor:pointer; white-space:nowrap; transition:all .15s;
+  }
+  .tab:hover { color:var(--text); }
+  .tab.active { color:#04201E; background:linear-gradient(135deg,var(--accent),var(--accent-deep)); border-color:transparent; box-shadow:0 6px 16px -8px rgba(45,212,191,.6); }
+  .tab .tdot { width:7px; height:7px; border-radius:50%; background:var(--gold); }
+
+  .panel { display:none; }
+  .panel.active { display:block; animation:fade .2s ease; }
+  @keyframes fade { from{opacity:0; transform:translateY(4px);} to{opacity:1; transform:none;} }
+
+  /* ── 區塊(分頁內的子卡) ── */
+  .block { background:var(--surface); border:1px solid var(--border); border-radius:15px; padding:16px; margin-bottom:14px; box-shadow:0 10px 30px -20px rgba(0,0,0,.8); }
+  .block-head { display:flex; align-items:center; justify-content:space-between; gap:10px; margin-bottom:13px; }
+  .block-title { font-size:14px; font-weight:700; color:var(--text); }
+  .count-pill { font-size:12px; color:var(--text-dim); background:var(--surface-2); border:1px solid var(--border); border-radius:999px; padding:4px 10px; white-space:nowrap; }
+
+  /* ── 搜尋 + 篩選 ── */
+  .search { width:100%; padding:12px 14px; font-size:16px; border-radius:11px; border:1px solid var(--border); background:var(--surface-2); color:var(--text); font-family:inherit; margin-bottom:10px; }
+  .search:focus { outline:none; border-color:var(--accent); box-shadow:0 0 0 3px rgba(45,212,191,.16); }
+  .filters { display:flex; flex-wrap:wrap; gap:7px; margin-bottom:14px; }
+  .fchip { padding:7px 13px; font-size:13px; font-weight:600; font-family:inherit; color:var(--text-dim); background:var(--surface-2); border:1px solid var(--border); border-radius:999px; cursor:pointer; transition:all .12s; }
+  .fchip:hover { color:var(--text); }
+  .fchip.active { color:var(--accent); background:rgba(45,212,191,.10); border-color:rgba(45,212,191,.4); }
+
+  .empty { color:var(--text-dim); font-size:14px; text-align:center; padding:26px 10px; }
+
+  /* ── 裝置卡(精簡版) ── */
+  .dev-list { display:flex; flex-direction:column; gap:11px; }
+  .dev-card.hide, .code-row.hide { display:none; }
+  .dev-head { display:flex; align-items:flex-start; justify-content:space-between; gap:10px; }
+  .dev-title { min-width:0; }
+  .dev-name { font-size:16px; font-weight:700; color:var(--text); word-break:break-all; }
+  .dev-id { font-size:11.5px; color:var(--accent); margin-top:2px; word-break:break-all; }
+  .dev-badges { display:flex; align-items:center; gap:6px; flex:0 0 auto; flex-wrap:wrap; justify-content:flex-end; }
+  .sdot { width:9px; height:9px; border-radius:50%; }
+  .sdot.on { background:#34D399; box-shadow:0 0 8px rgba(52,211,153,.7); }
+  .sdot.off { background:#4A5568; }
+  .ok-b { color:var(--accent); background:rgba(45,212,191,.12); border:1px solid rgba(45,212,191,.35); }
+  .warn-b { color:var(--gold); background:rgba(251,191,36,.12); border:1px solid rgba(251,191,36,.35); }
+  .mute-b { color:var(--text-dim); background:rgba(151,162,180,.10); border:1px solid var(--border); }
+  .danger-b { color:var(--danger); background:rgba(255,77,94,.12); border:1px solid rgba(255,77,94,.4); }
+  .facts { display:grid; grid-template-columns:repeat(2,1fr); gap:6px 12px; margin:12px 0 4px; }
+  .fact { display:flex; justify-content:space-between; gap:8px; font-size:12.5px; border-bottom:1px dashed #1b2231; padding-bottom:5px; }
+  .fk { color:var(--text-dim); flex:0 0 auto; }
+  .fv { font-weight:600; text-align:right; word-break:break-all; }
+  .fv.ok { color:var(--accent); } .fv.bad { color:var(--danger); } .fv.mute { color:var(--text); }
+  .dev-primary { display:flex; flex-wrap:wrap; gap:8px; margin-top:12px; }
+  .dev-more { margin-top:10px; }
+  .dev-more summary { cursor:pointer; font-size:13px; color:var(--text-dim); list-style:none; padding:7px 0; user-select:none; }
+  .dev-more summary::-webkit-details-marker { display:none; }
+  .dev-more[open] summary { color:var(--accent); }
+  .dev-more-body { display:flex; flex-direction:column; gap:8px; padding-top:6px; }
+  .row-form { display:flex; gap:8px; align-items:center; margin:0; }
+  .row-form.wide { width:100%; }
+  .btn-row { display:flex; gap:8px; flex-wrap:wrap; }
+  .mini-input { padding:9px 11px; font-size:15px; border-radius:9px; border:1px solid var(--border); background:var(--bg-1); color:var(--text); font-family:inherit; min-width:0; }
+  .mini-input.grow { flex:1 1 auto; }
+  .mini-days { width:64px; flex:0 0 64px; }
+  .mini-select { padding:9px 8px; font-size:14px; border-radius:9px; border:1px solid var(--border); background:var(--bg-1); color:var(--text); font-family:inherit; }
+  .bulk-row { display:flex; flex-wrap:wrap; align-items:center; gap:8px; padding:10px 12px; margin-bottom:13px; background:var(--surface-2); border:1px solid var(--border); border-radius:11px; }
+  .bulk-label { font-size:13px; font-weight:600; margin-right:auto; }
+
   .footnote { text-align: center; color: var(--text-dim); font-size: 12.5px; margin-top: 24px; }
 </style>
 </head>
 <body>
 <div class="wrap">
-  <div class="brand">
-    <span class="dot"></span>
-    <h1>偉電視 · 管理中心</h1>
-  </div>
-  <div class="accent-line"></div>
-  <div class="sub">遠端管理直播源、授權與裝置。存檔後盒子下次輪詢自動更新。</div>
+  <header class="topbar">
+    <div class="brand"><span class="dot"></span><h1>偉電視 · 管理中心</h1></div>
+    <div class="ver-pill">設定 v${escapeHtml(config.version)}</div>
+  </header>
 
-  <div class="card">
-    <div class="card-title">📊 營運概覽</div>
-    <div class="stat-grid">
-      <div class="stat-box"><div class="sb-num">${stat.total}</div><div class="sb-label">總裝置</div></div>
-      <div class="stat-box"><div class="sb-num accent">${stat.online}</div><div class="sb-label">24h 在線</div></div>
-      <div class="stat-box"><div class="sb-num ok">${stat.authed}</div><div class="sb-label">已授權</div></div>
-      <div class="stat-box"><div class="sb-num ${stat.unauth > 0 ? "warn" : ""}">${stat.unauth}</div><div class="sb-label">未授權</div></div>
-      <div class="stat-box"><div class="sb-num">${codeStat.unused}</div><div class="sb-label">未用碼</div></div>
-      <div class="stat-box"><div class="sb-num">${codeStat.used}</div><div class="sb-label">已用碼</div></div>
-    </div>
-    <div class="auth-banner ${config.requireActivation ? "on" : "off"}">
-      ${
-        config.requireActivation
-          ? "🔒 授權機制 <b>已啟用</b>：未授權或到期的盒子無法取得直播源。"
-          : "🔓 授權機制 <b>未啟用</b>：目前所有盒子皆可觀看（到下方「授權與啟動畫面」開啟）。"
-      }
-    </div>
-  </div>
+  <nav class="tabs">
+    <button type="button" class="tab active" data-tab="overview" onclick="showTab('overview',this)">📊 總覽</button>
+    <button type="button" class="tab" data-tab="source" onclick="showTab('source',this)">📡 直播源</button>
+    <button type="button" class="tab" data-tab="auth" onclick="showTab('auth',this)">🎟️ 授權</button>
+    <button type="button" class="tab" data-tab="devices" onclick="showTab('devices',this)">📺 裝置${
+      stat.unauth > 0 ? ' <span class="tdot"></span>' : ""
+    }</button>
+    <button type="button" class="tab" data-tab="system" onclick="showTab('system',this)">⚙️ 系統</button>
+  </nav>
 
-  <div class="card">
-    <div class="card-title">目前設定</div>
-    <div class="info-grid">
-      <div class="chip">
-        <div class="k">版本</div>
-        <div class="v">v${escapeHtml(config.version)}</div>
+  <section class="panel active" data-panel="overview">
+    <div class="block">
+      <div class="block-head"><span class="block-title">📊 營運概覽</span></div>
+      <div class="stat-grid">
+        <div class="stat-box"><div class="sb-num">${stat.total}</div><div class="sb-label">總裝置</div></div>
+        <div class="stat-box"><div class="sb-num accent">${stat.online}</div><div class="sb-label">24h 在線</div></div>
+        <div class="stat-box"><div class="sb-num ok">${stat.authed}</div><div class="sb-label">已授權</div></div>
+        <div class="stat-box"><div class="sb-num ${stat.unauth > 0 ? "warn" : ""}">${stat.unauth}</div><div class="sb-label">未授權</div></div>
+        <div class="stat-box"><div class="sb-num">${codeStat.unused}</div><div class="sb-label">未用碼</div></div>
+        <div class="stat-box"><div class="sb-num">${codeStat.used}</div><div class="sb-label">已用碼</div></div>
       </div>
-      <div class="chip">
-        <div class="k">強制刷新旗標</div>
-        <div class="v">
-          <span class="badge ${config.forceRefresh ? "on" : "off"}">${
-            config.forceRefresh ? "開啟中" : "關閉"
-          }</span>
-        </div>
-      </div>
-      <div class="chip">
-        <div class="k">開機自動啟動</div>
-        <div class="v">
-          <span class="badge ${config.autostart ? "on" : "off"}">${
-            config.autostart ? "開啟" : "關閉"
-          }</span>
-        </div>
-      </div>
-      <div class="chip" style="flex-basis:100%;">
-        <div class="k">最後更新</div>
-        <div class="v mono">${escapeHtml(config.updatedAt)}</div>
-      </div>
-      <div class="chip" style="flex-basis:100%;">
-        <div class="k">目前訂閱網址</div>
-        <div class="v mono">${escapeHtml(config.subscriptionUrl)}</div>
+      <div class="auth-banner ${config.requireActivation ? "on" : "off"}">
+        ${
+          config.requireActivation
+            ? "🔒 授權機制 <b>已啟用</b>：未授權或到期的盒子無法取得直播源。"
+            : "🔓 授權機制 <b>未啟用</b>：目前所有盒子皆可觀看（到「授權」分頁開啟）。"
+        }
       </div>
     </div>
-  </div>
-
-  <form class="card" method="POST" action="/admin/save">
-    <div class="card-title">編輯設定</div>
-
-    <label for="subscriptionUrl">訂閱網址
-      <span class="hint">含 token 的 m3u8 清單網址</span>
-    </label>
-    <textarea id="subscriptionUrl" name="subscriptionUrl">${escapeHtml(
-      config.subscriptionUrl
-    )}</textarea>
-
-    <button type="button" class="btn btn-secondary" onclick="testSource()">測試來源</button>
-    <div id="testResult"></div>
-
-    <label for="pollIntervalMinutes">盒子輪詢間隔（分鐘）</label>
-    <input type="number" id="pollIntervalMinutes" name="pollIntervalMinutes" min="1"
-      value="${escapeHtml(config.pollIntervalMinutes)}">
-
-    <label for="notice">公告
-      <span class="hint">可留空，盒子會顯示</span>
-    </label>
-    <textarea id="notice" name="notice">${escapeHtml(config.notice)}</textarea>
-
-    <div class="switch-row">
-      <input type="checkbox" id="forceRefresh" name="forceRefresh" ${
-        config.forceRefresh ? "checked" : ""
-      }>
-      <label for="forceRefresh">強制刷新（讓盒子下次輪詢立即重載來源）</label>
+    <div class="block">
+      <div class="block-head"><span class="block-title">目前設定摘要</span></div>
+      <div class="info-grid">
+        <div class="chip"><div class="k">設定版本</div><div class="v">v${escapeHtml(config.version)}</div></div>
+        <div class="chip"><div class="k">輪詢間隔</div><div class="v">${escapeHtml(config.pollIntervalMinutes)} 分</div></div>
+        <div class="chip"><div class="k">開機自啟（全域）</div><div class="v"><span class="badge ${config.autostart ? "on" : "off"}">${config.autostart ? "開啟" : "關閉"}</span></div></div>
+        <div class="chip" style="flex-basis:100%;"><div class="k">最後更新</div><div class="v mono">${escapeHtml(config.updatedAt)}</div></div>
+        <div class="chip" style="flex-basis:100%;"><div class="k">目前訂閱網址</div><div class="v mono">${escapeHtml(config.subscriptionUrl) || "（尚未設定）"}</div></div>
+      </div>
     </div>
+  </section>
 
-    <div class="switch-row">
-      <input type="checkbox" id="autostart" name="autostart" ${
-        config.autostart ? "checked" : ""
-      }>
-      <label for="autostart">開機自動啟動（所有盒子開機後自動開啟 App）</label>
-    </div>
+  <section class="panel" data-panel="source">
+    <form class="block" method="POST" action="/admin/save">
+      <input type="hidden" name="_fields" value="source">
+      <div class="block-head"><span class="block-title">📡 直播源</span></div>
+      <label for="subscriptionUrl">訂閱網址<span class="hint">含 token 的 m3u8 清單網址；App 不內建 token，一律由此下發</span></label>
+      <textarea id="subscriptionUrl" name="subscriptionUrl">${escapeHtml(config.subscriptionUrl)}</textarea>
+      <button type="button" class="btn btn-secondary" onclick="testSource()">測試來源</button>
+      <div id="testResult"></div>
+      <button type="submit" class="btn btn-primary">儲存直播源</button>
+    </form>
+  </section>
 
-    <div class="section-sep">🔐 授權與啟動畫面</div>
+  <section class="panel" data-panel="auth">
+    <form class="block" method="POST" action="/admin/save">
+      <input type="hidden" name="_fields" value="auth">
+      <div class="block-head"><span class="block-title">🔐 授權設定</span></div>
+      <div class="switch-row">
+        <input type="checkbox" id="requireActivation" name="requireActivation" ${config.requireActivation ? "checked" : ""}>
+        <label for="requireActivation">啟用啟動碼授權（未授權／到期盒子無法觀看）</label>
+      </div>
+      <label for="activationTitle">啟動畫面標題<span class="hint">App 開啟與輸入啟動碼時顯示</span></label>
+      <input type="text" id="activationTitle" name="activationTitle" value="${escapeHtml(config.activationTitle || "")}">
+      <label for="activationText">啟動畫面說明文字<span class="hint">可換行；可放歡迎語、客服聯絡方式</span></label>
+      <textarea id="activationText" name="activationText">${escapeHtml(config.activationText || "")}</textarea>
+      <label for="codeDigits">啟動碼位數（4～12，方便遙控器輸入）</label>
+      <input type="number" id="codeDigits" name="codeDigits" min="4" max="12" value="${escapeHtml(config.codeDigits || 8)}">
+      <button type="submit" class="btn btn-primary">儲存授權設定</button>
+    </form>
+    ${renderCodesSection(codeList, config)}
+  </section>
 
-    <div class="switch-row">
-      <input type="checkbox" id="requireActivation" name="requireActivation" ${
-        config.requireActivation ? "checked" : ""
-      }>
-      <label for="requireActivation">啟用啟動碼授權（未授權／到期盒子無法觀看）</label>
-    </div>
+  <section class="panel" data-panel="devices">
+    ${renderDevicesSection(devices)}
+  </section>
 
-    <label for="activationTitle">啟動畫面標題
-      <span class="hint">App 開啟與輸入啟動碼時顯示</span>
-    </label>
-    <input type="text" id="activationTitle" name="activationTitle" value="${escapeHtml(
-      config.activationTitle || ""
-    )}">
-
-    <label for="activationText">啟動畫面說明文字
-      <span class="hint">可換行；可放歡迎語、客服聯絡方式等</span>
-    </label>
-    <textarea id="activationText" name="activationText">${escapeHtml(
-      config.activationText || ""
-    )}</textarea>
-
-    <label for="codeDigits">啟動碼位數（4～12，方便遙控器輸入）</label>
-    <input type="number" id="codeDigits" name="codeDigits" min="4" max="12" value="${escapeHtml(
-      config.codeDigits || 8
-    )}">
-
-    <button type="submit" class="btn btn-primary">儲存設定</button>
-  </form>
-
-  ${renderCodesSection(codeList, config)}
-
-  ${renderDevicesSection(devices)}
-
-  <div class="footnote">App 設定端點 <code>/api/config</code> · 啟動端點 <code>/api/activate</code></div>
+  <section class="panel" data-panel="system">
+    <form class="block" method="POST" action="/admin/save">
+      <input type="hidden" name="_fields" value="system">
+      <div class="block-head"><span class="block-title">⚙️ 系統設定</span></div>
+      <label for="notice">公告<span class="hint">可留空；會顯示在盒子上</span></label>
+      <textarea id="notice" name="notice">${escapeHtml(config.notice)}</textarea>
+      <label for="pollIntervalMinutes">盒子輪詢間隔（分鐘）</label>
+      <input type="number" id="pollIntervalMinutes" name="pollIntervalMinutes" min="1" value="${escapeHtml(config.pollIntervalMinutes)}">
+      <div class="switch-row">
+        <input type="checkbox" id="forceRefresh" name="forceRefresh" ${config.forceRefresh ? "checked" : ""}>
+        <label for="forceRefresh">強制刷新（盒子下次輪詢立即重載來源）</label>
+      </div>
+      <div class="switch-row">
+        <input type="checkbox" id="autostart" name="autostart" ${config.autostart ? "checked" : ""}>
+        <label for="autostart">開機自動啟動（全域預設；可在「裝置」分頁個別覆蓋）</label>
+      </div>
+      <button type="submit" class="btn btn-primary">儲存系統設定</button>
+    </form>
+    <div class="footnote">App 設定端點 <code>/api/config</code> · 啟動端點 <code>/api/activate</code></div>
+  </section>
 </div>
 
 <script>
+// 分頁切換（記住目前分頁，操作後返回不跳回第一頁）
+function showTab(name, el) {
+  document.querySelectorAll('.panel').forEach(function(p){ p.classList.toggle('active', p.dataset.panel === name); });
+  document.querySelectorAll('.tab').forEach(function(t){ t.classList.remove('active'); });
+  if (el) el.classList.add('active');
+  try { localStorage.setItem('weitvTab', name); } catch(e){}
+}
+function restoreTab() {
+  var name; try { name = localStorage.getItem('weitvTab'); } catch(e){}
+  if (!name) return;
+  var btn = document.querySelector('.tab[data-tab="'+name+'"]');
+  if (btn) showTab(name, btn);
+}
+// 裝置搜尋 + 篩選
+var devFilter = 'all';
+function setDevFilter(el){ devFilter = el.dataset.f; el.parentNode.querySelectorAll('.fchip').forEach(function(c){c.classList.remove('active');}); el.classList.add('active'); filterDevs(); }
+function filterDevs(){
+  var box = document.getElementById('devSearch');
+  var q = (box ? box.value : '').trim().toLowerCase();
+  document.querySelectorAll('#devList .dev-card').forEach(function(card){
+    var okText = !q || (card.dataset.search||'').indexOf(q) >= 0;
+    var okFilter = devFilter === 'all'
+      || (devFilter === 'online' && card.dataset.online === '1')
+      || (devFilter === 'unauth' && card.dataset.authed === '0')
+      || (devFilter === 'blocked' && card.dataset.blocked === '1');
+    card.classList.toggle('hide', !(okText && okFilter));
+  });
+}
+// 啟動碼搜尋 + 篩選
+var codeFilter = 'all';
+function setCodeFilter(el){ codeFilter = el.dataset.f; el.parentNode.querySelectorAll('.fchip').forEach(function(c){c.classList.remove('active');}); el.classList.add('active'); filterCodes(); }
+function filterCodes(){
+  var box = document.getElementById('codeSearch');
+  var q = (box ? box.value : '').trim().toLowerCase();
+  document.querySelectorAll('#codeList .code-row').forEach(function(row){
+    var okText = !q || (row.dataset.search||'').indexOf(q) >= 0;
+    var okFilter = codeFilter === 'all' || row.dataset.status === codeFilter;
+    row.classList.toggle('hide', !(okText && okFilter));
+  });
+}
+document.addEventListener('DOMContentLoaded', restoreTab);
+
 function renderBoxesHtml(b) {
   if (!b) return '';
   var inner;
