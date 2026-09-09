@@ -210,12 +210,13 @@ export function renderOverview(ctx) {
     const actTxt = ss.last_action && ss.last_action !== "none"
       ? `最近自動處置：${esc(ss.last_action)}${ss.last_action_at ? "（" + esc(relativeTime(ss.last_action_at, nowMs)) + "）" : ""}`
       : "";
+    const reasonTxt = { vpn: "VPN 出口斷線", api_blocked: "4gtv 封鎖了目前出口 IP（API 400）", stale: "快取的播放網址失效", upstream: "上游 4gtv 不通" }[ss.reason] || "上游 4gtv 不通";
     if (stale) {
       banners.push(`<div class="banner warn"><span class="bi">⚠️</span><div>直播源伺服器的看門狗 <b>${when === "-" ? "沒有回報" : when + "後就沒再回報"}</b>，VPS 可能離線或排程停了。</div></div>`);
     } else if (ss.healthy) {
-      banners.push(`<div class="banner off"><span class="bi">🟢</span><div>直播源伺服器 <b>正常</b>（實測頻道解析與切片，${when}）。${ipTxt}。${epgTxt}${actTxt ? " " + actTxt : ""}</div></div>`);
+      banners.push(`<div class="banner off"><span class="bi">🟢</span><div>直播源伺服器 <b>正常</b>（實測熱門台切片與冷門台 API 解析，${when}）。${ipTxt}。${epgTxt}${actTxt ? " " + actTxt : ""}</div></div>`);
     } else {
-      banners.push(`<div class="banner warn"><span class="bi">🔴</span><div>直播源伺服器 <b>異常</b>：連續 <b>${esc(ss.consecutive_failures)}</b> 次實測失敗（${esc(ss.reason === "vpn" ? "VPN 出口斷線" : "上游 4gtv 不通")}，${when}，${ipTxt}）。看門狗會自動重啟與更換出口節點${actTxt ? "；" + actTxt : ""}。若 30 分鐘內未恢復請通知維護人員。</div></div>`);
+      banners.push(`<div class="banner warn"><span class="bi">🔴</span><div>直播源伺服器 <b>異常</b>：連續 <b>${esc(ss.consecutive_failures)}</b> 次實測失敗（${esc(reasonTxt)}，${when}，${ipTxt}）。看門狗會自動清快取、重啟與更換出口節點${actTxt ? "；" + actTxt : ""}。若 30 分鐘內未恢復請通知維護人員。</div></div>`);
     }
   }
   banners.push(
