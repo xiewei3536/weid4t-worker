@@ -29,7 +29,7 @@
 
 1. Cloudflare 後台 → **Workers & Pages** → 點開 `weid4t-worker`
 2. 上方 **Settings** → **Variables and Secrets**
-3. **+ Add** → Type 選 **Secret** → Name 填 `ADMIN_PASSWORD`、Value 填密碩 → **Deploy**
+3. **+ Add** → Type 選 **Secret** → Name 填 `ADMIN_PASSWORD`、Value 填密碼 → **Deploy**
 
 > 還沒設密碼時開 `/admin`,頁面會**直接畫出上面這幾步**,照著做即可。
 
