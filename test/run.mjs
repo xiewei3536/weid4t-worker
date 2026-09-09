@@ -388,6 +388,38 @@ await test("HTML 跳脫：惡意暱稱不會注入", async () => {
   assert.ok(p.text.includes("&lt;img"));
 });
 
+await test("總覽顯示直播源伺服器看門狗狀態（status.json）", async () => {
+  const env = makeEnv({ config: { version: 1, subscriptionUrl: "http://1.2.3.4:5050/channel?type=m3u&token=x" } });
+  const realFetch = globalThis.fetch;
+  let hit = 0;
+  globalThis.fetch = async (url, init) => {
+    if (String(url) === "http://1.2.3.4:5050/status.json") {
+      hit++;
+      return new Response(JSON.stringify({ healthy: false, consecutive_failures: 3, reason: "upstream", public_ip: "187.15.1.1", checked_at_ms: Date.now() - 60000, last_action: "restart_gluetun_hop", last_action_at: new Date(Date.now() - 30000).toISOString(), epg_updated: "2026-09-09 06:17:46 +08:00" }), { headers: { "Content-Type": "application/json" } });
+    }
+    return realFetch(url, init);
+  };
+  try {
+    const p = await call(env, "/admin/partial?name=overview");
+    assert.equal(hit, 1);
+    assert.match(p.text, /直播源伺服器 <b>異常<\/b>/);
+    assert.match(p.text, /187\.15\.1\.1/);
+    assert.match(p.text, /restart_gluetun_hop/);
+    // 健康 + 過期回報
+    globalThis.fetch = async (url, init) => String(url).endsWith("/status.json")
+      ? new Response(JSON.stringify({ healthy: true, consecutive_failures: 0, public_ip: "1.1.1.1", checked_at_ms: Date.now() - 2 * 3600000 }), { headers: { "Content-Type": "application/json" } })
+      : realFetch(url, init);
+    const p2 = await call(env, "/admin/partial?name=overview");
+    assert.match(p2.text, /沒再回報/);
+    // 沒有 status.json（第三方源）→ 不顯示、不出錯
+    globalThis.fetch = async (url, init) => String(url).endsWith("/status.json") ? new Response("nf", { status: 404 }) : realFetch(url, init);
+    const p3 = await call(env, "/admin/partial?name=overview");
+    assert.ok(!p3.text.includes("直播源伺服器"));
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+});
+
 console.log(`\n${passed} passed, ${failures.length} failed`);
 if (failures.length) {
   for (const [n, e] of failures) console.log("FAIL:", n, "\n", e && e.stack);

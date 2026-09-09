@@ -128,7 +128,33 @@ async function buildContext(request, env) {
   } catch (_) {
     ota = null;
   }
-  return { config, devices, codes, ota, origin: new URL(request.url).origin, hasGithubToken: !!env.GITHUB_TOKEN };
+  const sourceStatus = await fetchSourceStatus(config.subscriptionUrl);
+  return { config, devices, codes, ota, sourceStatus, origin: new URL(request.url).origin, hasGithubToken: !!env.GITHUB_TOKEN };
+}
+
+/**
+ * 直播源伺服器的看門狗狀態（VPS 上 watchdog.sh 每 5 分鐘輸出 /status.json）。
+ * 只要訂閱網址同源下有 status.json 就顯示；沒有（第三方源）就回 null 不顯示。3 秒逾時。
+ */
+async function fetchSourceStatus(subscriptionUrl) {
+  const m = /^(https?:\/\/[^/]+)/i.exec(String(subscriptionUrl || "").trim());
+  if (!m) return null;
+  try {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 3000);
+    const resp = await fetch(m[1] + "/status.json", {
+      signal: controller.signal,
+      headers: { "User-Agent": "WeiTV-Admin/2.0", Accept: "application/json" },
+      cf: { cacheTtl: 0 },
+    });
+    clearTimeout(timer);
+    if (!resp.ok) return null;
+    const j = await resp.json();
+    if (!j || typeof j !== "object" || typeof j.healthy !== "boolean") return null;
+    return j;
+  } catch (_) {
+    return null;
+  }
 }
 
 /** GET /admin */

@@ -199,6 +199,25 @@ export function renderOverview(ctx) {
     .join("");
 
   const banners = [];
+  // 直播源伺服器看門狗（VPS 每 5 分鐘實測頻道解析與切片）
+  const ss = ctx.sourceStatus;
+  if (ss) {
+    const ageMs = ss.checked_at_ms ? nowMs - ss.checked_at_ms : NaN;
+    const stale = !Number.isFinite(ageMs) || ageMs > 20 * 60 * 1000;
+    const when = ss.checked_at_ms ? relativeTime(new Date(ss.checked_at_ms).toISOString(), nowMs) : "-";
+    const ipTxt = ss.public_ip ? `出口 IP ${esc(ss.public_ip)}` : "出口 IP 未知";
+    const epgTxt = ss.epg_updated ? `節目表更新於 ${esc(String(ss.epg_updated).slice(5, 16))}` : "";
+    const actTxt = ss.last_action && ss.last_action !== "none"
+      ? `最近自動處置：${esc(ss.last_action)}${ss.last_action_at ? "（" + esc(relativeTime(ss.last_action_at, nowMs)) + "）" : ""}`
+      : "";
+    if (stale) {
+      banners.push(`<div class="banner warn"><span class="bi">⚠️</span><div>直播源伺服器的看門狗 <b>${when === "-" ? "沒有回報" : when + "後就沒再回報"}</b>，VPS 可能離線或排程停了。</div></div>`);
+    } else if (ss.healthy) {
+      banners.push(`<div class="banner off"><span class="bi">🟢</span><div>直播源伺服器 <b>正常</b>（實測頻道解析與切片，${when}）。${ipTxt}。${epgTxt}${actTxt ? " " + actTxt : ""}</div></div>`);
+    } else {
+      banners.push(`<div class="banner warn"><span class="bi">🔴</span><div>直播源伺服器 <b>異常</b>：連續 <b>${esc(ss.consecutive_failures)}</b> 次實測失敗（${esc(ss.reason === "vpn" ? "VPN 出口斷線" : "上游 4gtv 不通")}，${when}，${ipTxt}）。看門狗會自動重啟與更換出口節點${actTxt ? "；" + actTxt : ""}。若 30 分鐘內未恢復請通知維護人員。</div></div>`);
+    }
+  }
   banners.push(
     config.requireActivation
       ? `<div class="banner on"><span class="bi">🔒</span><div>授權機制 <b>已啟用</b>：未授權或到期的盒子拿不到直播源。${stat.unauth > 0 ? `目前有 <b>${stat.unauth}</b> 台未授權。` : "所有裝置皆已授權。"}</div></div>`
