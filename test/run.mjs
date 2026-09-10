@@ -96,7 +96,7 @@ await test("裝置登記與 KV 寫入節流", async () => {
   let r = await call(env, "/api/config?id=tv-1&m=BoxA&v=1.0.0.24");
   assert.equal(r.json.subscriptionUrl, "http://src/list.m3u");
   const w1 = kv.writes;
-  assert.equal(w1, 1, "新裝置寫一次");
+  assert.equal(w1, 2, "新裝置寫一次（＋新裝置登記限速計數一次）");
   await call(env, "/api/config?id=tv-1&m=BoxA&v=1.0.0.24");
   await call(env, "/api/config?id=tv-1&m=BoxA&v=1.0.0.24");
   assert.equal(kv.writes, w1, "10 分內無變化不再寫");
@@ -208,12 +208,13 @@ await test("裝置字體覆蓋與遠端指令（送出 → 下發 → ack）", a
   assert.equal(c.cmd.id, cmdId, "未 ack 前重複下發同一指令");
   c = (await call(env, "/api/config?id=tv-1&ack=" + cmdId)).json;
   assert.equal(c.cmd, null, "ack 後清除");
-  const dev = await env.CONFIG_KV.get("dev:tv-1", { type: "json" });
-  assert.equal(dev.lastAck.id, cmdId);
-  assert.equal(dev.lastAck.type, "tune");
+  const adm = await env.CONFIG_KV.get("devadm:tv-1", { type: "json" });
+  assert.equal(adm.lastAck.id, cmdId);
+  assert.equal(adm.lastAck.type, "tune");
+  assert.equal(adm.cmd, null);
   // 過期指令不下發
-  dev.cmd = { id: "old", type: "reload", arg: "", at: new Date(Date.now() - 7 * 3600000).toISOString() };
-  await env.CONFIG_KV.put("dev:tv-1", JSON.stringify(dev));
+  adm.cmd = { id: "old", type: "reload", arg: "", at: new Date(Date.now() - 7 * 3600000).toISOString() };
+  await env.CONFIG_KV.put("devadm:tv-1", JSON.stringify(adm));
   assert.equal((await call(env, "/api/config?id=tv-1")).json.cmd, null);
   // 群發
   await call(env, "/api/config?id=tv-2&m=Box&v=1");
@@ -334,6 +335,7 @@ await test("裝置：傳話 / 暱稱 / 自啟 / 刪除 / 清舊", async () => {
   assert.equal((await call(env, "/api/config?id=tv-1")).json.deviceNick, "客廳");
   await call(env, "/admin/device", { method: "POST", body: { id: "tv-1", action: "autostart", value: "off" } });
   assert.equal((await call(env, "/api/config?id=tv-1")).json.autostart, false);
+  await new Promise((r) => setTimeout(r, 5));   // 盒子之後在設定頁改開 → 最後改的贏
   await call(env, "/api/config?id=tv-1&as=1");
   assert.equal((await call(env, "/api/config?id=tv-1")).json.autostart, true);
   // 清 30 天未上線
@@ -404,7 +406,7 @@ await test("總覽顯示直播源伺服器看門狗狀態（status.json）", asy
     assert.equal(hit, 1);
     assert.match(p.text, /直播源伺服器 <b>異常<\/b>/);
     assert.match(p.text, /187\.15\.1\.1/);
-    assert.match(p.text, /restart_gluetun_hop/);
+    assert.match(p.text, /更換出口節點/);
     // 健康 + 過期回報
     globalThis.fetch = async (url, init) => String(url).includes("/status.json")
       ? new Response(JSON.stringify({ healthy: true, consecutive_failures: 0, public_ip: "1.1.1.1", checked_at_ms: Date.now() - 2 * 3600000 }), { headers: { "Content-Type": "application/json" } })
@@ -611,7 +613,7 @@ await test("監控：重點盒子離線 / 回來、載入失敗每小時一則�
     // 裝置分頁可切換重點監控
     r = await call(env, "/admin/device", { method: "POST", body: { id: "tv-b", action: "watch", value: "on" } });
     assert.equal(r.json.ok, true);
-    assert.equal((await env.CONFIG_KV.get("dev:tv-b", { type: "json" })).watch, true);
+    assert.equal((await env.CONFIG_KV.get("devadm:tv-b", { type: "json" })).watch, true);
     const d = await call(env, "/admin/partial?name=devices");
     assert.match(d.text, /重點監控/);
     // 靜音時段（台灣 12:00 落在 0-23）→ 不發只記錄
@@ -707,6 +709,130 @@ await test("Cron scheduled 入口會執行監控並寫入狀態；靜音時段�
   assert.equal(inQuietHours("9-18", at(12)), true);
   assert.equal(inQuietHours("", at(12)), false);
   assert.equal(inQuietHours("abc", at(12)), false);
+});
+
+await test("2.2：舊版單一 dev: 紀錄自動搬家到 devadm:，授權不中斷；心跳不再蓋掉管理員欄位", async () => {
+  const env = makeEnv({
+    config: { version: 9, subscriptionUrl: "http://src/list.m3u", requireActivation: true },
+    "dev:tv-old": { id: "tv-old", nick: "客廳", m: "Box", v: "1.0.0.25", ip: "1.1.1.1", firstSeen: "2026-09-01T00:00:00Z", lastSeen: "2026-09-10T00:00:00Z", count: 5, blocked: false, msg: "", msgLevel: "info", authorized: true, expireAt: "", watch: true, cmd: { id: "c1", type: "reload", arg: "", at: new Date().toISOString() } },
+  });
+  const c = (await call(env, "/api/config?id=tv-old&m=Box&v=1.0.0.26")).json;
+  assert.equal(c.authorized, true, "舊資料的授權要沿用");
+  assert.equal(c.subscriptionUrl, "http://src/list.m3u");
+  assert.equal(c.deviceNick, "客廳");
+  assert.equal(c.cmd && c.cmd.id, "c1", "舊資料裡的待送指令要保留");
+  const adm = await env.CONFIG_KV.get("devadm:tv-old", { type: "json" });
+  assert.equal(adm.authorized, true);
+  assert.equal(adm.watch, true);
+  const dev = await env.CONFIG_KV.get("dev:tv-old", { type: "json" });
+  assert.ok(!("authorized" in dev) && !("cmd" in dev) && !("nick" in dev), "盒子紀錄不再帶管理員欄位");
+  // 管理員在心跳之間改暱稱 → 下一次心跳（會寫 dev:）不會把暱稱蓋掉
+  await call(env, "/admin/device", { method: "POST", body: { id: "tv-old", action: "rename", value: "阿嬤房" } });
+  const d2 = await env.CONFIG_KV.get("dev:tv-old", { type: "json" });
+  d2.lastWrite = new Date(Date.now() - 11 * 60000).toISOString();
+  await env.CONFIG_KV.put("dev:tv-old", JSON.stringify(d2));
+  const c2 = (await call(env, "/api/config?id=tv-old&m=Box&v=1.0.0.26&now=%E4%B8%AD%E8%A6%96")).json;
+  assert.equal(c2.deviceNick, "阿嬤房");
+  const p = await call(env, "/admin/partial?name=devices");
+  assert.match(p.text, /阿嬤房/);
+  assert.match(p.text, /中視/);
+  assert.equal(env.CONFIG_KV.lists, 1, "裝置分頁只 list 一次");
+});
+
+await test("2.2：KV 故障時 /api/config 回 503（盒子沿用快取），不會回未授權把人鎖在外", async () => {
+  const env = makeEnv({ config: { version: 1, subscriptionUrl: "http://src/x", requireActivation: true } });
+  await call(env, "/api/config?id=tv-1");
+  await call(env, "/admin/device", { method: "POST", body: { id: "tv-1", action: "authorize", value: "0" } });
+  env.CONFIG_KV.failNext(1);
+  let r = await call(env, "/api/config?id=tv-1");
+  assert.equal(r.status, 503);
+  assert.equal(r.headers.get("retry-after"), "60");
+  assert.equal(r.json.ok, false);
+  r = await call(env, "/api/config?id=tv-1");
+  assert.equal(r.status, 200);
+  assert.equal(r.json.authorized, true);
+  // 伺服器內部錯誤對 fetch 呼叫回 JSON，不是純文字（管理頁局部刷新在 KV 全掛時）
+  const brokenEnv = { CONFIG_KV: null, ADMIN_PASSWORD: PASS };
+  const j = await call(brokenEnv, "/admin/partial?name=overview", { headers: { "X-Requested-With": "fetch" } });
+  assert.equal(j.status, 500);
+  assert.equal(j.json && j.json.ok, false);
+  const t = await call(brokenEnv, "/admin");
+  assert.equal(t.status, 500);
+  assert.match(t.ct, /text\/plain/);
+});
+
+await test("2.2：撤銷授權連帶作廢啟動碼；autostart 管理員設定優先於盒子回報；cmd_all tune 驗證台號", async () => {
+  const env = makeEnv({ config: { version: 1, subscriptionUrl: "http://src/x", requireActivation: true, codeDigits: 6 } });
+  await call(env, "/api/config?id=tv-1&m=B&v=1");
+  const g = await call(env, "/admin/codes", { method: "POST", body: { action: "gen_batch", count: "1", days: "0" } });
+  const code = g.json.codes[0];
+  assert.equal((await call(env, "/api/activate?id=tv-1&code=" + code)).json.ok, true);
+  assert.equal((await call(env, "/api/config?id=tv-1")).json.authorized, true);
+  let r = await call(env, "/admin/device", { method: "POST", body: { id: "tv-1", action: "deauthorize" } });
+  assert.equal(r.json.ok, true);
+  assert.match(r.json.message, /作廢/);
+  assert.equal((await call(env, "/api/config?id=tv-1")).json.authorized, false);
+  assert.equal((await call(env, "/api/activate?id=tv-1&code=" + code)).json.ok, false, "同一組碼不能再拿回授權");
+  assert.equal((await env.CONFIG_KV.get("code:" + code, { type: "json" })).status, "revoked");
+  // autostart：盒子回報 as=0，管理員沒設 → 跟盒子；之後管理員設開 → 以管理員為準；盒子之後又在設定頁改關 → 最後改的贏
+  await call(env, "/api/config?id=tv-1&as=0");
+  assert.equal((await call(env, "/api/config?id=tv-1")).json.autostart, false);
+  await new Promise((r) => setTimeout(r, 5));
+  await call(env, "/admin/device", { method: "POST", body: { id: "tv-1", action: "autostart", value: "on" } });
+  assert.equal((await call(env, "/api/config?id=tv-1")).json.autostart, true, "管理員最後改 → 開");
+  await new Promise((r) => setTimeout(r, 5));
+  await call(env, "/api/config?id=tv-1&as=0");
+  assert.equal((await call(env, "/api/config?id=tv-1")).json.autostart, false, "盒子之後在設定頁改關 → 關（最後改的贏）");
+  r = await call(env, "/admin/device", { method: "POST", body: { action: "cmd_all", value: "tune", arg: "abc" } });
+  assert.equal(r.json.ok, false);
+  r = await call(env, "/admin/device", { method: "POST", body: { action: "cmd_all", value: "tune", arg: "7" } });
+  assert.equal(r.json.ok, true);
+  // 啟動碼位數下限 6
+  await call(env, "/admin/save", { method: "POST", body: { _fields: "auth", requireActivation: "on", codeDigits: "4" } });
+  assert.equal((await env.CONFIG_KV.get("config", { type: "json" })).codeDigits, 6);
+});
+
+await test("2.2：新裝置登記限速與 7 天壽命；HEAD 視同 GET；CSV 防公式注入；QR 只收真圖", async () => {
+  const env = makeEnv({ config: { version: 1, subscriptionUrl: "http://src/x" } });
+  for (let i = 0; i < 12; i++) await call(env, "/api/config?id=spam-" + i, { ip: "3.3.3.3" });
+  const listed = await env.CONFIG_KV.list({ prefix: "dev:" });
+  assert.equal(listed.keys.length, 10, "同 IP 每小時最多 10 台新裝置");
+  assert.ok(env.CONFIG_KV.exp.has("dev:spam-1"), "未授權新裝置有 7 天壽命");
+  await call(env, "/admin/device", { method: "POST", body: { id: "spam-1", action: "authorize", value: "0" } });
+  assert.ok(!env.CONFIG_KV.exp.has("dev:spam-1"), "授權後改永久");
+  const h = await call(env, "/api/health", { method: "HEAD" });
+  assert.equal(h.status, 200);
+  await call(env, "/api/config?id=tv-csv&m=%3DHYPERLINK(%22x%22)&v=1", { ip: "4.4.4.4" });
+  const csv = await call(env, "/admin/export?what=devices");
+  assert.ok(csv.text.includes(`"'=HYPERLINK`), "公式字元前置單引號");
+  const fd = new FormData();
+  fd.append("file", new Blob(["<svg onload=alert(1)></svg>"], { type: "image/svg+xml" }), "x.svg");
+  const up = await call(env, "/admin/upload", { method: "POST", body: fd });
+  assert.equal(up.json.ok, false, "SVG 不收");
+  const fd2 = new FormData();
+  fd2.append("file", new Blob([new Uint8Array([0xff, 0xd8, 0xff, 0xe0, 0, 0x10, 0x4a, 0x46, 0x49, 0x46, 0])], { type: "application/octet-stream" }), "photo.bin");
+  const up2 = await call(env, "/admin/upload", { method: "POST", body: fd2 });
+  assert.equal(up2.json.ok, true, "看檔頭不看 MIME：JPEG 收");
+  const img = await call(env, "/asset/qr");
+  assert.equal(img.ct, "image/jpeg");
+  assert.match(img.headers.get("content-security-policy") || "", /sandbox/);
+});
+
+await test("2.2：公告 / 跑馬燈只改文字時留空維持原到期", async () => {
+  const env = makeEnv();
+  await call(env, "/admin/save", { method: "POST", body: { _fields: "notice", notice: "客服 0912", noticeHours: "24" } });
+  const until1 = (await env.CONFIG_KV.get("config", { type: "json" })).noticeUntil;
+  assert.ok(until1);
+  await call(env, "/admin/save", { method: "POST", body: { _fields: "notice", notice: "客服 0912-345", noticeHours: "" } });
+  assert.equal((await env.CONFIG_KV.get("config", { type: "json" })).noticeUntil, until1, "留空維持原到期");
+  await call(env, "/admin/save", { method: "POST", body: { _fields: "notice", notice: "客服 0912-345", noticeHours: "0" } });
+  assert.equal((await env.CONFIG_KV.get("config", { type: "json" })).noticeUntil, "", "填 0 = 常駐");
+  await call(env, "/admin/save", { method: "POST", body: { _fields: "marquee", marquee: "維護", marqueeMinutes: "30" } });
+  const m1 = (await env.CONFIG_KV.get("config", { type: "json" })).marqueeUntil;
+  await call(env, "/admin/save", { method: "POST", body: { _fields: "marquee", marquee: "維護中", marqueeMinutes: "" } });
+  assert.equal((await env.CONFIG_KV.get("config", { type: "json" })).marqueeUntil, m1);
+  const p = await call(env, "/admin/partial?name=notice");
+  assert.match(p.text, /維持原到期/);
 });
 
 console.log(`\n${passed} passed, ${failures.length} failed`);

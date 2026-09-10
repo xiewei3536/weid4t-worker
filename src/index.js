@@ -15,7 +15,7 @@
  *   - 影片串流不經過本 Worker（盒子直連源站），流量極小。
  */
 
-import { CORS_HEADERS, QR_ASSET_KEY, htmlResponse, textResponse } from "./lib.js";
+import { CORS_HEADERS, QR_ASSET_KEY, htmlResponse, jsonResponse, textResponse, wantsJson } from "./lib.js";
 import {
   handleActivate,
   handleDownloadApk,
@@ -49,7 +49,8 @@ export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
     const { pathname } = url;
-    const method = request.method;
+    // HEAD 視同 GET（監控 / 下載工具會先 HEAD 探測）；Workers 回應 HEAD 時會自動丟掉 body
+    const method = request.method === "HEAD" ? "GET" : request.method;
 
     try {
       if (method === "OPTIONS") {
@@ -57,13 +58,15 @@ export default {
       }
 
       // ── App 端 ──
-      if (pathname === "/api/config" && method === "GET") return await handleGetConfig(request, env);
+      if (pathname === "/api/config" && method === "GET") return await handleGetConfig(request, env, ctx);
       if (pathname === "/api/activate" && method === "GET") return await handleActivate(request, env);
       if (pathname === "/api/update" && method === "GET") return await handleUpdateInfo(request, env);
       if (pathname === "/api/time" && method === "GET") return handleTime();
       if (pathname === "/api/health" && method === "GET") return await handleHealth(env);
       if (pathname === "/dl/latest.apk" && method === "GET") return await handleDownloadApk(request, env);
       if (pathname === "/asset/qr" && method === "GET") return await handleAssetQr(env);
+      if (pathname === "/manifest.webmanifest" && method === "GET") return manifestResponse(url.origin);
+      if (pathname === "/asset/icon.svg" && method === "GET") return iconResponse();
 
       // ── 管理頁 ──
       if (pathname === "/admin" && method === "GET") return await handleAdminPage(request, env);
@@ -83,10 +86,41 @@ export default {
       return textResponse("Not Found", 404);
     } catch (err) {
       console.error("Unhandled error:", err && err.stack ? err.stack : err);
-      return textResponse("Internal Server Error", 500);
+      const reqId = (request.headers.get("cf-ray") || "").split("-")[0] || "";
+      // API 與管理頁的 fetch 呼叫都期待 JSON，不要回純文字讓前端 r.json() 炸掉
+      if (pathname.startsWith("/api/") || wantsJson(request)) {
+        return jsonResponse({ ok: false, error: "伺服器內部錯誤，請稍後再試", reqId }, 500);
+      }
+      return textResponse("Internal Server Error" + (reqId ? " (" + reqId + ")" : ""), 500);
     }
   },
 };
+
+/** PWA 資訊檔：手機「加到主畫面」後像 App 一樣開 */
+function manifestResponse(origin) {
+  const m = {
+    name: "偉電視管理中心",
+    short_name: "偉電視",
+    start_url: "/admin",
+    scope: "/",
+    display: "standalone",
+    background_color: "#0B1018",
+    theme_color: "#0B1018",
+    icons: [{ src: origin + "/asset/icon.svg", sizes: "any", type: "image/svg+xml", purpose: "any" }],
+  };
+  return new Response(JSON.stringify(m), {
+    status: 200,
+    headers: { "Content-Type": "application/manifest+json; charset=utf-8", "Cache-Control": "public, max-age=86400" },
+  });
+}
+
+function iconResponse() {
+  const svg = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128"><defs><linearGradient id="g" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#2DD4BF"/><stop offset="1" stop-color="#0EA5A0"/></linearGradient></defs><rect width="128" height="128" rx="30" fill="#0B1018"/><rect x="14" y="14" width="100" height="100" rx="24" fill="url(#g)"/><text x="64" y="86" font-size="62" font-weight="900" text-anchor="middle" font-family="PingFang TC, Noto Sans TC, sans-serif" fill="#052A26">偉</text></svg>`;
+  return new Response(svg, {
+    status: 200,
+    headers: { "Content-Type": "image/svg+xml", "Cache-Control": "public, max-age=604800", "Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'; sandbox" },
+  });
+}
 
 /** GET /asset/qr — 公開回傳聯絡 QR 圖（從 KV）；沒有則 404 */
 async function handleAssetQr(env) {
@@ -105,6 +139,9 @@ async function handleAssetQr(env) {
     headers: {
       "Content-Type": (metadata && metadata.ct) || "image/png",
       "Cache-Control": "public, max-age=86400",
+      "X-Content-Type-Options": "nosniff",
+      // 就算有人上傳了帶 script 的圖,也不准在本站網域執行
+      "Content-Security-Policy": "default-src 'none'; sandbox",
       ...CORS_HEADERS,
     },
   });

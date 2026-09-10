@@ -9,12 +9,14 @@
 import {
   CMD_TYPES,
   FONT_SCALE_OPTIONS,
+  actionText,
   configLabel,
   diffConfigKeys,
   escapeHtml as esc,
   effectiveFontScale,
   formatTaipeiFull,
   formatTaipeiTime,
+  maskToken,
   onlineState,
   pendingCmd,
   relativeTime,
@@ -114,6 +116,11 @@ export function renderAdminHtml(ctx) {
 <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
 <meta name="robots" content="noindex,nofollow">
 <meta name="theme-color" content="#0B1018">
+<link rel="manifest" href="/manifest.webmanifest">
+<link rel="icon" href="/asset/icon.svg" type="image/svg+xml">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="偉電視">
 <title>偉電視 · 管理中心</title>
 <style>${ADMIN_CSS}</style>
 </head>
@@ -295,7 +302,7 @@ export function renderOverview(ctx) {
     const ipTxt = ss.public_ip ? `出口 IP ${esc(ss.public_ip)}` : "出口 IP 未知";
     const epgTxt = ss.epg_updated ? `節目表更新於 ${esc(String(ss.epg_updated).slice(5, 16))}` : "";
     const actTxt = ss.last_action && ss.last_action !== "none"
-      ? `最近自動處置：${esc(ss.last_action)}${ss.last_action_at ? "（" + esc(relativeTime(ss.last_action_at, nowMs)) + "）" : ""}`
+      ? `最近自動處置：${esc(actionText(ss.last_action))}${ss.last_action_at ? "（" + esc(relativeTime(ss.last_action_at, nowMs)) + "）" : ""}`
       : "";
     const reasonTxt = reasonText(ss.reason);
     if (stale) {
@@ -343,7 +350,7 @@ export function renderOverview(ctx) {
         <div class="stat-box"><div class="sb-num accent">${stat.today}</div><div class="sb-label">今日上線</div></div>
         <div class="stat-box"><div class="sb-num ${config.requireActivation ? "ok" : "mute"}">${stat.authed}</div><div class="sb-label">已授權</div></div>
         <div class="stat-box"><div class="sb-num ${stat.unauth > 0 && config.requireActivation ? "warn" : "mute"}">${stat.unauth}</div><div class="sb-label">未授權</div></div>
-        <div class="stat-box"><div class="sb-num mute">${unusedCodes}</div><div class="sb-label">未用碼</div></div>
+        <div class="stat-box"><div class="sb-num ${devList.some((d) => onlineState(d, nowMs) === "online" && playHealth(d, nowMs).level === "bad") ? "warn" : "mute"}">${devList.filter((d) => onlineState(d, nowMs) === "online" && playHealth(d, nowMs).level === "bad").length}</div><div class="sb-label">播放不穩</div></div>
       </div>
       ${banners.join("")}
     </div>
@@ -390,9 +397,10 @@ export function renderOverview(ctx) {
         <div class="item"><div class="k">OTA 更新提示</div><div class="v"><span class="badge ${config.otaEnabled !== false ? "on" : "off"}">${config.otaEnabled !== false ? "允許" : "停用"}</span></div></div>
         <div class="item"><div class="k">Telegram 警示</div><div class="v"><span class="badge ${telegramReady(config) ? "on" : "off"}">${telegramReady(config) ? "已啟用" : "未設定"}</span></div></div>
         <div class="item"><div class="k">最後更新</div><div class="v mono">${esc(formatTaipeiFull(config.updatedAt))}</div></div>
-        <div class="item full"><div class="k">目前訂閱網址</div><div class="v mono">${config.subscriptionUrl ? esc(config.subscriptionUrl) : "（尚未設定）"}</div></div>
+        <div class="item full"><div class="k">目前訂閱網址</div><div class="v mono" title="token 已遮罩；完整網址在「直播源」分頁">${config.subscriptionUrl ? esc(maskToken(config.subscriptionUrl)) : "（尚未設定）"}</div></div>
       </div>
-      <div class="inline-note">啟動碼：未用 ${unusedCodes} · 已用 ${usedCodes} · 共 ${codeList.length}${stat.blocked ? ` ｜ 已封鎖裝置 ${stat.blocked} 台` : ""}</div>
+      ${ctx.devicesError ? `<div class="inline-note" style="color:var(--danger)">⚠ 裝置清單讀取失敗（資料庫暫時無法使用，或今日免費額度用完），數字可能不完整，稍後再試。</div>` : ""}
+      ${stat.blocked ? `<div class="inline-note">已封鎖裝置 ${stat.blocked} 台</div>` : ""}
     </div>`;
 }
 
@@ -407,7 +415,7 @@ export function renderSourcePanel(ctx) {
       <input type="hidden" name="_fields" value="source">
       <div class="block-head"><span class="block-title"><span class="ic">📡</span>直播源</span></div>
       <div class="block-sub">含 token 的 m3u 清單網址。App 不內建任何 token，一律由這裡下發；換 token 只要改這裡，盒子下次輪詢（最長 ${esc(config.pollIntervalMinutes)} 分鐘）或按「重載頻道」遠端指令就會更新。</div>
-      <label for="subscriptionUrl">訂閱網址<span class="hint">例如 http://你的IP:5050/channel?type=m3u&amp;token=…（HTTP 端口對老盒子最穩）</span></label>
+      <label for="subscriptionUrl">訂閱網址<span class="hint">例如 http://你的IP:5050/channel?type=m3u&amp;token=…（HTTP 連接埠對老盒子最穩）</span></label>
       <textarea id="subscriptionUrl" name="subscriptionUrl" spellcheck="false">${esc(config.subscriptionUrl)}</textarea>
       <div class="btn-row">
         <button type="button" class="btn btn-secondary" onclick="testSource()">🔍 測試來源</button>
@@ -546,6 +554,8 @@ export function renderDevicesSection(ctx) {
   const online = list.filter((d) => onlineState(d, nowMs) === "online").length;
   const body = list.length
     ? list.map((d) => renderDeviceCard(d, config, latestVer, nowMs)).join("")
+    : ctx.devicesError
+    ? `<div class="empty" style="color:var(--danger)">裝置清單讀取失敗（資料庫暫時無法使用，或今日免費額度用完）。這不代表盒子有問題，稍後再按「重新整理」。</div>`
     : `<div class="empty">尚無裝置上線（盒子裝好 App 開過後會出現）</div>`;
   const stale = list.filter((d) => nowMs - (Date.parse(d.lastSeen) || 0) > 30 * DAY).length;
   const cmdOpts = Object.keys(CMD_TYPES).filter((k) => k !== "tune").map((k) => `<option value="${k}">${CMD_TYPES[k]}</option>`).join("");
@@ -572,8 +582,8 @@ export function renderDevicesSection(ctx) {
           <select name="value" class="mini-select">${cmdOpts}</select>
           <button class="btn-mini btn-info">送出指令</button>
         </form>
-        <form class="row-form" method="POST" action="/admin/device"><input type="hidden" name="action" value="autostart_all"><input type="hidden" name="value" value="on"><button class="btn-mini">自啟全開</button></form>
-        <form class="row-form" method="POST" action="/admin/device"><input type="hidden" name="action" value="autostart_all"><input type="hidden" name="value" value="off"><button class="btn-mini">自啟全關</button></form>
+        <form class="row-form" method="POST" action="/admin/device" data-confirm="確定把「全部」裝置的開機自啟改為開？"><input type="hidden" name="action" value="autostart_all"><input type="hidden" name="value" value="on"><button class="btn-mini">自啟全開</button></form>
+        <form class="row-form" method="POST" action="/admin/device" data-confirm="確定把「全部」裝置的開機自啟改為關？關掉後盒子重開機不會自動進偉電視。"><input type="hidden" name="action" value="autostart_all"><input type="hidden" name="value" value="off"><button class="btn-mini">自啟全關</button></form>
         <a class="btn-mini" href="/admin/export?what=devices" style="text-decoration:none">⬇️ CSV</a>
         ${stale ? `<form class="row-form" method="POST" action="/admin/device" data-confirm="刪除 ${stale} 台超過 30 天未上線的裝置紀錄？"><input type="hidden" name="action" value="delete_stale"><button class="btn-mini btn-danger">清 30 天未上線（${stale}）</button></form>` : ""}
       </div>
@@ -593,7 +603,7 @@ export function renderDeviceCard(d, config, latestVer, nowMs) {
   const model = d && d.m ? d.m : "";
   const ver = d && d.v ? d.v : "";
   const state = onlineState(d, nowMs);
-  const stateText = state === "online" ? "線上" : state === "today" ? "今日曾上線" : "離線";
+  const stateText = state === "online" ? "線上" : state === "today" ? "剛離線" : "離線";
 
   const authed = !!(d && d.authorized);
   const dExpireAt = d && d.expireAt ? d.expireAt : "";
@@ -649,13 +659,16 @@ export function renderDeviceCard(d, config, latestVer, nowMs) {
     : "";
 
   const blockForm = blocked ? devForm(idAttr, "unblock", "解除封鎖", "ok") : devForm(idAttr, "block", "封鎖", "danger", `確定封鎖 ${esc(title)}？該台約 90 秒內停播。`);
-  const primary = `
+  const authForms = config.requireActivation
+    ? `
       <form class="row-form" method="POST" action="/admin/device">
         <input type="hidden" name="id" value="${idAttr}"><input type="hidden" name="action" value="authorize">
         <input type="number" name="value" class="mini-input mini-days" placeholder="天" value="0" min="0" title="0＝永久">
         <button class="btn-mini btn-ok">授權</button>
       </form>
-      ${authed ? devForm(idAttr, "deauthorize", "撤銷授權", "danger", `確定撤銷 ${esc(title)} 的授權？`) : ""}
+      ${authed ? devForm(idAttr, "deauthorize", "撤銷授權", "danger", `確定撤銷 ${esc(title)} 的授權？綁定的啟動碼會一併作廢。`) : ""}`
+    : "";
+  const primary = `${authForms}
       ${blockForm}
       <form class="row-form" method="POST" action="/admin/device"><input type="hidden" name="id" value="${idAttr}"><input type="hidden" name="action" value="cmd"><input type="hidden" name="value" value="reload"><button class="btn-mini btn-info" title="讓這台重新抓清單並繼續播放">🔁 重載頻道</button></form>`;
 
@@ -825,8 +838,8 @@ export function renderNoticePanel(ctx) {
       <div class="block-sub">在盒子畫面底部像電視台一樣滾動，適合「今晚 8 點停機維護」「請家人回電」這類臨時通知。</div>
       <label for="marquee">跑馬燈文字</label>
       <textarea id="marquee" name="marquee" maxlength="300" placeholder="例如：系統將於今晚 23:00 維護 10 分鐘，造成不便敬請見諒">${esc(config.marquee || "")}</textarea>
-      <label for="marqueeMinutes">顯示分鐘數<span class="hint">時間到自動消失；填 0 或清空文字＝停止</span></label>
-      <input type="number" id="marqueeMinutes" name="marqueeMinutes" min="0" value="${marqueeActive ? 30 : 30}" placeholder="例如 30">
+      <label for="marqueeMinutes">顯示分鐘數<span class="hint">時間到自動消失；${marqueeActive ? "留空＝維持原到期時間，只改文字；" : ""}填 0 或清空文字＝停止</span></label>
+      <input type="number" id="marqueeMinutes" name="marqueeMinutes" min="0" value="${marqueeActive ? "" : 30}" placeholder="${marqueeActive ? "維持原到期（剩 " + Math.max(1, Math.round((Date.parse(config.marqueeUntil) - nowMs) / 60000)) + " 分）" : "例如 30"}">
       ${marqueeActive ? `<div class="hint-line">⏱ 目前跑馬燈將於 <b>${esc(formatTaipeiFull(config.marqueeUntil))}</b> 自動消失</div>` : ""}
       <div class="preview-tv"><div class="ptitle">盒子畫面預覽</div><div class="pm"><span id="pmText">${esc(config.marquee || "（跑馬燈文字預覽）")}</span></div></div>
       <div class="btn-row">
@@ -841,8 +854,8 @@ export function renderNoticePanel(ctx) {
       <div class="block-sub">盒子開機／換台時在畫面下方顯示幾秒鐘的固定文字，適合長期提醒（例如客服電話）。</div>
       <label for="notice">公告文字<span class="hint">留空則不顯示</span></label>
       <textarea id="notice" name="notice" maxlength="500">${esc(config.notice || "")}</textarea>
-      <label for="noticeHours">自動撤下時數<span class="hint">0＝常駐；例如 24＝一天後自動撤下</span></label>
-      <input type="number" id="noticeHours" name="noticeHours" min="0" step="0.5" value="0" placeholder="0">
+      <label for="noticeHours">自動撤下時數<span class="hint">0＝常駐；例如 24＝一天後自動撤下${config.notice && config.noticeUntil ? "；留空＝維持原到期時間，只改文字" : ""}</span></label>
+      <input type="number" id="noticeHours" name="noticeHours" min="0" step="0.5" value="${config.notice && config.noticeUntil ? "" : 0}" placeholder="${config.notice && config.noticeUntil ? "維持原到期（剩 " + Math.max(0.5, Math.round(((Date.parse(config.noticeUntil) - nowMs) / 3600000) * 2) / 2) + " 小時）" : "0"}">
       ${config.notice && config.noticeUntil ? `<div class="hint-line">⏱ 目前公告將於 <b>${esc(formatTaipeiFull(config.noticeUntil))}</b> 自動撤下</div>` : ""}
       <div class="preview-tv center"><div class="ptitle" style="text-align:left">盒子畫面預覽</div><span class="pn" id="pnText">${esc(config.notice || "（公告文字預覽）")}</span></div>
       <div class="btn-row">
@@ -902,7 +915,7 @@ export function renderSystemPanel(ctx) {
     ? histList.map((h, i) => {
         const next = i === 0 ? config : histList[i - 1];   // 這份被「下一份」取代時改了什麼
         const changed = diffConfigKeys(h, next).map(configLabel);
-        return `<div class="hist-row"><div class="hist-meta"><b>v${esc(h.version != null ? h.version : "?")}</b><span>${esc(formatTaipeiFull(h.updatedAt))}（${esc(relativeTime(h.updatedAt, nowMs))}）</span></div><div class="hist-diff">${changed.length ? "之後改了：" + esc(changed.join("、")) : "與後一版相同"}</div><div class="hist-src mono">${esc(h.subscriptionUrl ? h.subscriptionUrl.slice(0, 90) + (h.subscriptionUrl.length > 90 ? "…" : "") : "（無直播源）")}</div><form method="POST" action="/admin/system" data-confirm="把設定還原成 v${esc(h.version)} 的內容？（會另存成新版本，可再還原回來）"><input type="hidden" name="action" value="restore_config"><input type="hidden" name="idx" value="${i}"><button class="btn-mini btn-gold">↩ 還原成這版</button></form></div>`;
+        return `<div class="hist-row"><div class="hist-meta"><b>v${esc(h.version != null ? h.version : "?")}</b><span>${esc(formatTaipeiFull(h.updatedAt))}（${esc(relativeTime(h.updatedAt, nowMs))}）</span></div><div class="hist-diff">${changed.length ? "之後改了：" + esc(changed.join("、")) : "與後一版相同"}</div><div class="hist-src mono">${esc(h.subscriptionUrl ? maskToken(h.subscriptionUrl).slice(0, 90) + (h.subscriptionUrl.length > 90 ? "…" : "") : "（無直播源）")}</div><form method="POST" action="/admin/system" data-confirm="把設定還原成 v${esc(h.version)} 的內容？（會另存成新版本，可再還原回來）"><input type="hidden" name="action" value="restore_config"><input type="hidden" name="idx" value="${i}"><button class="btn-mini btn-gold">↩ 還原成這版</button></form></div>`;
       }).join("")
     : `<div class="empty">尚無歷史（每次儲存設定會自動留一份，最多 12 份）</div>`;
   const auditList = Array.isArray(audit) ? audit : [];

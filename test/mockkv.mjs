@@ -1,6 +1,7 @@
 /**
  * 極簡 KV 模擬（測試 / 本機預覽用），支援本專案用到的 API：
  * get(key,{type}) / getWithMetadata / put(key,value,{metadata,expirationTtl}) / delete / list({prefix,limit})
+ * 另有測試輔助：writes / reads / lists 計數器、failNext(n) 讓接下來 n 次操作丟錯（模擬 KV 故障）。
  */
 export class MockKV {
   constructor(seed) {
@@ -9,7 +10,20 @@ export class MockKV {
     this.exp = new Map();
     this.writes = 0;
     this.reads = 0;
+    this.lists = 0;
+    this.deletes = 0;
+    this._fail = 0;
     if (seed) for (const [k, v] of Object.entries(seed)) this.map.set(k, typeof v === "string" ? v : JSON.stringify(v));
+  }
+  /** 讓接下來 n 次任何操作都丟例外（測試 KV 故障路徑） */
+  failNext(n) {
+    this._fail = n;
+  }
+  _maybeFail() {
+    if (this._fail > 0) {
+      this._fail--;
+      throw new Error("MockKV: simulated failure");
+    }
   }
   _alive(key) {
     const e = this.exp.get(key);
@@ -21,6 +35,7 @@ export class MockKV {
     return this.map.has(key);
   }
   async get(key, opts) {
+    this._maybeFail();
     this.reads++;
     if (!this._alive(key)) return null;
     const v = this.map.get(key);
@@ -34,6 +49,7 @@ export class MockKV {
     return { value, metadata: this.meta.get(key) || null };
   }
   async put(key, value, opts) {
+    this._maybeFail();
     this.writes++;
     this.map.set(key, value);
     if (opts && opts.metadata) this.meta.set(key, opts.metadata);
@@ -41,11 +57,15 @@ export class MockKV {
     else this.exp.delete(key);
   }
   async delete(key) {
+    this._maybeFail();
+    this.deletes++;
     this.map.delete(key);
     this.meta.delete(key);
     this.exp.delete(key);
   }
   async list(o) {
+    this._maybeFail();
+    this.lists++;
     const prefix = (o && o.prefix) || "";
     const limit = (o && o.limit) || 1000;
     const keys = [...this.map.keys()].filter((k) => k.startsWith(prefix) && this._alive(k)).slice(0, limit).map((name) => ({ name }));

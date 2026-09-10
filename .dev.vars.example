@@ -7,3 +7,7 @@
 
 # 管理頁(/admin)的登入密碼 —— 請設一個只有你知道的密碼。
 ADMIN_PASSWORD=
+
+# (選用)OTA 自動更新:GitHub fine-grained token,只需 weid4t-app 的 Contents: Read-only。
+# 沒填就不提供 App 自動更新,其餘功能不受影響。
+GITHUB_TOKEN=

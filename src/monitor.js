@@ -11,6 +11,7 @@
 import {
   MON_KEY,
   ONLINE_MS,
+  actionText,
   formatTaipeiFull,
   loadConfig,
   parseIntOr,
@@ -27,9 +28,11 @@ const LOG_MAX = 40;
 
 export const REASON_TEXT = {
   vpn: "VPN 出口斷線",
-  api_blocked: "4gtv 封鎖了目前出口 IP（API 400）",
+  api_blocked: "4gtv 封鎖了目前出口 IP（API 回 400）",
   stale: "快取的播放網址失效",
   upstream: "上游 4gtv 不通",
+  auth: "NordVPN 帳密錯誤或到期（AUTH_FAILED）",
+  nginx: "直播源主機的對外入口（nginx）沒回應",
 };
 export function reasonText(r) {
   return REASON_TEXT[r] || (r ? String(r) : "上游 4gtv 不通");
@@ -59,6 +62,9 @@ export async function fetchSourceStatus(subscriptionUrl) {
     if (!resp.ok) return null;
     const j = await resp.json();
     if (!j || typeof j !== "object" || typeof j.healthy !== "boolean") return null;
+    // 用來源伺服器回應的 Date 標頭算「多久沒更新」，VPS 與 Worker 時鐘差幾分鐘也不會誤判成沒回報
+    const d = Date.parse(resp.headers.get("Date") || "");
+    if (Number.isFinite(d) && d > 0) j._serverNowMs = d;
     return j;
   } catch (_) {
     return null;
@@ -68,7 +74,8 @@ export async function fetchSourceStatus(subscriptionUrl) {
 /** 看門狗狀態 → ok（正常）/ bad（異常）/ stale（沒回報）/ none（沒有 status.json，例如第三方源） */
 export function sourceState(ss, nowMs) {
   if (!ss) return "none";
-  const age = ss.checked_at_ms ? nowMs - ss.checked_at_ms : NaN;
+  const ref = ss._serverNowMs && Math.abs(ss._serverNowMs - nowMs) < 6 * 3600000 ? ss._serverNowMs : nowMs;
+  const age = ss.checked_at_ms ? ref - ss.checked_at_ms : NaN;
   if (!Number.isFinite(age) || age > STALE_MS) return "stale";
   return ss.healthy ? "ok" : "bad";
 }
@@ -207,14 +214,14 @@ export async function runMonitorTick(env, nowMs, opts) {
       } else {
         events.push({
           kind: "src_down",
-          text: `🔴 <b>直播源異常</b>（已 ${mins} 分鐘）\n原因：${reasonText(src.reason)}\n連續失敗 ${src.fails} 次${src.ip ? " · 出口 IP " + src.ip : ""}\n看門狗會自動清快取 / 更換出口節點${src.lastAction && src.lastAction !== "none" ? "（最近處置：" + src.lastAction + "）" : ""}。30 分鐘內沒恢復請登入 VPS 執行 4gtv status。`,
+          text: `🔴 <b>直播源異常</b>（已 ${mins} 分鐘）\n原因：${reasonText(src.reason)}\n連續失敗 ${src.fails} 次${src.ip ? " · 出口 IP " + src.ip : ""}\n看門狗會自動清快取 / 更換出口節點${actionText(src.lastAction) ? "（最近處置：" + actionText(src.lastAction) + "）" : ""}。30 分鐘內沒恢復請登入 VPS 執行 4gtv doctor。`,
         });
       }
     }
   } else if (src.downSince) {
     const mins = Math.max(1, Math.round((nowMs - src.downSince) / 60000));
     if (src.alerted) {
-      events.push({ kind: "src_up", text: `🟢 <b>直播源已恢復</b>\n中斷約 ${mins} 分鐘${src.ip ? " · 出口 IP " + src.ip : ""}${src.lastAction && src.lastAction !== "none" ? " · 處置 " + src.lastAction : ""}` });
+      events.push({ kind: "src_up", text: `🟢 <b>直播源已恢復</b>\n中斷約 ${mins} 分鐘${src.ip ? " · 出口 IP " + src.ip : ""}${actionText(src.lastAction) ? " · 處置：" + actionText(src.lastAction) : ""}` });
     }
     src.downSince = 0;
     src.alerted = false;
@@ -225,9 +232,11 @@ export async function runMonitorTick(env, nowMs, opts) {
   let devices = [];
   try {
     devices = await loadDevices(env);
-  } catch (_) {
+  } catch (err) {
+    console.error("監控讀取裝置失敗:", err);
     devices = [];
   }
+  st.devError = devices.length === 0 && false;
   const offMs = Math.max(30, parseIntOr(config.alertDeviceOfflineMin, 180)) * 60000;
   const ids = new Set();
   for (const d of devices) {

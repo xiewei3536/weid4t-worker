@@ -12,12 +12,14 @@ import {
   CMD_TYPES,
   CODE_PREFIX,
   DEFAULT_CONFIG,
+  DEVADM_PREFIX,
   DEVICE_PREFIX,
   OTA_CACHE_KEY,
   QR_ASSET_KEY,
   appendAudit,
   clientIp,
   configLabel,
+  csvCell,
   diffConfigKeys,
   escapeHtml,
   formatTaipeiFull,
@@ -27,6 +29,7 @@ import {
   loadAudit,
   loadConfig,
   loadConfigHistory,
+  maskToken,
   nowIso,
   parseFloatOr,
   parseIntOr,
@@ -37,7 +40,7 @@ import {
   timingSafeEqual,
   wantsJson,
 } from "./lib.js";
-import { authorizeDevice, genCodeString, getLatestRelease, loadCodes, loadDevices } from "./api.js";
+import { authorizeDevice, genCodeString, getLatestRelease, loadCodes, loadDevice, loadDevices, saveDeviceAdmin } from "./api.js";
 import { fetchSourceStatus, isValidTgToken, loadMonState, runMonitorTick, saveMonState, sendTelegram } from "./monitor.js";
 import { renderAdminHtml, renderCodesResultPage, renderPartial, renderResultPage, setupPasswordHtml } from "./ui.js";
 
@@ -146,7 +149,7 @@ const str = (form, k) => (form.get(k) == null ? "" : String(form.get(k))).trim()
  */
 const NEED = {
   page: ["devices", "codes", "ota", "status", "mon", "audit", "hist"],
-  overview: ["devices", "codes", "ota", "status", "mon"],
+  overview: ["devices", "ota", "status", "mon"],
   devices: ["devices", "ota"],
   codes: ["codes"],
   source: [],
@@ -159,8 +162,11 @@ const NEED = {
 async function buildContext(request, env, part) {
   const need = new Set(NEED[part] || NEED.page);
   const config = await loadConfig(env);
+  let devicesError = false;
   const [devices, codes, ota, sourceStatus, mon, audit, hist] = await Promise.all([
-    need.has("devices") ? loadDevices(env) : Promise.resolve([]),
+    need.has("devices")
+      ? loadDevices(env).catch((err) => { console.error("裝置列舉失敗:", err); devicesError = true; return []; })
+      : Promise.resolve([]),
     need.has("codes") ? loadCodes(env) : Promise.resolve([]),
     need.has("ota") ? getLatestRelease(env).catch(() => null) : Promise.resolve(null),
     need.has("status") ? fetchSourceStatus(config.subscriptionUrl) : Promise.resolve(null),
@@ -169,7 +175,7 @@ async function buildContext(request, env, part) {
     need.has("hist") ? loadConfigHistory(env) : Promise.resolve([]),
   ]);
   return {
-    config, devices, codes, ota, sourceStatus, mon, audit, hist,
+    config, devices, codes, ota, sourceStatus, mon, audit, hist, devicesError,
     origin: new URL(request.url).origin,
     hasGithubToken: !!env.GITHUB_TOKEN,
   };
@@ -232,17 +238,27 @@ export async function handleAdminSave(request, env) {
 
   if (fields === "all" || fields === "notice") {
     updated.notice = String(form.get("notice") || "").slice(0, 500);
-    let nh = parseFloatOr(form.get("noticeHours"), 0);
-    if (nh < 0) nh = 0;
-    updated.noticeUntil = nh > 0 && updated.notice ? new Date(Date.now() + nh * 3600000).toISOString() : "";
+    const nhRaw = str(form, "noticeHours");
+    if (!updated.notice) updated.noticeUntil = "";
+    else if (nhRaw === "") updated.noticeUntil = current.noticeUntil || "";   // 留空 = 維持原到期（改錯字不會把限時公告變常駐）
+    else {
+      let nh = parseFloatOr(nhRaw, 0);
+      if (nh < 0) nh = 0;
+      updated.noticeUntil = nh > 0 ? new Date(Date.now() + nh * 3600000).toISOString() : "";
+    }
     changes.push("公告");
   }
 
   if (fields === "all" || fields === "marquee") {
     updated.marquee = String(form.get("marquee") || "").replace(/\s+/g, " ").trim().slice(0, 300);
-    let mm = parseFloatOr(form.get("marqueeMinutes"), 0);
-    if (mm < 0) mm = 0;
-    updated.marqueeUntil = mm > 0 && updated.marquee ? new Date(Date.now() + mm * 60000).toISOString() : "";
+    const mmRaw = str(form, "marqueeMinutes");
+    if (!updated.marquee) updated.marqueeUntil = "";
+    else if (mmRaw === "" && current.marqueeUntil && (Date.parse(current.marqueeUntil) || 0) > Date.now()) updated.marqueeUntil = current.marqueeUntil;
+    else {
+      let mm = parseFloatOr(mmRaw, 30);
+      if (mm < 0) mm = 0;
+      updated.marqueeUntil = mm > 0 ? new Date(Date.now() + mm * 60000).toISOString() : "";
+    }
     changes.push("跑馬燈");
   }
 
@@ -270,7 +286,7 @@ export async function handleAdminSave(request, env) {
     updated.activationTitle = String(form.get("activationTitle") || "").slice(0, 60);
     updated.activationText = String(form.get("activationText") || "").slice(0, 500);
     let cd = parseIntOr(form.get("codeDigits"), current.codeDigits || 8);
-    updated.codeDigits = Math.max(4, Math.min(12, cd));
+    updated.codeDigits = Math.max(6, Math.min(12, cd));   // 4～5 位太好猜（200 組未用碼時每猜 2%），最低 6 位
     changes.push("授權設定");
   }
 
@@ -307,7 +323,7 @@ export async function handleAdminSave(request, env) {
   }
 
   const what = changes.length ? changes.join("、") : "設定";
-  await appendAudit(env, request, `儲存${what}（v${updated.version}）${fields === "source" ? "：" + updated.subscriptionUrl.slice(0, 120) : ""}`);
+  await appendAudit(env, request, `儲存${what}（v${updated.version}）${fields === "source" ? "：" + maskToken(updated.subscriptionUrl).slice(0, 120) : ""}`);
   return respond(
     request,
     true,
@@ -422,8 +438,17 @@ async function summarizeBoxes(env) {
 }
 
 /* ================================================================
- *  POST /admin/device — 裝置動作
+ *  POST /admin/device — 裝置動作（只寫 devadm:<id>，心跳寫的 dev:<id> 不碰）
  * ================================================================ */
+
+/** 讀某台的管理員紀錄（不存在時給空物件）；順便回傳合併後的顯示名 */
+async function loadAdm(env, id) {
+  const { dev, adm } = await loadDevice(env, id);
+  if (!dev && !adm) return null;
+  const a = { ...(adm || {}), id };
+  const who = a.nick ? `${a.nick}（${id}）` : id;
+  return { adm: a, who, dev };
+}
 
 export async function handleAdminDevice(request, env) {
   const blocked = await guard(request, env);
@@ -446,9 +471,12 @@ export async function handleAdminDevice(request, env) {
     let n = 0;
     for (const dev of devices) {
       if (!dev || !dev.id) continue;
-      dev.autostart = on;
       try {
-        await env.CONFIG_KV.put(DEVICE_PREFIX + dev.id, JSON.stringify(dev));
+        const r = await loadAdm(env, dev.id);
+        if (!r) continue;
+        r.adm.autostart = on;
+        r.adm.autostartAt = nowIso();
+        await saveDeviceAdmin(env, dev.id, r.adm);
         n++;
       } catch (_) {}
     }
@@ -476,14 +504,17 @@ export async function handleAdminDevice(request, env) {
   if (action === "cmd_all") {
     const type = value;
     if (!CMD_TYPES[type]) return respond(request, false, "未知指令");
+    if (type === "tune" && !/^\d{1,4}$/.test(arg)) return respond(request, false, "請輸入頻道號碼（數字）");
     const devices = await loadDevices(env);
     let n = 0;
     const cmd = { id: "c" + Date.now().toString(36), type, arg, at: nowIso() };
     for (const dev of devices) {
       if (!dev || !dev.id || dev.blocked) continue;
-      dev.cmd = { ...cmd };
       try {
-        await env.CONFIG_KV.put(DEVICE_PREFIX + dev.id, JSON.stringify(dev));
+        const r = await loadAdm(env, dev.id);
+        if (!r) continue;
+        r.adm.cmd = { ...cmd };
+        await saveDeviceAdmin(env, dev.id, r.adm);
         n++;
       } catch (_) {}
     }
@@ -501,6 +532,7 @@ export async function handleAdminDevice(request, env) {
       if ((Date.parse(dev.lastSeen) || 0) < cutoff) {
         try {
           await env.CONFIG_KV.delete(DEVICE_PREFIX + dev.id);
+          await env.CONFIG_KV.delete(DEVADM_PREFIX + dev.id);
           n++;
         } catch (_) {}
       }
@@ -510,11 +542,11 @@ export async function handleAdminDevice(request, env) {
   }
 
   if (!id || !action) return respond(request, false, "缺少裝置 id 或動作");
-  const key = DEVICE_PREFIX + id;
 
   if (action === "delete") {
     try {
-      await env.CONFIG_KV.delete(key);
+      await env.CONFIG_KV.delete(DEVICE_PREFIX + id);
+      await env.CONFIG_KV.delete(DEVADM_PREFIX + id);
     } catch (err) {
       return respond(request, false, "刪除失敗，請稍後再試");
     }
@@ -522,61 +554,74 @@ export async function handleAdminDevice(request, env) {
     return respond(request, true, `已刪除裝置 ${id}`, { refresh });
   }
 
-  let dev = null;
+  let r = null;
   try {
-    dev = await env.CONFIG_KV.get(key, { type: "json" });
+    r = await loadAdm(env, id);
   } catch (_) {}
-  if (!dev || typeof dev !== "object") {
+  if (!r) {
     return respond(request, false, `找不到裝置 ${id}（可能已被刪除）`);
   }
+  const adm = r.adm;
+  const who = r.who;
 
   let summary = "";
-  const who = dev.nick ? `${dev.nick}（${id}）` : id;
   switch (action) {
     case "block":
-      dev.blocked = true;
+      adm.blocked = true;
       summary = `已封鎖 ${who}，約 90 秒內停播`;
       break;
     case "unblock":
-      dev.blocked = false;
+      adm.blocked = false;
       summary = `已解除封鎖 ${who}`;
       break;
     case "message":
-      dev.msg = value.slice(0, 200);
-      dev.msgLevel = level === "warn" ? "warn" : "info";
-      summary = dev.msg ? `已對 ${who} 傳話` : `已清除 ${who} 的訊息`;
+      adm.msg = value.slice(0, 200);
+      adm.msgLevel = level === "warn" ? "warn" : "info";
+      summary = adm.msg ? `已對 ${who} 傳話` : `已清除 ${who} 的訊息`;
       break;
     case "clearmsg":
-      dev.msg = "";
-      dev.msgLevel = "info";
+      adm.msg = "";
+      adm.msgLevel = "info";
       summary = `已清除 ${who} 的訊息`;
       break;
     case "rename":
-      dev.nick = value.trim().slice(0, 40);
-      summary = dev.nick ? `已把 ${id} 命名為「${dev.nick}」` : `已清除 ${id} 的暱稱`;
+      adm.nick = value.trim().slice(0, 40);
+      summary = adm.nick ? `已把 ${id} 命名為「${adm.nick}」` : `已清除 ${id} 的暱稱`;
       break;
     case "autostart":
-      dev.autostart = value === "on";
-      summary = `已將 ${who} 的開機自啟設為「${dev.autostart ? "開" : "關"}」`;
+      adm.autostart = value === "on";
+      adm.autostartAt = nowIso();
+      summary = `已將 ${who} 的開機自啟設為「${adm.autostart ? "開" : "關"}」`;
       break;
     case "authorize": {
       let days = parseIntOr(value, 0);
       if (days < 0) days = 0;
-      dev.authorized = true;
-      dev.authedAt = nowIso();
-      dev.expireAt = days > 0 ? new Date(Date.now() + days * 86400000).toISOString() : "";
+      adm.authorized = true;
+      adm.authedAt = nowIso();
+      adm.expireAt = days > 0 ? new Date(Date.now() + days * 86400000).toISOString() : "";
       summary = `已授權 ${who}（${days > 0 ? days + " 天" : "永久"}）`;
       break;
     }
     case "deauthorize":
-      dev.authorized = false;
-      dev.expireAt = "";
-      summary = `已撤銷 ${who} 的授權`;
+      adm.authorized = false;
+      adm.expireAt = "";
+      // 綁定的啟動碼一併作廢，不然盒子重輸同一組碼就又回來了
+      if (adm.codeUsed) {
+        try {
+          const ck = CODE_PREFIX + adm.codeUsed;
+          const rec = await env.CONFIG_KV.get(ck, { type: "json" });
+          if (rec && rec.status === "used" && rec.device === id) {
+            rec.status = "revoked";
+            await env.CONFIG_KV.put(ck, JSON.stringify(rec));
+          }
+        } catch (_) {}
+      }
+      summary = `已撤銷 ${who} 的授權${adm.codeUsed ? "（原啟動碼一併作廢）" : ""}`;
       break;
     case "fontscale": {
       const fs = value.trim();
       if (fs && !isValidFontScale(fs)) return respond(request, false, "字體等級不正確");
-      dev.fontScale = fs; // 空字串 = 跟隨全域
+      adm.fontScale = fs; // 空字串 = 跟隨全域
       summary = fs ? `已將 ${who} 的字體設為「${fs}」` : `${who} 的字體改為跟隨全域設定`;
       break;
     }
@@ -584,17 +629,17 @@ export async function handleAdminDevice(request, env) {
       const type = value.trim();
       if (!CMD_TYPES[type]) return respond(request, false, "未知指令");
       if (type === "tune" && !/^\d{1,4}$/.test(arg)) return respond(request, false, "請輸入頻道號碼（數字）");
-      dev.cmd = { id: "c" + Date.now().toString(36), type, arg, at: nowIso() };
+      adm.cmd = { id: "c" + Date.now().toString(36), type, arg, at: nowIso() };
       summary = `已送出「${CMD_TYPES[type]}${type === "tune" ? " " + arg : ""}」給 ${who}，下次心跳（約 90 秒內）執行`;
       break;
     }
     case "clearcmd":
-      dev.cmd = null;
+      adm.cmd = null;
       summary = `已取消 ${who} 的待送指令`;
       break;
     case "watch":
-      dev.watch = value === "on";
-      summary = dev.watch
+      adm.watch = value === "on";
+      summary = adm.watch
         ? `已把 ${who} 設為重點監控：離線超過門檻會通知你（在「警示」分頁設定）`
         : `已取消 ${who} 的重點監控`;
       break;
@@ -603,7 +648,12 @@ export async function handleAdminDevice(request, env) {
   }
 
   try {
-    await env.CONFIG_KV.put(key, JSON.stringify(dev));
+    await saveDeviceAdmin(env, id, adm);
+    // 授權後盒子紀錄改永久（未授權的新裝置原本只有 7 天壽命）
+    if (action === "authorize" && r.dev) {
+      const { stripAdminFields } = await import("./lib.js");
+      await env.CONFIG_KV.put(DEVICE_PREFIX + id, JSON.stringify(stripAdminFields(r.dev)));
+    }
   } catch (err) {
     return respond(request, false, "寫入失敗，請稍後再試");
   }
@@ -705,12 +755,11 @@ export async function handleAdminCodes(request, env) {
     rec.status = "revoked";
     if (rec.device) {
       try {
-        const dkey = DEVICE_PREFIX + rec.device;
-        const dev = await env.CONFIG_KV.get(dkey, { type: "json" });
-        if (dev) {
-          dev.authorized = false;
-          dev.expireAt = "";
-          await env.CONFIG_KV.put(dkey, JSON.stringify(dev));
+        const { adm } = await loadDevice(env, rec.device);
+        if (adm) {
+          adm.authorized = false;
+          adm.expireAt = "";
+          await saveDeviceAdmin(env, rec.device, adm);
         }
       } catch (_) {}
     }
@@ -803,8 +852,6 @@ export async function handleAdminUpload(request, env) {
   if (!file || typeof file === "string" || typeof file.arrayBuffer !== "function") {
     return respond(request, false, "請選擇要上傳的圖檔", null, config);
   }
-  const ct = file.type || "image/png";
-  if (!/^image\//.test(ct)) return respond(request, false, "只接受圖片檔（PNG / JPG 等）", null, config);
   let buf;
   try {
     buf = await file.arrayBuffer();
@@ -812,6 +859,9 @@ export async function handleAdminUpload(request, env) {
     return respond(request, false, "讀取圖檔失敗", null, config);
   }
   if (buf.byteLength > 2 * 1024 * 1024) return respond(request, false, "圖檔太大，請小於 2MB", null, config);
+  // 只認檔頭（magic bytes），不信瀏覽器報的 MIME：SVG 之類可夾帶 script 的一律拒收
+  const ct = sniffImageType(new Uint8Array(buf.slice(0, 16)));
+  if (!ct) return respond(request, false, "只接受 PNG / JPG / GIF / WebP 圖片檔", null, config);
   try {
     await env.CONFIG_KV.put(QR_ASSET_KEY, buf, { metadata: { ct } });
   } catch (_) {
@@ -825,6 +875,15 @@ export async function handleAdminUpload(request, env) {
   } catch (_) {}
   await appendAudit(env, request, "上傳聯絡 QR 圖");
   return respond(request, true, "已上傳聯絡 QR 圖，盒子下次輪詢就會看到", { refresh, version: config.version }, config);
+}
+
+/** 由檔頭判斷圖片類型；不是 PNG / JPEG / GIF / WebP 回 null */
+function sniffImageType(b) {
+  if (b.length >= 8 && b[0] === 0x89 && b[1] === 0x50 && b[2] === 0x4e && b[3] === 0x47) return "image/png";
+  if (b.length >= 3 && b[0] === 0xff && b[1] === 0xd8 && b[2] === 0xff) return "image/jpeg";
+  if (b.length >= 6 && b[0] === 0x47 && b[1] === 0x49 && b[2] === 0x46 && b[3] === 0x38) return "image/gif";
+  if (b.length >= 12 && b[0] === 0x52 && b[1] === 0x49 && b[2] === 0x46 && b[3] === 0x46 && b[8] === 0x57 && b[9] === 0x45 && b[10] === 0x42 && b[11] === 0x50) return "image/webp";
+  return null;
 }
 
 /* ================================================================
@@ -971,16 +1030,17 @@ export async function handleAdminExport(request, env) {
   const stamp = new Date().toISOString().slice(0, 10);
   if (what === "config") {
     const config = await loadConfig(env);
+    // 含直播源 token 與 Telegram token：檔名標 SECRET 提醒妥善保管
     return new Response(JSON.stringify(config, null, 2), {
       status: 200,
       headers: {
         "Content-Type": "application/json; charset=utf-8",
-        "Content-Disposition": `attachment; filename="weitv-config-v${config.version}-${stamp}.json"`,
+        "Content-Disposition": `attachment; filename="weitv-config-SECRET-v${config.version}-${stamp}.json"`,
         "Cache-Control": "no-store",
       },
     });
   }
-  const q = (v) => '"' + String(v == null ? "" : v).replace(/"/g, '""') + '"';
+  const q = csvCell;
   let rows = [];
   let name = "";
   if (what === "devices") {

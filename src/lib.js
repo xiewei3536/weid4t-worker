@@ -9,6 +9,8 @@
 
 export const CONFIG_KEY = "config";
 export const DEVICE_PREFIX = "dev:";
+/** 管理員擁有的裝置欄位另存一把 key(暱稱 / 封鎖 / 授權 / 指令 / 監控…),盒子心跳永不寫它 → 不會被心跳的讀改寫蓋掉 */
+export const DEVADM_PREFIX = "devadm:";
 export const CODE_PREFIX = "code:";
 export const OTA_CACHE_KEY = "update_cache";
 export const QR_ASSET_KEY = "asset:qr";
@@ -23,11 +25,19 @@ export const CFG_HIST_KEY = "cfghist";
 export const CFG_HIST_MAX = 12;
 
 /** 程式版本（/api/health 回傳，部署後用來確認新版已生效） */
-export const BUILD = "2.1.0";
+export const BUILD = "2.2.0";
 
 /** 管理密碼猜錯限速：同一 IP 每 10 分鐘最多幾次 */
 export const ADMIN_RL_MAX = 20;
 export const ADMIN_RL_TTL_SEC = 600;
+/** 新裝置登記限速：同一 IP 每小時最多建立幾台（防亂數 id 灌爆 KV 寫入額度） */
+export const NEWDEV_RL_MAX = 10;
+export const NEWDEV_RL_TTL_SEC = 3600;
+/** 未授權的新裝置紀錄保留天數（沒人核准就自動消失；一旦授權會改成永久） */
+export const NEWDEV_TTL_SEC = 7 * 86400;
+
+/** 裝置紀錄裡屬於管理員的欄位（存 devadm:<id>；舊資料若還在 dev:<id> 會自動搬過去） */
+export const ADMIN_DEVICE_FIELDS = ["nick", "blocked", "msg", "msgLevel", "autostart", "autostartAt", "authorized", "authedAt", "expireAt", "codeUsed", "fontScale", "cmd", "lastAck", "watch", "group", "note"];
 
 /** 列舉上限（KV list 單次最多 1000 筆） */
 export const DEVICE_LIST_MAX = 1000;
@@ -137,14 +147,18 @@ export const CORS_HEADERS = {
 /**
  * 從 KV 讀取設定；若不存在則寫入並回傳預設值。
  * 回傳一個保證欄位齊全的設定物件（舊資料缺欄位會被預設值補齊）。
+ * KV 讀取失敗會丟出 KvUnavailable —— 呼叫端（/api/config）回 503 讓盒子沿用快取，
+ * 而不是回一份空設定把長輩鎖在外面。
  */
+export class KvUnavailable extends Error {}
+
 export async function loadConfig(env) {
   let stored = null;
   try {
     stored = await env.CONFIG_KV.get(CONFIG_KEY, { type: "json" });
   } catch (err) {
     console.error("KV 讀取失敗:", err);
-    return { ...DEFAULT_CONFIG };
+    throw new KvUnavailable("KV 讀取失敗");
   }
   if (!stored || typeof stored !== "object") {
     try {
@@ -253,9 +267,76 @@ export function htmlResponse(html, status) {
       "Content-Type": "text/html; charset=utf-8",
       "Cache-Control": "no-store",
       "X-Content-Type-Options": "nosniff",
+      "X-Frame-Options": "DENY",
+      "Content-Security-Policy": "frame-ancestors 'none'",
       "Referrer-Policy": "same-origin",
+      "Permissions-Policy": "camera=(), microphone=(), geolocation=()",
     },
   });
+}
+
+/** 把網址裡的 token 遮成「前 4 碼…後 4 碼」（畫面與紀錄用，避免整串 token 到處出現） */
+export function maskToken(url) {
+  return String(url == null ? "" : url).replace(/([?&]token=)([^&\s]+)/gi, (_, k, v) =>
+    k + (v.length > 10 ? v.slice(0, 4) + "…" + v.slice(-4) : "…")
+  );
+}
+
+/** CSV 儲存格：跳脫引號，並在開頭是 = + - @ 等公式字元時前置單引號（防試算表公式注入） */
+export function csvCell(v) {
+  let s = String(v == null ? "" : v);
+  if (/^[=+\-@\t\r]/.test(s)) s = "'" + s;
+  return '"' + s.replace(/"/g, '""') + '"';
+}
+
+/** 看門狗處置代碼 → 白話 */
+export const ACTION_TEXT = {
+  none: "無",
+  hop_api_blocked: "更換出口節點（API 被封）",
+  restart_gluetun_hop: "更換出口節點",
+  restart_gluetun_vpn: "重撥 VPN",
+  restart_4gtv_stale: "清快取重啟（網址失效）",
+  restart_4gtv: "清快取重啟",
+  restart_4gtv_ipchange: "出口 IP 變動，清快取重啟",
+  restart_nginx: "重啟對外入口 nginx",
+};
+export function actionText(a) {
+  if (!a || a === "none") return "";
+  return ACTION_TEXT[a] || String(a);
+}
+
+/* ────────────────────────── 裝置紀錄：盒子欄位 + 管理員欄位 ────────────────────────── */
+
+/** 從一份（舊版）裝置物件抽出管理員欄位 */
+export function splitAdminFields(dev) {
+  const adm = {};
+  let found = false;
+  for (const k of ADMIN_DEVICE_FIELDS) {
+    if (dev && dev[k] !== undefined) { adm[k] = dev[k]; found = true; }
+  }
+  return found ? adm : null;
+}
+
+/** 去掉管理員欄位後的盒子紀錄（寫回 dev:<id> 時用，避免舊欄位一直留著） */
+export function stripAdminFields(dev) {
+  const out = { ...dev };
+  for (const k of ADMIN_DEVICE_FIELDS) delete out[k];
+  return out;
+}
+
+/**
+ * 合併 盒子紀錄 + 管理員紀錄 成畫面 / API 用的完整裝置物件。
+ * autostart：管理員設定（autostartAt）與盒子本機設定回報（asReportAt）「最後改的贏」；都沒有就交給全域。
+ */
+export function mergeDevice(dev, adm) {
+  if (!dev && !adm) return null;
+  const out = { ...(dev || {}), ...(adm || {}) };
+  const admT = adm && typeof adm.autostart === "boolean" ? (Date.parse(adm.autostartAt) || 1) : 0;
+  const devT = dev && typeof dev.asReport === "boolean" ? (Date.parse(dev.asReportAt) || 1) : 0;
+  if (admT || devT) out.autostart = admT >= devT ? adm.autostart : dev.asReport;
+  else delete out.autostart;
+  if (!out.id) out.id = (dev && dev.id) || (adm && adm.id) || "";
+  return out;
 }
 
 export function textResponse(text, status) {
@@ -362,7 +443,7 @@ export function timingSafeEqual(a, b) {
 
 /* ────────────────────────── 裝置狀態判定 ────────────────────────── */
 
-/** 裝置在線狀態：online（線上）/ today（今日曾上線）/ offline */
+/** 裝置在線狀態：online（線上）/ today（最近 24 小時內上線過）/ offline */
 export function onlineState(dev, nowMs) {
   const t = Date.parse(dev && dev.lastSeen) || 0;
   if (!t) return "offline";
@@ -370,6 +451,15 @@ export function onlineState(dev, nowMs) {
   if (diff < ONLINE_MS) return "online";
   if (diff < TODAY_MS) return "today";
   return "offline";
+}
+
+/** 在線狀態的白話（today 不再說「今日曾上線」，改講清楚多久前離線） */
+export function onlineText(dev, nowMs) {
+  const s = onlineState(dev, nowMs);
+  if (s === "online") return "線上";
+  const rel = relativeTime(dev && dev.lastSeen, nowMs);
+  if (s === "today") return "剛離線" + (rel ? "（" + rel + "）" : "");
+  return "離線" + (rel ? "（" + rel + "）" : "");
 }
 
 /**

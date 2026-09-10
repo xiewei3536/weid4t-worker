@@ -378,6 +378,17 @@ input[type=password]{width:100%;padding:13px 14px;font-size:16px;border-radius:1
 [data-part].loading{opacity:.55;pointer-events:none;transition:opacity .2s}
 [data-part]{transition:opacity .2s}
 
+/* ── 可讀性與觸控：小字對比拉高、按鈕高度 ≥ 40px ── */
+:root{--text-faint:#7C889E}
+.btn-mini,.fchip,.iconbtn,.mini-select,.quick button{min-height:40px}
+.dev-more summary{min-height:40px;display:flex;align-items:center}
+.hist i{min-height:24px}
+@media(prefers-reduced-motion:reduce){
+  .sdot.online::after,.head-card.red .lamp,.preview-tv .pm span,.iconbtn.spin{animation:none !important}
+  .panel.active{animation:none}
+  *{transition:none !important}
+}
+
 @media(max-width:480px){.brand .tag{display:none}.top-right .clock{display:none}}
 `;
 
@@ -491,13 +502,19 @@ export const ADMIN_JS = `
   window.refreshAll = refreshAll;
 
   /* ── 表單 AJAX 送出 ── */
+  // 舊 iOS / WebView 沒有 ev.submitter：記住最後被按的送出鈕，formaction 的「立即停止 / 測試發送」才不會退回主按鈕
+  document.addEventListener('click', function(ev){
+    var b = ev.target && ev.target.closest ? ev.target.closest('button') : null;
+    if (b && b.form) b.form.__lastBtn = b;
+  }, true);
   document.addEventListener('submit', function(ev){
     var form = ev.target;
     if (!form || form.tagName !== 'FORM' || form.hasAttribute('data-native')) return;
     ev.preventDefault();
     var confirmText = form.getAttribute('data-confirm');
     if (confirmText && !window.confirm(confirmText)) return;
-    var sub = ev.submitter || null;
+    var sub = ev.submitter || form.__lastBtn || null;
+    form.__lastBtn = null;
     var btn = sub || form.querySelector('button[type=submit],button:not([type])');
     var oldText = btn ? btn.textContent : '';
     if (btn) { btn.disabled = true; btn.textContent = '處理中…'; }
@@ -588,14 +605,15 @@ export const ADMIN_JS = `
     if (t && t.id === 'notice') { var pn = $('#pnText'); if (pn) pn.textContent = t.value || '（公告文字預覽）'; }
   });
 
-  /* ── 自動刷新：概覽 / 裝置分頁每 60 秒 ── */
+  /* ── 自動刷新：概覽 / 裝置分頁每 3 分鐘（KV list 免費額度每日 1000 次，別刷太勤）；有打開的「更多操作」或正在輸入就跳過 ── */
   setInterval(function(){
     if (document.hidden) return;
     var active = document.activeElement; if (active && /^(INPUT|TEXTAREA|SELECT)$/.test(active.tagName)) return;
+    if (document.querySelector('[data-part] details[open]')) return;
     var p = $('.panel.active'); if (!p) return;
     var name = p.dataset.panel;
     if (name === 'overview' || name === 'devices') refreshParts([name === 'overview' ? 'overview' : 'devices']);
-  }, 60000);
+  }, 180000);
 
   document.addEventListener('DOMContentLoaded', function(){ restoreTab(); reapplyFilters(); });
 })();
