@@ -116,7 +116,7 @@ App **不內建任何源 token**,源一律由這裡下發 → APK 就算被複�
 
 ```bash
 npm install                 # 只裝 wrangler(開發用)
-npm test                    # 零依賴端到端測試(MockKV,26 組:相容性、節流、授權、限速、CSRF、指令、監控與警示、版本歷史、匯入匯出…)
+npm test                    # 零依賴端到端測試(MockKV,31 組:相容性、節流、授權、限速、CSRF、指令、監控與警示、版本歷史、匯入匯出、KV 故障、資料搬家…)
 npm run preview             # 本機預覽 http://localhost:8787/admin(密碼 test,內含示範裝置)
 node test/serve.mjs 8799 test "http://你的源/channel?type=m3u&token=…"   # 指定訂閱網址,可供模擬器 App 連線;內含示範監控歷史與警示
 npx wrangler deploy --dry-run   # 驗證打包
