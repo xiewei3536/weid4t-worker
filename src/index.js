@@ -25,6 +25,7 @@ import {
   handleUpdateInfo,
 } from "./api.js";
 import {
+  handleAdminAlerts,
   handleAdminCodes,
   handleAdminDevice,
   handleAdminExport,
@@ -35,8 +36,16 @@ import {
   handleAdminTest,
   handleAdminUpload,
 } from "./admin.js";
+import { runMonitorTick } from "./monitor.js";
 
 export default {
+  /** Cron Trigger（wrangler.toml 每 5 分鐘）：監控直播源與盒子、必要時發 Telegram 警示 */
+  async scheduled(event, env, ctx) {
+    ctx.waitUntil(
+      runMonitorTick(env).catch((err) => console.error("監控執行失敗:", err && err.stack ? err.stack : err))
+    );
+  },
+
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
     const { pathname } = url;
@@ -66,6 +75,7 @@ export default {
       if (pathname === "/admin/codes" && method === "POST") return await handleAdminCodes(request, env);
       if (pathname === "/admin/upload" && method === "POST") return await handleAdminUpload(request, env);
       if (pathname === "/admin/system" && method === "POST") return await handleAdminSystem(request, env);
+      if (pathname === "/admin/alerts" && method === "POST") return await handleAdminAlerts(request, env);
 
       if (pathname === "/" && method === "GET") return htmlResponse(landingHtml(), 200);
       if (pathname === "/robots.txt") return textResponse("User-agent: *\nDisallow: /\n", 200);

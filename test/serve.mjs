@@ -33,6 +33,28 @@ if (subscriptionUrl) {
   seed["dev:tv-00aa11bb"] = { id: "tv-00aa11bb", nick: "", m: "X96mini", v: "1.0.0.24", ip: "36.230.1.1", firstSeen: new Date(now - 3 * 86400000).toISOString(), lastSeen: new Date(now - 3 * 86400000).toISOString(), count: 7, blocked: true, msg: "", msgLevel: "info", authorized: false, expireAt: "" };
   seed["code:48213957"] = { code: "48213957", status: "unused", device: null, note: "王先生", days: 0, createdAt: new Date(now - 86400000).toISOString(), usedAt: "", expireAt: "" };
   seed["code:90817263"] = { code: "90817263", status: "used", device: "tv-9f8e7d6c", note: "阿嬤房", days: 30, createdAt: new Date(now - 10 * 86400000).toISOString(), usedAt: new Date(now - 9 * 86400000).toISOString(), expireAt: new Date(now + 20 * 86400000).toISOString() };
+  // 監控歷史（24 小時；中間一段異常）與警示紀錄，讓總覽 / 警示分頁有東西看
+  const hist = [];
+  for (let t = now - 24 * 3600000; t <= now; t += 15 * 60000) {
+    const ago = now - t;
+    const code = ago < 7 * 3600000 && ago > 6.25 * 3600000 ? 0 : ago < 13 * 3600000 && ago > 12.5 * 3600000 ? 2 : 1;
+    hist.push([t, code]);
+  }
+  seed["mon:state"] = {
+    v: 1, lastTick: now - 120000, lastWrite: now - 120000,
+    src: { state: "ok", since: now - 6 * 3600000, downSince: 0, alerted: false, ip: "185.213.82.16", reason: "", fails: 0, lastAction: "hop_api_blocked" },
+    dev: {}, hist,
+    log: [
+      { at: new Date(now - 6.2 * 3600000).toISOString(), kind: "src_up", text: "🟢 直播源已恢復\n中斷約 42 分鐘 · 出口 IP 185.213.82.16 · 處置 hop_api_blocked", status: "sent" },
+      { at: new Date(now - 6.9 * 3600000).toISOString(), kind: "src_down", text: "🔴 直播源異常（已 10 分鐘）\n原因：4gtv 封鎖了目前出口 IP（API 400）\n連續失敗 3 次 · 出口 IP 187.15.121.112\n看門狗會自動清快取 / 更換出口節點。", status: "sent" },
+      { at: new Date(now - 12.6 * 3600000).toISOString(), kind: "src_stale", text: "⚠️ 直播源伺服器沒回報\n看門狗已 20 分鐘沒更新狀態", status: "muted" },
+    ],
+  };
+  seed["audit"] = [
+    { at: new Date(now - 3600000).toISOString(), ip: "1.160.2.3", what: "儲存直播源（v3）：" + subscriptionUrl.slice(0, 60) },
+    { at: new Date(now - 2 * 86400000).toISOString(), ip: "1.160.2.3", what: "已對 阿嬤房（tv-9f8e7d6c）傳話" },
+  ];
+  seed["cfghist"] = [{ ...seed.config, version: 2, subscriptionUrl: "http://old.example:5050/channel?type=m3u&token=OLD", updatedAt: new Date(now - 2 * 86400000).toISOString() }];
 }
 const env = { CONFIG_KV: new MockKV(seed), ADMIN_PASSWORD: password };
 

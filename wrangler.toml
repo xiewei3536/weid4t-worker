@@ -19,6 +19,16 @@ compatibility_date = "2025-06-01"
 [[kv_namespaces]]
 binding = "CONFIG_KV"
 
+# ── 排程：監控與警示 ─────────────────────────────────────────
+# 每 5 分鐘讀一次直播源伺服器的看門狗狀態與盒子心跳;異常 / 恢復 / 重點盒子離線 → Telegram 通知
+# (在 /admin 的「警示」分頁設定 Bot Token 與 Chat ID)
+[triggers]
+crons = ["*/5 * * * *"]
+
+# ── 觀測：Cloudflare 後台可看 Worker 日誌(免費方案也有) ─────────
+[observability]
+enabled = true
+
 # ── 環境變數 ─────────────────────────────────────────────────
 # ADMIN_PASSWORD 不寫在這裡。一鍵部署會依 .dev.vars.example 提示你輸入;
 # 手動部署用：wrangler secret put ADMIN_PASSWORD

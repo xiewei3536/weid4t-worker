@@ -420,6 +420,295 @@ await test("總覽顯示直播源伺服器看門狗狀態（status.json）", asy
   }
 });
 
+const TOK = "123456789:AAxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx";
+function tgMock(tg, statusFn, realFetch) {
+  return async (url, init) => {
+    const u = String(url);
+    if (u.startsWith("https://api.telegram.org/bot")) {
+      tg.push(JSON.parse(init.body).text);
+      return new Response(JSON.stringify({ ok: true }), { headers: { "Content-Type": "application/json" } });
+    }
+    if (u.includes("/status.json")) {
+      const s = statusFn ? statusFn(u) : null;
+      return s ? new Response(JSON.stringify(s), { headers: { "Content-Type": "application/json" } }) : new Response("nf", { status: 404 });
+    }
+    return realFetch(url, init);
+  };
+}
+
+await test("/api/config 沒帶裝置編號不給直播源；管理員專用欄位（Telegram token）不外流", async () => {
+  const env = makeEnv({ config: { version: 1, subscriptionUrl: "http://src/list.m3u", tgBotToken: TOK, tgChatId: "5", alertsEnabled: true } });
+  const c = (await call(env, "/api/config")).json;
+  assert.equal(c.subscriptionUrl, "");
+  for (const k of ["tgBotToken", "tgChatId", "alertsEnabled", "alertSourceMin", "alertQuiet", "alertBoxFail"]) assert.ok(!(k in c), "不該外流 " + k);
+  const c2 = (await call(env, "/api/config?id=tv-1")).json;
+  assert.equal(c2.subscriptionUrl, "http://src/list.m3u");
+  assert.ok(!("tgBotToken" in c2));
+  const h = (await call(env, "/api/health")).json;
+  assert.match(h.build, /^\d+\.\d+/);
+});
+
+await test("心跳回報播放健康（pe / le / up）→ 裝置卡與總覽顯示", async () => {
+  const env = makeEnv({ config: { version: 1, subscriptionUrl: "http://src/list.m3u" } });
+  await call(env, "/api/config?id=tv-1&m=Box&v=1.0.0.26&now=%E6%B0%91%E8%A6%96&pe=0&up=5");
+  let dev = await env.CONFIG_KV.get("dev:tv-1", { type: "json" });
+  assert.equal(dev.pe, 0);
+  assert.equal(dev.up, 5);
+  const w = env.CONFIG_KV.writes;
+  await call(env, "/api/config?id=tv-1&m=Box&v=1.0.0.26&now=%E6%B0%91%E8%A6%96&pe=4&le=HTTP%20500&up=6");
+  assert.equal(env.CONFIG_KV.writes, w + 1, "重連達 3 次要立刻寫");
+  dev = await env.CONFIG_KV.get("dev:tv-1", { type: "json" });
+  assert.equal(dev.pe, 4);
+  assert.equal(dev.le, "HTTP 500");
+  const p = await call(env, "/admin/partial?name=devices");
+  assert.match(p.text, /重連 4 次/);
+  assert.match(p.text, /HTTP 500/);
+  const o = await call(env, "/admin/partial?name=overview");
+  assert.match(o.text, /播放不穩/);
+  assert.match(o.text, /head-card (yellow|red)/);
+  // 恢復 → 正常
+  await call(env, "/api/config?id=tv-1&m=Box&v=1.0.0.26&pe=0");
+  dev = await env.CONFIG_KV.get("dev:tv-1", { type: "json" });
+  assert.equal(dev.pe, 0);
+  assert.equal(dev.le, "");
+});
+
+await test("管理密碼連錯 20 次 → 429；其他 IP 與未帶帳密不受影響", async () => {
+  const env = makeEnv();
+  const wrong = "Basic " + Buffer.from("a:wrong").toString("base64");
+  let last = null;
+  for (let i = 0; i < 21; i++) last = await call(env, "/admin", { auth: false, headers: { Authorization: wrong }, ip: "7.7.7.7" });
+  assert.equal(last.status, 429);
+  assert.equal((await call(env, "/admin", { auth: false, headers: { Authorization: wrong }, ip: "6.6.6.6" })).status, 401);
+  assert.equal((await call(env, "/admin", { auth: false, ip: "7.7.7.7" })).status, 401, "瀏覽器第一次沒帶帳密不算猜錯");
+  assert.equal((await call(env, "/admin", { ip: "5.5.5.5" })).status, 200);
+  const j = await call(env, "/admin/partial?name=overview", { auth: false, headers: { Authorization: wrong, "X-Requested-With": "fetch" }, ip: "7.7.7.7" });
+  assert.equal(j.status, 429);
+  assert.equal(j.json.ok, false);
+});
+
+await test("警示設定：驗證 / 儲存 / token 留空不清除 / 測試發送（mock Telegram）/ 操作紀錄", async () => {
+  const env = makeEnv({ config: { version: 1, subscriptionUrl: "http://src/list.m3u" } });
+  const realFetch = globalThis.fetch;
+  const tg = [];
+  globalThis.fetch = tgMock(tg, null, realFetch);
+  try {
+    let r = await call(env, "/admin/save", { method: "POST", body: { _fields: "alerts", alertsEnabled: "on", tgBotToken: "bad", tgChatId: "5" } });
+    assert.equal(r.json.ok, false, "token 格式錯要擋");
+    r = await call(env, "/admin/save", { method: "POST", body: { _fields: "alerts", alertsEnabled: "on", tgBotToken: TOK, tgChatId: "abc" } });
+    assert.equal(r.json.ok, false, "chat id 非數字要擋");
+    r = await call(env, "/admin/save", { method: "POST", body: { _fields: "alerts", alertsEnabled: "on", tgBotToken: TOK, tgChatId: "123456", alertSourceMin: "3", alertDeviceOfflineMin: "10", alertQuiet: "23-7", alertBoxFail: "on" } });
+    assert.equal(r.json.ok, true, r.text);
+    let cfg = await env.CONFIG_KV.get("config", { type: "json" });
+    assert.equal(cfg.tgBotToken, TOK);
+    assert.equal(cfg.alertSourceMin, 5, "下限 5 分");
+    assert.equal(cfg.alertDeviceOfflineMin, 30, "下限 30 分");
+    assert.equal(cfg.alertQuiet, "23-7");
+    r = await call(env, "/admin/save", { method: "POST", body: { _fields: "alerts", alertsEnabled: "on", tgBotToken: "", tgChatId: "123456", alertSourceMin: "10", alertDeviceOfflineMin: "180" } });
+    assert.equal(r.json.ok, true);
+    cfg = await env.CONFIG_KV.get("config", { type: "json" });
+    assert.equal(cfg.tgBotToken, TOK, "留空維持原 token");
+    assert.equal(cfg.alertQuiet, "");
+    r = await call(env, "/admin/alerts", { method: "POST", body: { action: "test" } });
+    assert.equal(r.json.ok, true, r.text);
+    assert.equal(tg.length, 1);
+    assert.match(tg[0], /測試訊息/);
+    const p = await call(env, "/admin/partial?name=alerts");
+    assert.equal(p.status, 200);
+    assert.match(p.text, /已啟用/);
+    assert.ok(!p.text.includes(TOK), "token 不得回填到畫面");
+    const s = await call(env, "/admin/partial?name=system");
+    assert.match(s.text, /儲存警示設定/);
+    assert.match(s.text, /Telegram 測試訊息/);
+    // 清 token → 開著警示會被擋
+    r = await call(env, "/admin/save", { method: "POST", body: { _fields: "alerts", alertsEnabled: "on", clearTg: "on", tgChatId: "123456" } });
+    assert.equal(r.json.ok, false);
+    r = await call(env, "/admin/save", { method: "POST", body: { _fields: "alerts", clearTg: "on", tgChatId: "123456" } });
+    assert.equal(r.json.ok, true);
+    assert.equal((await env.CONFIG_KV.get("config", { type: "json" })).tgBotToken, "");
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+});
+
+await test("監控：直播源異常達門檻才通知、不重複；恢復通知含中斷時間；沒回報另一種訊息；歷史色條", async () => {
+  const env = makeEnv({ config: { version: 1, subscriptionUrl: "http://1.2.3.4:5050/channel?type=m3u&token=x", alertsEnabled: true, tgBotToken: TOK, tgChatId: "99", alertSourceMin: 10 } });
+  const realFetch = globalThis.fetch;
+  const tg = [];
+  let T = Date.parse("2026-09-10T04:00:00Z"); // 台灣 12:00
+  let status = { healthy: true, consecutive_failures: 0, public_ip: "1.1.1.1" };
+  globalThis.fetch = tgMock(tg, (u) => (u === "http://1.2.3.4:5050/status.json?token=x" ? { ...status, checked_at_ms: status.checked_at_ms || T - 30000 } : null), realFetch);
+  const { runMonitorTick } = await import("../src/monitor.js");
+  try {
+    let r = await runMonitorTick(env, T);
+    assert.equal(r.state, "ok");
+    assert.equal(tg.length, 0);
+    status = { healthy: false, consecutive_failures: 1, reason: "api_blocked", public_ip: "1.1.1.1", last_action: "hop_api_blocked" };
+    T += 5 * 60000; r = await runMonitorTick(env, T);
+    assert.equal(r.state, "bad");
+    assert.equal(tg.length, 0, "剛壞不吵");
+    T += 5 * 60000; status.consecutive_failures = 2; r = await runMonitorTick(env, T);
+    assert.equal(tg.length, 0, "5 分鐘未達 10 分門檻");
+    T += 5 * 60000; status.consecutive_failures = 3; r = await runMonitorTick(env, T);
+    assert.equal(tg.length, 1, "達門檻發一次");
+    assert.match(tg[0], /直播源異常/);
+    assert.match(tg[0], /封鎖/);
+    assert.match(tg[0], /1\.1\.1\.1/);
+    T += 5 * 60000; r = await runMonitorTick(env, T);
+    assert.equal(tg.length, 1, "持續異常不重複發");
+    status = { healthy: true, consecutive_failures: 0, public_ip: "2.2.2.2", last_action: "hop_api_blocked" };
+    T += 5 * 60000; r = await runMonitorTick(env, T);
+    assert.equal(r.state, "ok");
+    assert.equal(tg.length, 2);
+    assert.match(tg[1], /已恢復/);
+    assert.match(tg[1], /約 20 分鐘/);
+    const st = await env.CONFIG_KV.get("mon:state", { type: "json" });
+    assert.ok(st.hist.length >= 3, "歷史至少 3 段");
+    assert.equal(st.log.length, 2);
+    assert.equal(st.log[0].status, "sent");
+    assert.equal(st.src.downSince, 0);
+    const o = await call(env, "/admin/partial?name=overview");
+    assert.match(o.text, /class="hist"/);
+    assert.match(o.text, /可用率/);
+    assert.match(o.text, /直播源恢復/);
+    // 看門狗沒回報（status.json 3 小時沒更新）→ 10 分後通知
+    status = { healthy: true, consecutive_failures: 0, public_ip: "2.2.2.2", checked_at_ms: T - 3 * 3600000 };
+    T += 5 * 60000; r = await runMonitorTick(env, T);
+    assert.equal(r.state, "stale");
+    assert.equal(tg.length, 2);
+    T += 10 * 60000; r = await runMonitorTick(env, T);
+    assert.equal(tg.length, 3);
+    assert.match(tg[2], /沒回報/);
+    const a = await call(env, "/admin/partial?name=alerts");
+    assert.match(a.text, /看門狗沒回報/);
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+});
+
+await test("監控：重點盒子離線 / 回來、載入失敗每小時一則、未監控盒子不吵、靜音時段只記錄", async () => {
+  const env = makeEnv({ config: { version: 1, subscriptionUrl: "http://src/x", alertsEnabled: true, tgBotToken: TOK, tgChatId: "1", alertDeviceOfflineMin: 60 } });
+  const realFetch = globalThis.fetch;
+  const tg = [];
+  globalThis.fetch = tgMock(tg, null, realFetch);
+  const { runMonitorTick } = await import("../src/monitor.js");
+  try {
+    let T = Date.parse("2026-09-10T04:00:00Z");
+    await env.CONFIG_KV.put("dev:tv-a", JSON.stringify({ id: "tv-a", nick: "客廳", lastSeen: new Date(T - 2 * 3600000).toISOString(), watch: true, now: "民視" }));
+    await env.CONFIG_KV.put("dev:tv-b", JSON.stringify({ id: "tv-b", lastSeen: new Date(T - 2 * 3600000).toISOString() }));
+    await env.CONFIG_KV.put("dev:tv-c", JSON.stringify({ id: "tv-c", nick: "阿嬤房", lastSeen: new Date(T - 60000).toISOString(), lastOk: false, lastResultAt: new Date(T - 120000).toISOString() }));
+    let r = await runMonitorTick(env, T);
+    assert.equal(tg.length, 2, JSON.stringify(tg));
+    assert.ok(tg.some((t) => /重點盒子離線/.test(t) && /客廳/.test(t)));
+    assert.ok(tg.some((t) => /載入頻道失敗/.test(t) && /阿嬤房/.test(t)));
+    assert.ok(!tg.some((t) => /tv-b/.test(t)), "未監控的盒子不通知");
+    T += 5 * 60000; r = await runMonitorTick(env, T);
+    assert.equal(tg.length, 2, "一小時內不重複");
+    await env.CONFIG_KV.put("dev:tv-a", JSON.stringify({ id: "tv-a", nick: "客廳", lastSeen: new Date(T).toISOString(), watch: true, now: "中視" }));
+    T += 5 * 60000; r = await runMonitorTick(env, T);
+    assert.equal(tg.length, 3);
+    assert.match(tg[2], /回來了/);
+    // 裝置分頁可切換重點監控
+    r = await call(env, "/admin/device", { method: "POST", body: { id: "tv-b", action: "watch", value: "on" } });
+    assert.equal(r.json.ok, true);
+    assert.equal((await env.CONFIG_KV.get("dev:tv-b", { type: "json" })).watch, true);
+    const d = await call(env, "/admin/partial?name=devices");
+    assert.match(d.text, /重點監控/);
+    // 靜音時段（台灣 12:00 落在 0-23）→ 不發只記錄
+    r = await call(env, "/admin/save", { method: "POST", body: { _fields: "alerts", alertsEnabled: "on", tgChatId: "1", alertSourceMin: "10", alertDeviceOfflineMin: "60", alertQuiet: "0-23" } });
+    assert.equal(r.json.ok, true, r.text);
+    T += 5 * 60000; r = await runMonitorTick(env, T);   // tv-b 已離線 2 小時且剛設監控
+    assert.equal(tg.length, 3, "靜音不發");
+    const st = await env.CONFIG_KV.get("mon:state", { type: "json" });
+    assert.equal(st.log[0].status, "muted");
+    assert.match(st.log[0].text, /tv-b/);
+    const a = await call(env, "/admin/partial?name=alerts");
+    assert.match(a.text, /靜音時段未發/);
+    assert.match(a.text, /重點監控的盒子/);
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+});
+
+await test("設定版本歷史 → 還原；匯出 / 匯入設定 JSON；操作紀錄", async () => {
+  const env = makeEnv({ config: { version: 1, subscriptionUrl: "http://a/1" } });
+  await call(env, "/admin/save", { method: "POST", body: { _fields: "source", subscriptionUrl: "http://a/2" } });
+  await call(env, "/admin/save", { method: "POST", body: { _fields: "source", subscriptionUrl: "http://a/3" } });
+  const hist = await env.CONFIG_KV.get("cfghist", { type: "json" });
+  assert.equal(hist.length, 2);
+  assert.equal(hist[0].subscriptionUrl, "http://a/2");
+  assert.equal(hist[1].subscriptionUrl, "http://a/1");
+  const s = await call(env, "/admin/partial?name=system");
+  assert.match(s.text, /還原成這版/);
+  assert.match(s.text, /http:\/\/a\/2/);
+  let r = await call(env, "/admin/system", { method: "POST", body: { action: "restore_config", idx: "1" } });
+  assert.equal(r.json.ok, true, r.text);
+  let c = (await call(env, "/api/config?id=tv-1")).json;
+  assert.equal(c.subscriptionUrl, "http://a/1");
+  assert.equal(c.version, 4);
+  r = await call(env, "/admin/system", { method: "POST", body: { action: "restore_config", idx: "9" } });
+  assert.equal(r.json.ok, false);
+  const ex = await call(env, "/admin/export?what=config");
+  assert.equal(ex.status, 200);
+  assert.match(ex.ct, /json/);
+  const exported = JSON.parse(ex.text);
+  assert.equal(exported.subscriptionUrl, "http://a/1");
+  exported.subscriptionUrl = "http://b/9";
+  exported.notice = "匯入的公告";
+  exported.bogus = 1;
+  const fd = new FormData();
+  fd.append("action", "import_config");
+  fd.append("file", new Blob([JSON.stringify(exported)], { type: "application/json" }), "cfg.json");
+  r = await call(env, "/admin/upload", { method: "POST", body: fd });
+  assert.equal(r.json.ok, true, r.text);
+  c = (await call(env, "/api/config?id=tv-1")).json;
+  assert.equal(c.subscriptionUrl, "http://b/9");
+  assert.equal(c.notice, "匯入的公告");
+  assert.ok(!("bogus" in c));
+  assert.equal(c.version, 5);
+  const fd2 = new FormData();
+  fd2.append("action", "import_config");
+  fd2.append("file", new Blob(["not json"], { type: "application/json" }), "x.json");
+  r = await call(env, "/admin/upload", { method: "POST", body: fd2 });
+  assert.equal(r.json.ok, false);
+  const audit = await env.CONFIG_KV.get("audit", { type: "json" });
+  assert.ok(audit.length >= 4);
+  assert.match(audit[0].what, /匯入設定/);
+  assert.equal(audit[0].ip, "1.2.3.4");
+  const s2 = await call(env, "/admin/partial?name=system");
+  assert.match(s2.text, /匯入設定/);
+  r = await call(env, "/admin/system", { method: "POST", body: { action: "clear_audit" } });
+  assert.equal(r.json.ok, true);
+});
+
+await test("Cron scheduled 入口會執行監控並寫入狀態；靜音時段判定", async () => {
+  const env = makeEnv({ config: { version: 1, subscriptionUrl: "http://src/x" } });
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = tgMock([], null, realFetch);
+  try {
+    const tasks = [];
+    await worker.scheduled({ cron: "*/5 * * * *", scheduledTime: Date.now() }, env, { waitUntil: (p) => tasks.push(p) });
+    await Promise.all(tasks);
+    const st = await env.CONFIG_KV.get("mon:state", { type: "json" });
+    assert.ok(st && st.lastTick > 0);
+    assert.equal(st.src.state, "none");
+    const r = await call(env, "/admin/alerts", { method: "POST", body: { action: "run" } });
+    assert.equal(r.json.ok, true);
+    assert.match(r.json.message, /無看門狗資料/);
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+  const { inQuietHours } = await import("../src/monitor.js");
+  const at = (h) => Date.parse("2026-09-10T00:00:00Z") + ((h - 8 + 24) % 24) * 3600000; // 台灣 h 點
+  assert.equal(inQuietHours("23-7", at(2)), true);
+  assert.equal(inQuietHours("23-7", at(23)), true);
+  assert.equal(inQuietHours("23-7", at(7)), false);
+  assert.equal(inQuietHours("23-7", at(12)), false);
+  assert.equal(inQuietHours("9-18", at(12)), true);
+  assert.equal(inQuietHours("", at(12)), false);
+  assert.equal(inQuietHours("abc", at(12)), false);
+});
+
 console.log(`\n${passed} passed, ${failures.length} failed`);
 if (failures.length) {
   for (const [n, e] of failures) console.log("FAIL:", n, "\n", e && e.stack);

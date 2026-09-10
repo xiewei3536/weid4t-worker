@@ -12,6 +12,7 @@
 import {
   ACTIVATE_RL_MAX,
   ACTIVATE_RL_TTL_SEC,
+  BUILD,
   CODE_LIST_MAX,
   CODE_PREFIX,
   CORS_HEADERS,
@@ -27,6 +28,7 @@ import {
   nowIso,
   parseIntOr,
   pendingCmd,
+  publicConfig,
   rateLimited,
 } from "./lib.js";
 
@@ -55,7 +57,7 @@ export async function handleGetConfig(request, env) {
   const auth = computeAuth(dev, config);
 
   const payload = {
-    ...config,
+    ...publicConfig(config),
     autostart,
     blocked,
     message: (dev && dev.msg) || "",
@@ -74,7 +76,8 @@ export async function handleGetConfig(request, env) {
     deviceNick: (dev && dev.nick) || "",
   };
 
-  if (blocked || !auth.authorized) payload.subscriptionUrl = "";
+  // 被封鎖 / 未授權 / 沒帶裝置編號（不是我們的 App）→ 不給直播源網址（裡面有 token）
+  if (blocked || !auth.authorized || !dev) payload.subscriptionUrl = "";
 
   if (config.noticeUntil && (Date.parse(config.noticeUntil) || 0) <= nowMs) payload.notice = "";
   if (!config.marqueeUntil || (Date.parse(config.marqueeUntil) || 0) <= nowMs) payload.marquee = "";
@@ -104,6 +107,7 @@ export async function handleGetConfig(request, env) {
  *   as  1/0 開機自啟回報
  *   now 正在觀看的頻道名稱   fs 目前生效的字體等級
  *   ack 已執行的遠端指令 id
+ *   pe  近 10 分鐘播放重連次數  le 最近一次播放錯誤（短文字）  up App 已運行分鐘數
  */
 export async function touchDevice(request, env) {
   const url = new URL(request.url);
@@ -173,6 +177,23 @@ export async function touchDevice(request, env) {
       dev.nowAt = iso;
       if (sinceWrite >= 3 * 60 * 1000) mustWrite = true;
     }
+  }
+  if (q.has("pe")) {
+    // 播放健康：重連次數變了（尤其從 0 變多、或恢復到 0）就記下來，讓管理員遠端看得到「這台一直在重連」
+    const pe = Math.max(0, Math.min(999, parseIntOr(q.get("pe"), 0)));
+    const le = (q.get("le") || "").slice(0, 80);
+    if (pe !== dev.pe || (pe > 0 && le && le !== dev.le)) {
+      dev.pe = pe;
+      dev.le = pe > 0 ? le : "";
+      dev.peAt = iso;
+      // 變成「不穩」(≥3)或從不穩恢復到 0 → 立刻寫,管理員看到的是即時狀態;其餘照 3 分鐘節流
+      if (sinceWrite >= 3 * 60 * 1000 || (pe >= 3 && !(dev.pePrev >= 3)) || (pe === 0 && dev.pePrev >= 3)) mustWrite = true;
+    }
+    dev.pePrev = pe;
+  }
+  if (q.has("up")) {
+    const up = parseIntOr(q.get("up"), -1);
+    if (up >= 0) dev.up = up;
   }
   if (q.has("ack")) {
     const ack = (q.get("ack") || "").trim();
@@ -476,5 +497,5 @@ export async function handleHealth(env) {
   } catch (_) {
     kv = false;
   }
-  return jsonResponse({ ok: kv, kv, time: nowIso() }, kv ? 200 : 503, CORS_HEADERS);
+  return jsonResponse({ ok: kv, kv, build: BUILD, time: nowIso() }, kv ? 200 : 503, CORS_HEADERS);
 }

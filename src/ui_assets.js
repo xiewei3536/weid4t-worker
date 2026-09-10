@@ -311,6 +311,73 @@ code{background:var(--surface-2);border:1px solid var(--border);padding:2px 7px;
 .modal .btn{margin-top:12px}
 
 .sr{position:absolute;left:-9999px;top:0}
+
+/* ── 一眼狀態 ── */
+.head-card{display:flex;align-items:center;gap:18px;padding:20px 22px;border-radius:var(--radius);border:1px solid var(--border);margin-top:14px;background:linear-gradient(135deg,var(--surface),var(--surface-2));box-shadow:var(--shadow);position:relative;overflow:hidden}
+.head-card::before{content:"";position:absolute;inset:0;pointer-events:none;background:radial-gradient(520px 180px at 0% 50%,var(--lamp-soft),transparent 70%)}
+.head-card.green{--lamp:var(--ok);--lamp-soft:rgba(52,211,153,.16);border-color:rgba(52,211,153,.35)}
+.head-card.yellow{--lamp:var(--gold);--lamp-soft:rgba(251,191,36,.16);border-color:rgba(251,191,36,.4)}
+.head-card.red{--lamp:var(--danger);--lamp-soft:rgba(255,92,108,.18);border-color:rgba(255,92,108,.5)}
+.lamp{width:56px;height:56px;border-radius:50%;flex:none;position:relative;z-index:1;background:radial-gradient(circle at 35% 32%,rgba(255,255,255,.55) 0,rgba(255,255,255,0) 42%),var(--lamp)}
+.head-card.green .lamp{box-shadow:0 0 0 7px rgba(52,211,153,.16),0 0 30px rgba(52,211,153,.55)}
+.head-card.yellow .lamp{box-shadow:0 0 0 7px rgba(251,191,36,.16),0 0 30px rgba(251,191,36,.55)}
+.head-card.red .lamp{box-shadow:0 0 0 7px rgba(255,92,108,.18),0 0 34px rgba(255,92,108,.7);animation:lampPulse 1.6s ease-in-out infinite}
+@keyframes lampPulse{0%,100%{transform:scale(1)}50%{transform:scale(1.07)}}
+.head-body{min-width:0;position:relative;z-index:1}
+.head-title{font-size:21px;font-weight:800;letter-spacing:.3px}
+.head-card.green .head-title{color:var(--ok)}.head-card.yellow .head-title{color:var(--gold)}.head-card.red .head-title{color:var(--danger)}
+.head-sub{color:var(--text-dim);font-size:13.5px;margin-top:4px;line-height:1.65}
+.head-issues{margin-top:9px;display:flex;flex-wrap:wrap;gap:6px}
+.issue{font-size:12.5px;font-weight:600;padding:4px 10px;border-radius:999px;border:1px solid var(--border)}
+.issue.red{color:var(--danger);border-color:rgba(255,92,108,.4);background:rgba(255,92,108,.09)}
+.issue.yellow{color:var(--gold);border-color:rgba(251,191,36,.4);background:rgba(251,191,36,.09)}
+@media(max-width:480px){.head-card{padding:16px}.lamp{width:44px;height:44px}.head-title{font-size:18px}}
+
+/* ── 24 小時健康色條 ── */
+.hist{display:flex;gap:2px;height:24px;margin-top:6px}
+.hist i{flex:1;border-radius:3px;background:var(--surface-3);min-width:0}
+.hist i.ok{background:linear-gradient(180deg,#5EEBB8,var(--ok))}
+.hist i.bad{background:linear-gradient(180deg,#FF8A96,var(--danger))}
+.hist i.stale{background:linear-gradient(180deg,#FCD34D,var(--gold))}
+.hist i.none{background:var(--surface-3)}
+.hist-axis{display:flex;justify-content:space-between;font-size:11px;color:var(--text-faint);margin-top:5px}
+.hist-legend{display:flex;gap:14px;font-size:12px;color:var(--text-dim);margin-top:8px;flex-wrap:wrap;align-items:center}
+.hist-legend i{display:inline-block;width:10px;height:10px;border-radius:2px;margin-right:5px;vertical-align:-1px;background:var(--surface-3)}
+.hist-legend i.ok{background:var(--ok)}.hist-legend i.bad{background:var(--danger)}.hist-legend i.stale{background:var(--gold)}
+.hist-legend b{color:var(--accent)}
+
+/* ── 警示紀錄 / 操作紀錄 / 設定歷史 ── */
+.alog{display:flex;flex-direction:column;gap:8px;max-height:460px;overflow:auto;padding-right:2px}
+.alog-row{padding:10px 12px;border-radius:11px;background:var(--surface-2);border:1px solid var(--border);font-size:13px;line-height:1.6;white-space:pre-wrap;word-break:break-word;color:var(--text)}
+.alog-row .am{display:flex;justify-content:space-between;gap:8px;color:var(--text-faint);font-size:11.5px;margin-bottom:4px;white-space:normal;flex-wrap:wrap}
+.alog-row.k-src_down,.alog-row.k-src_stale,.alog-row.k-dev_off,.alog-row.k-dev_fail{border-color:rgba(255,92,108,.35);background:rgba(255,92,108,.05)}
+.alog-row.k-src_up,.alog-row.k-dev_on{border-color:rgba(52,211,153,.35);background:rgba(52,211,153,.05)}
+.audit{display:flex;flex-direction:column;gap:5px;max-height:420px;overflow:auto}
+.audit-row{display:grid;grid-template-columns:118px 1fr auto;gap:10px;align-items:baseline;padding:8px 10px;border-radius:9px;background:var(--surface-2);border:1px solid var(--border);font-size:12.5px}
+.audit-row .at{color:var(--text-dim);font-variant-numeric:tabular-nums;white-space:nowrap}
+.audit-row .what{color:var(--text);word-break:break-word}
+.audit-row .ip{color:var(--text-faint);font-size:11.5px}
+@media(max-width:560px){.audit-row{grid-template-columns:1fr;gap:2px}.audit-row .ip{display:none}}
+.hist-list{display:flex;flex-direction:column;gap:8px}
+.hist-row{padding:11px 13px;border-radius:12px;background:var(--surface-2);border:1px solid var(--border);display:grid;grid-template-columns:1fr auto;gap:4px 12px;align-items:center}
+.hist-row .hist-meta{display:flex;gap:10px;align-items:baseline;font-size:13px;color:var(--text-dim)}
+.hist-row .hist-meta b{color:var(--accent);font-size:15px}
+.hist-row .hist-diff{grid-column:1;font-size:12.5px;color:var(--text)}
+.hist-row .hist-src{grid-column:1;font-size:11.5px;color:var(--text-faint);word-break:break-all}
+.hist-row form{grid-column:2;grid-row:1/4;margin:0}
+@media(max-width:560px){.hist-row{grid-template-columns:1fr}.hist-row form{grid-column:1;grid-row:auto}}
+.ph{font-size:11.5px;font-weight:700;padding:2px 8px;border-radius:999px;border:1px solid;white-space:nowrap;flex:none}
+.ph.bad{color:var(--danger);border-color:rgba(255,92,108,.4);background:rgba(255,92,108,.08)}
+.ph.warn{color:var(--gold);border-color:rgba(251,191,36,.4);background:rgba(251,191,36,.08)}
+.howto{margin:12px 0 4px;border:1px dashed var(--border);border-radius:12px;padding:10px 14px}
+.howto summary{cursor:pointer;font-size:13.5px;font-weight:700;color:var(--accent);list-style:none}
+.howto summary::-webkit-details-marker{display:none}
+.steps{margin:8px 0 2px;padding-left:22px;font-size:13.5px;line-height:1.75;color:var(--text)}
+.steps li{margin:4px 0}
+input[type=password]{width:100%;padding:13px 14px;font-size:16px;border-radius:13px;border:1px solid var(--border);background:var(--surface-2);color:var(--text);font-family:inherit}
+[data-part].loading{opacity:.55;pointer-events:none;transition:opacity .2s}
+[data-part]{transition:opacity .2s}
+
 @media(max-width:480px){.brand .tag{display:none}.top-right .clock{display:none}}
 `;
 
@@ -399,6 +466,7 @@ export const ADMIN_JS = `
     names.forEach(function(name){
       var devQ = $('#devSearch') ? $('#devSearch').value : null;
       var codeQ = $('#codeSearch') ? $('#codeSearch').value : null;
+      var hostEl = $('[data-part="' + name + '"]'); if (hostEl) hostEl.classList.add('loading');
       fetch('/admin/partial?name=' + encodeURIComponent(name), { headers: { 'X-Requested-With': 'fetch' }, credentials: 'same-origin' })
         .then(function(r){
           if (r.status === 401) { toast('登入已失效，請重新整理頁面', false); throw new Error('401'); }
@@ -412,13 +480,13 @@ export const ADMIN_JS = `
           reapplyFilters();
         })
         .catch(function(){})
-        .then(function(){ if (--pending === 0 && done) done(); });
+        .then(function(){ var h = $('[data-part="' + name + '"]'); if (h) h.classList.remove('loading'); if (--pending === 0 && done) done(); });
     });
   }
   window.refreshParts = refreshParts;
   function refreshAll(){
     var b = $('#btnRefresh'); if (b) b.classList.add('spin');
-    refreshParts(['overview','devices','codes','notice','system'], function(){ if (b) b.classList.remove('spin'); toast('已更新'); });
+    refreshParts(['overview','devices','codes','notice','alerts','system'], function(){ if (b) b.classList.remove('spin'); toast('已更新'); });
   }
   window.refreshAll = refreshAll;
 
@@ -440,6 +508,7 @@ export const ADMIN_JS = `
       .then(function(r){ return r.json().then(function(j){ j.__status = r.status; return j; }); })
       .then(function(data){
         if (data.relogin) { toast('登入已失效，請重新整理頁面', false); return; }
+        if (data.__status === 429) { toast(data.error || '操作太頻繁，請稍後再試', false); return; }
         toast(data.message || data.error || (data.ok ? '完成' : '失敗'), data.ok !== false);
         if (data.version) { var vp = $('#verPill b'); if (vp) vp.textContent = 'v' + data.version; }
         if (data.ok && data.codes && data.codes.length) showCodesModal(data.codes, data.days, data.note);

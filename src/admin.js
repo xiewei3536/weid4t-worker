@@ -7,26 +7,38 @@
  */
 
 import {
+  ADMIN_RL_MAX,
+  ADMIN_RL_TTL_SEC,
   CMD_TYPES,
   CODE_PREFIX,
+  DEFAULT_CONFIG,
   DEVICE_PREFIX,
   OTA_CACHE_KEY,
   QR_ASSET_KEY,
+  appendAudit,
+  clientIp,
+  configLabel,
+  diffConfigKeys,
   escapeHtml,
   formatTaipeiFull,
   htmlResponse,
   isValidFontScale,
   jsonResponse,
+  loadAudit,
   loadConfig,
+  loadConfigHistory,
   nowIso,
   parseFloatOr,
   parseIntOr,
+  pushConfigHistory,
+  rateLimited,
   relativeTime,
   saveConfig,
   timingSafeEqual,
   wantsJson,
 } from "./lib.js";
 import { authorizeDevice, genCodeString, getLatestRelease, loadCodes, loadDevices } from "./api.js";
+import { fetchSourceStatus, isValidTgToken, loadMonState, runMonitorTick, saveMonState, sendTelegram } from "./monitor.js";
 import { renderAdminHtml, renderCodesResultPage, renderPartial, renderResultPage, setupPasswordHtml } from "./ui.js";
 
 /* ================================================================
@@ -36,19 +48,27 @@ import { renderAdminHtml, renderCodesResultPage, renderPartial, renderResultPage
 /**
  * 驗證 Basic Auth。使用者名稱不限，密碼必須等於 env.ADMIN_PASSWORD。
  * 通過回傳 null；未通過回傳 401 Response（fetch 模式回 JSON，瀏覽器模式跳帳密框）。
+ * 同一 IP 密碼連錯 ADMIN_RL_MAX 次 → 10 分鐘內回 429（防暴力猜密碼）。
  */
-export function checkAuth(request, env) {
+export async function checkAuth(request, env) {
   const expected = env.ADMIN_PASSWORD;
   if (!expected) return htmlResponse(setupPasswordHtml(), 200);
 
   const header = request.headers.get("Authorization") || "";
+  let attempted = false;
   if (header.startsWith("Basic ")) {
+    attempted = true;
     try {
       const decoded = atob(header.slice(6));
       const idx = decoded.indexOf(":");
       const password = idx >= 0 ? decoded.slice(idx + 1) : "";
       if (timingSafeEqual(password, expected)) return null;
     } catch (_) {}
+  }
+  if (attempted && (await rateLimited(env, "adm", clientIp(request), ADMIN_RL_MAX, ADMIN_RL_TTL_SEC))) {
+    const msg = "密碼錯誤次數過多，請 10 分鐘後再試";
+    if (wantsJson(request)) return jsonResponse({ ok: false, error: msg }, 429);
+    return new Response(msg, { status: 429, headers: { "Content-Type": "text/plain; charset=utf-8", "Retry-After": "600" } });
   }
   if (wantsJson(request)) {
     return jsonResponse({ ok: false, error: "需要重新登入", relogin: true }, 401, {
@@ -88,8 +108,8 @@ export function csrfCheck(request) {
 }
 
 /** 通過驗證與 CSRF 後回傳 null，否則回傳要直接送出的 Response */
-function guard(request, env) {
-  const unauthorized = checkAuth(request, env);
+async function guard(request, env) {
+  const unauthorized = await checkAuth(request, env);
   if (unauthorized) return unauthorized;
   if (request.method === "POST") {
     const bad = csrfCheck(request);
@@ -120,62 +140,56 @@ const str = (form, k) => (form.get(k) == null ? "" : String(form.get(k))).trim()
  *  頁面與局部刷新
  * ================================================================ */
 
-async function buildContext(request, env) {
-  const [config, devices, codes] = await Promise.all([loadConfig(env), loadDevices(env), loadCodes(env)]);
-  let ota = null;
-  try {
-    ota = await getLatestRelease(env);
-  } catch (_) {
-    ota = null;
-  }
-  const sourceStatus = await fetchSourceStatus(config.subscriptionUrl);
-  return { config, devices, codes, ota, sourceStatus, origin: new URL(request.url).origin, hasGithubToken: !!env.GITHUB_TOKEN };
-}
-
 /**
- * 直播源伺服器的看門狗狀態（VPS 上 watchdog.sh 每 5 分鐘輸出 /status.json，需 token）。
- * 用訂閱網址同源 + 訂閱網址裡的 token 去讀；沒有（第三方源）就回 null 不顯示。3 秒逾時。
+ * 組出畫面需要的資料。parts 指定要哪些區塊（省 KV 讀取與對外請求）：
+ *   page（整頁）= 全部；partial 名稱 → 只載該區塊會用到的東西。
  */
-async function fetchSourceStatus(subscriptionUrl) {
-  const sub = String(subscriptionUrl || "").trim();
-  const m = /^(https?:\/\/[^/]+)/i.exec(sub);
-  if (!m) return null;
-  let token = "";
-  try {
-    token = new URL(sub).searchParams.get("token") || "";
-  } catch (_) {}
-  try {
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 3000);
-    const resp = await fetch(m[1] + "/status.json" + (token ? "?token=" + encodeURIComponent(token) : ""), {
-      signal: controller.signal,
-      headers: { "User-Agent": "WeiTV-Admin/2.0", Accept: "application/json" },
-      cf: { cacheTtl: 0 },
-    });
-    clearTimeout(timer);
-    if (!resp.ok) return null;
-    const j = await resp.json();
-    if (!j || typeof j !== "object" || typeof j.healthy !== "boolean") return null;
-    return j;
-  } catch (_) {
-    return null;
-  }
+const NEED = {
+  page: ["devices", "codes", "ota", "status", "mon", "audit", "hist"],
+  overview: ["devices", "codes", "ota", "status", "mon"],
+  devices: ["devices", "ota"],
+  codes: ["codes"],
+  source: [],
+  auth: [],
+  notice: [],
+  system: ["ota", "audit", "hist"],
+  alerts: ["devices", "mon", "status"],
+};
+
+async function buildContext(request, env, part) {
+  const need = new Set(NEED[part] || NEED.page);
+  const config = await loadConfig(env);
+  const [devices, codes, ota, sourceStatus, mon, audit, hist] = await Promise.all([
+    need.has("devices") ? loadDevices(env) : Promise.resolve([]),
+    need.has("codes") ? loadCodes(env) : Promise.resolve([]),
+    need.has("ota") ? getLatestRelease(env).catch(() => null) : Promise.resolve(null),
+    need.has("status") ? fetchSourceStatus(config.subscriptionUrl) : Promise.resolve(null),
+    need.has("mon") ? loadMonState(env) : Promise.resolve(null),
+    need.has("audit") ? loadAudit(env) : Promise.resolve([]),
+    need.has("hist") ? loadConfigHistory(env) : Promise.resolve([]),
+  ]);
+  return {
+    config, devices, codes, ota, sourceStatus, mon, audit, hist,
+    origin: new URL(request.url).origin,
+    hasGithubToken: !!env.GITHUB_TOKEN,
+  };
 }
 
 /** GET /admin */
 export async function handleAdminPage(request, env) {
-  const blocked = guard(request, env);
+  const blocked = await guard(request, env);
   if (blocked) return blocked;
-  const ctx = await buildContext(request, env);
+  const ctx = await buildContext(request, env, "page");
   return htmlResponse(renderAdminHtml(ctx), 200);
 }
 
-/** GET /admin/partial?name=overview|devices|codes|source|system|notice|auth → HTML 片段 */
+/** GET /admin/partial?name=overview|devices|codes|source|system|notice|auth|alerts → HTML 片段 */
 export async function handleAdminPartial(request, env) {
-  const blocked = guard(request, env);
+  const blocked = await guard(request, env);
   if (blocked) return blocked;
   const name = new URL(request.url).searchParams.get("name") || "";
-  const ctx = await buildContext(request, env);
+  if (!(name in NEED) || name === "page") return jsonResponse({ ok: false, error: "未知區塊" }, 404);
+  const ctx = await buildContext(request, env, name);
   const html = renderPartial(name, ctx);
   if (html == null) return jsonResponse({ ok: false, error: "未知區塊" }, 404);
   return new Response(html, {
@@ -193,7 +207,7 @@ export async function handleAdminPartial(request, env) {
  * ================================================================ */
 
 export async function handleAdminSave(request, env) {
-  const blocked = guard(request, env);
+  const blocked = await guard(request, env);
   if (blocked) return blocked;
 
   const current = await loadConfig(env);
@@ -260,7 +274,32 @@ export async function handleAdminSave(request, env) {
     changes.push("授權設定");
   }
 
+  if (fields === "alerts") {
+    updated.alertsEnabled = form.get("alertsEnabled") === "on";
+    const tok = str(form, "tgBotToken");
+    if (form.get("clearTg") === "on") {
+      updated.tgBotToken = "";
+    } else if (tok) {
+      if (!isValidTgToken(tok)) return respond(request, false, "Telegram Bot Token 格式不正確（應像 123456789:AAxxxxxxxx…，從 @BotFather 取得）", null, current);
+      updated.tgBotToken = tok;
+    } // 留空 = 沿用既有 token（畫面不會回填 token）
+    const chat = str(form, "tgChatId").slice(0, 40);
+    if (chat && !/^-?\d{1,20}$/.test(chat)) return respond(request, false, "Chat ID 應為數字（群組會是負數，例如 -1001234567890）", null, current);
+    updated.tgChatId = chat;
+    updated.alertSourceMin = Math.max(5, Math.min(120, parseIntOr(form.get("alertSourceMin"), current.alertSourceMin || 10)));
+    updated.alertDeviceOfflineMin = Math.max(30, Math.min(1440, parseIntOr(form.get("alertDeviceOfflineMin"), current.alertDeviceOfflineMin || 180)));
+    const quiet = str(form, "alertQuiet");
+    if (quiet && !/^\d{1,2}\s*-\s*\d{1,2}$/.test(quiet)) return respond(request, false, "靜音時段格式為「起-迄」小時，例如 23-7", null, current);
+    updated.alertQuiet = quiet.replace(/\s+/g, "");
+    updated.alertBoxFail = form.get("alertBoxFail") === "on";
+    if (updated.alertsEnabled && (!updated.tgBotToken || !updated.tgChatId)) {
+      return respond(request, false, "要開啟警示，Bot Token 與 Chat ID 都要填", null, current);
+    }
+    changes.push("警示設定");
+  }
+
   try {
+    await pushConfigHistory(env, current);
     await saveConfig(env, updated);
   } catch (err) {
     console.error("KV 寫入失敗:", err);
@@ -268,11 +307,12 @@ export async function handleAdminSave(request, env) {
   }
 
   const what = changes.length ? changes.join("、") : "設定";
+  await appendAudit(env, request, `儲存${what}（v${updated.version}）${fields === "source" ? "：" + updated.subscriptionUrl.slice(0, 120) : ""}`);
   return respond(
     request,
     true,
     `${what}已儲存（版本 v${updated.version}），盒子下次輪詢就會套用`,
-    { version: updated.version, refresh: ["overview", fields === "source" ? "source" : ""].filter(Boolean) },
+    { version: updated.version, refresh: ["overview", fields === "source" ? "source" : "", fields === "alerts" ? "alerts" : ""].filter(Boolean) },
     updated
   );
 }
@@ -282,7 +322,7 @@ export async function handleAdminSave(request, env) {
  * ================================================================ */
 
 export async function handleAdminTest(request, env) {
-  const blocked = guard(request, env);
+  const blocked = await guard(request, env);
   if (blocked) return blocked;
 
   let targetUrl = "";
@@ -386,7 +426,7 @@ async function summarizeBoxes(env) {
  * ================================================================ */
 
 export async function handleAdminDevice(request, env) {
-  const blocked = guard(request, env);
+  const blocked = await guard(request, env);
   if (blocked) return blocked;
 
   const form = await readForm(request);
@@ -412,6 +452,7 @@ export async function handleAdminDevice(request, env) {
         n++;
       } catch (_) {}
     }
+    await appendAudit(env, request, `全部裝置開機自啟設為「${on ? "開" : "關"}」（${n} 台）`);
     return respond(request, true, `已將 ${n} 台裝置的開機自啟設為「${on ? "開" : "關"}」`, { refresh });
   }
 
@@ -428,6 +469,7 @@ export async function handleAdminDevice(request, env) {
         n++;
       } catch (_) {}
     }
+    await appendAudit(env, request, `一鍵授權所有裝置（${n} 台，${days > 0 ? days + " 天" : "永久"}）`);
     return respond(request, true, `已授權 ${n} 台現有裝置（${days > 0 ? days + " 天" : "永久"}）`, { refresh });
   }
 
@@ -445,6 +487,7 @@ export async function handleAdminDevice(request, env) {
         n++;
       } catch (_) {}
     }
+    await appendAudit(env, request, `對全部裝置送出「${CMD_TYPES[type]}」（${n} 台）`);
     return respond(request, true, `已對 ${n} 台裝置送出「${CMD_TYPES[type]}」，各台下次心跳（約 90 秒內）執行`, { refresh });
   }
 
@@ -462,6 +505,7 @@ export async function handleAdminDevice(request, env) {
         } catch (_) {}
       }
     }
+    await appendAudit(env, request, `清除 30 天未上線裝置（${n} 台）`);
     return respond(request, true, `已清除 ${n} 台超過 30 天未上線的裝置紀錄`, { refresh });
   }
 
@@ -474,6 +518,7 @@ export async function handleAdminDevice(request, env) {
     } catch (err) {
       return respond(request, false, "刪除失敗，請稍後再試");
     }
+    await appendAudit(env, request, `刪除裝置 ${id}`);
     return respond(request, true, `已刪除裝置 ${id}`, { refresh });
   }
 
@@ -547,6 +592,12 @@ export async function handleAdminDevice(request, env) {
       dev.cmd = null;
       summary = `已取消 ${who} 的待送指令`;
       break;
+    case "watch":
+      dev.watch = value === "on";
+      summary = dev.watch
+        ? `已把 ${who} 設為重點監控：離線超過門檻會通知你（在「警示」分頁設定）`
+        : `已取消 ${who} 的重點監控`;
+      break;
     default:
       return respond(request, false, `未知動作：${action}`);
   }
@@ -556,6 +607,7 @@ export async function handleAdminDevice(request, env) {
   } catch (err) {
     return respond(request, false, "寫入失敗，請稍後再試");
   }
+  await appendAudit(env, request, summary);
   return respond(request, true, summary, { refresh });
 }
 
@@ -564,7 +616,7 @@ export async function handleAdminDevice(request, env) {
  * ================================================================ */
 
 export async function handleAdminCodes(request, env) {
-  const blocked = guard(request, env);
+  const blocked = await guard(request, env);
   if (blocked) return blocked;
 
   const form = await readForm(request);
@@ -601,6 +653,7 @@ export async function handleAdminCodes(request, env) {
         created.push(code);
       } catch (_) {}
     }
+    if (created.length) await appendAudit(env, request, `產生 ${created.length} 組啟動碼（${days > 0 ? days + " 天" : "永久"}${note ? "，" + note : ""}）`);
     if (wantsJson(request)) {
       return jsonResponse({
         ok: created.length > 0,
@@ -625,6 +678,7 @@ export async function handleAdminCodes(request, env) {
         } catch (_) {}
       }
     }
+    await appendAudit(env, request, `刪除 ${n} 組未使用啟動碼`);
     return respond(request, true, `已刪除 ${n} 組未使用的啟動碼`, { refresh });
   }
 
@@ -638,6 +692,7 @@ export async function handleAdminCodes(request, env) {
     } catch (_) {
       return respond(request, false, "刪除失敗");
     }
+    await appendAudit(env, request, `刪除啟動碼 ${code}`);
     return respond(request, true, `已刪除啟動碼 ${code}`, { refresh });
   }
 
@@ -664,6 +719,7 @@ export async function handleAdminCodes(request, env) {
     } catch (_) {
       return respond(request, false, "撤銷失敗");
     }
+    await appendAudit(env, request, `撤銷啟動碼 ${code}${rec.device ? "（停用裝置 " + rec.device + "）" : ""}`);
     return respond(request, true, `已撤銷啟動碼 ${code}${rec.device ? "（並停用綁定裝置）" : ""}`, {
       refresh: ["codes", "devices", "overview"],
     });
@@ -677,7 +733,7 @@ export async function handleAdminCodes(request, env) {
  * ================================================================ */
 
 export async function handleAdminUpload(request, env) {
-  const blocked = guard(request, env);
+  const blocked = await guard(request, env);
   if (blocked) return blocked;
 
   const form = await readForm(request);
@@ -696,7 +752,51 @@ export async function handleAdminUpload(request, env) {
     try {
       await saveConfig(env, config);
     } catch (_) {}
+    await appendAudit(env, request, "移除聯絡 QR 圖");
     return respond(request, true, "已移除聯絡 QR 圖", { refresh, version: config.version }, config);
+  }
+
+  // 匯入設定 JSON（由「系統」分頁匯出的檔案）：只接受已知欄位，其餘忽略；舊設定會進版本歷史可還原
+  if (action === "import_config") {
+    const file = form.get("file");
+    if (!file || typeof file === "string" || typeof file.text !== "function") return respond(request, false, "請選擇匯出的設定 JSON 檔", null, config);
+    let obj = null;
+    try {
+      const text = await file.text();
+      if (text.length > 200000) throw new Error("too large");
+      obj = JSON.parse(text);
+    } catch (_) {
+      return respond(request, false, "檔案不是有效的設定 JSON", null, config);
+    }
+    if (!obj || typeof obj !== "object" || Array.isArray(obj)) return respond(request, false, "檔案內容不是設定物件", null, config);
+    const imported = { ...config };
+    const applied = [];
+    for (const k of Object.keys(DEFAULT_CONFIG)) {
+      if (k === "version" || k === "updatedAt" || k === "contactQrVer") continue;
+      if (!(k in obj)) continue;
+      const want = typeof DEFAULT_CONFIG[k];
+      let v = obj[k];
+      if (want === "boolean") v = v === true || v === "true" || v === "on";
+      else if (want === "number") { v = parseIntOr(v, DEFAULT_CONFIG[k]); }
+      else v = String(v == null ? "" : v);
+      if (JSON.stringify(v) !== JSON.stringify(config[k])) applied.push(configLabel(k));
+      imported[k] = v;
+    }
+    if (imported.subscriptionUrl && !/^https?:\/\//i.test(imported.subscriptionUrl)) return respond(request, false, "匯入的訂閱網址格式不正確", null, config);
+    if (!isValidFontScale(imported.fontScale)) imported.fontScale = "auto";
+    if (imported.tgBotToken && !isValidTgToken(imported.tgBotToken)) imported.tgBotToken = "";
+    imported.version = (config.version || 0) + 1;
+    imported.updatedAt = nowIso();
+    try {
+      await pushConfigHistory(env, config);
+      await saveConfig(env, imported);
+    } catch (_) {
+      return respond(request, false, "KV 寫入失敗", null, config);
+    }
+    await appendAudit(env, request, `匯入設定（v${imported.version}，${applied.length ? "變更：" + applied.join("、") : "無變更"}）`);
+    return respond(request, true, `已匯入設定（v${imported.version}）${applied.length ? "，變更：" + applied.join("、") : "，內容與目前相同"}`, {
+      refresh: ["overview", "source", "notice", "system", "auth", "alerts"], version: imported.version,
+    }, imported);
   }
 
   const file = form.get("file");
@@ -723,6 +823,7 @@ export async function handleAdminUpload(request, env) {
   try {
     await saveConfig(env, config);
   } catch (_) {}
+  await appendAudit(env, request, "上傳聯絡 QR 圖");
   return respond(request, true, "已上傳聯絡 QR 圖，盒子下次輪詢就會看到", { refresh, version: config.version }, config);
 }
 
@@ -731,7 +832,7 @@ export async function handleAdminUpload(request, env) {
  * ================================================================ */
 
 export async function handleAdminSystem(request, env) {
-  const blocked = guard(request, env);
+  const blocked = await guard(request, env);
   if (blocked) return blocked;
   const form = await readForm(request);
   if (!form) return respond(request, false, "表單解析失敗");
@@ -760,6 +861,7 @@ export async function handleAdminSystem(request, env) {
     } catch (_) {
       return respond(request, false, "KV 寫入失敗");
     }
+    await appendAudit(env, request, action === "clear_notice" ? "撤下公告" : "停止跑馬燈");
     return respond(request, true, action === "clear_notice" ? "已撤下公告" : "已停止跑馬燈", {
       refresh: ["notice", "overview"], version: config.version,
     }, config);
@@ -775,20 +877,109 @@ export async function handleAdminSystem(request, env) {
     } catch (_) {
       return respond(request, false, "KV 寫入失敗");
     }
+    await appendAudit(env, request, "關閉強制刷新旗標");
     return respond(request, true, "已關閉強制刷新旗標", { refresh: ["system", "overview"], version: config.version }, config);
+  }
+
+  // 還原某一份歷史設定（idx = 歷史列表索引，0 = 最近一份）
+  if (action === "restore_config") {
+    const current = await loadConfig(env);
+    const hist = await loadConfigHistory(env);
+    const idx = parseIntOr(form.get("idx"), -1);
+    const snap = hist[idx];
+    if (!snap) return respond(request, false, "找不到這份歷史設定（可能已被新的擠掉）", null, current);
+    const restored = { ...DEFAULT_CONFIG, ...snap, version: (current.version || 0) + 1, updatedAt: nowIso() };
+    // QR 圖本體沒有版本化，維持目前的
+    restored.contactQrVer = current.contactQrVer;
+    const changed = diffConfigKeys(current, restored).map(configLabel);
+    try {
+      await pushConfigHistory(env, current);
+      await saveConfig(env, restored);
+    } catch (_) {
+      return respond(request, false, "KV 寫入失敗", null, current);
+    }
+    await appendAudit(env, request, `還原設定 v${snap.version || "?"} → v${restored.version}（${changed.length ? changed.join("、") : "無變更"}）`);
+    return respond(request, true, `已還原成 v${snap.version || "?"} 的內容（新版本 v${restored.version}）${changed.length ? "，變更：" + changed.join("、") : ""}`, {
+      refresh: ["overview", "source", "notice", "system", "auth", "alerts"], version: restored.version,
+    }, restored);
+  }
+
+  if (action === "clear_audit") {
+    try {
+      await env.CONFIG_KV.delete("audit");
+    } catch (_) {}
+    await appendAudit(env, request, "清除操作紀錄");
+    return respond(request, true, "已清除操作紀錄", { refresh: ["system"] });
   }
 
   return respond(request, false, `未知動作：${action}`);
 }
 
 /* ================================================================
- *  GET /admin/export?what=codes|devices — CSV 匯出
+ *  POST /admin/alerts — 警示：測試發送 / 立即檢查 / 清除警示紀錄
+ * ================================================================ */
+
+export async function handleAdminAlerts(request, env) {
+  const blocked = await guard(request, env);
+  if (blocked) return blocked;
+  const form = await readForm(request);
+  if (!form) return respond(request, false, "表單解析失敗");
+  const action = str(form, "action");
+  const config = await loadConfig(env);
+
+  if (action === "test") {
+    // 允許用表單裡剛填、尚未儲存的值測試
+    const tok = str(form, "tgBotToken") || config.tgBotToken;
+    const chat = str(form, "tgChatId") || config.tgChatId;
+    const r = await sendTelegram({ tgBotToken: tok, tgChatId: chat },
+      `✅ <b>偉電視管理中心</b> 測試訊息\n收到這則表示 Telegram 通知已接好。\n${formatTaipeiFull(nowIso())}`);
+    if (!r.ok) return respond(request, false, `Telegram 發送失敗：${r.error}`);
+    await appendAudit(env, request, "發送 Telegram 測試訊息");
+    return respond(request, true, "測試訊息已送出，請看 Telegram");
+  }
+
+  if (action === "run") {
+    const r = await runMonitorTick(env, Date.now(), { force: true });
+    const stateTxt = { ok: "正常", bad: "異常", stale: "沒回報", none: "無看門狗資料" }[r.state] || r.state;
+    await appendAudit(env, request, `手動執行監控（直播源 ${stateTxt}，${r.events.length} 則事件）`);
+    return respond(request, true, `已檢查：直播源 ${stateTxt}${r.events.length ? "，產生 " + r.events.length + " 則通知" : "，沒有新事件"}`, { refresh: ["alerts", "overview"] });
+  }
+
+  if (action === "clear_log") {
+    const st = await loadMonState(env);
+    st.log = [];
+    try {
+      await saveMonState(env, st);
+    } catch (_) {
+      return respond(request, false, "KV 寫入失敗");
+    }
+    await appendAudit(env, request, "清除警示紀錄");
+    return respond(request, true, "已清除警示紀錄", { refresh: ["alerts"] });
+  }
+
+  return respond(request, false, `未知動作：${action}`);
+}
+
+/* ================================================================
+ *  GET /admin/export?what=codes|devices|config — CSV / JSON 匯出
  * ================================================================ */
 
 export async function handleAdminExport(request, env) {
-  const blocked = guard(request, env);
+  const blocked = await guard(request, env);
   if (blocked) return blocked;
   const what = new URL(request.url).searchParams.get("what") || "codes";
+  const stamp = new Date().toISOString().slice(0, 10);
+  if (what === "config") {
+    const config = await loadConfig(env);
+    return new Response(JSON.stringify(config, null, 2), {
+      status: 200,
+      headers: {
+        "Content-Type": "application/json; charset=utf-8",
+        "Content-Disposition": `attachment; filename="weitv-config-v${config.version}-${stamp}.json"`,
+        "Cache-Control": "no-store",
+      },
+    });
+  }
   const q = (v) => '"' + String(v == null ? "" : v).replace(/"/g, '""') + '"';
   let rows = [];
   let name = "";
@@ -816,7 +1007,6 @@ export async function handleAdminExport(request, env) {
     }
   }
   const csv = "﻿" + rows.map((r) => r.map(q).join(",")).join("\r\n") + "\r\n";
-  const stamp = new Date().toISOString().slice(0, 10);
   return new Response(csv, {
     status: 200,
     headers: {

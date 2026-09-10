@@ -13,6 +13,21 @@ export const CODE_PREFIX = "code:";
 export const OTA_CACHE_KEY = "update_cache";
 export const QR_ASSET_KEY = "asset:qr";
 export const RATE_PREFIX = "rl:";
+/** 監控 / 警示狀態（monitor.js） */
+export const MON_KEY = "mon:state";
+/** 管理操作紀錄（環狀，最多 AUDIT_MAX 筆） */
+export const AUDIT_KEY = "audit";
+export const AUDIT_MAX = 200;
+/** 設定版本歷史（最多 CFG_HIST_MAX 份快照，供還原） */
+export const CFG_HIST_KEY = "cfghist";
+export const CFG_HIST_MAX = 12;
+
+/** 程式版本（/api/health 回傳，部署後用來確認新版已生效） */
+export const BUILD = "2.1.0";
+
+/** 管理密碼猜錯限速：同一 IP 每 10 分鐘最多幾次 */
+export const ADMIN_RL_MAX = 20;
+export const ADMIN_RL_TTL_SEC = 600;
 
 /** 列舉上限（KV list 單次最多 1000 筆） */
 export const DEVICE_LIST_MAX = 1000;
@@ -64,8 +79,30 @@ export const DEFAULT_CONFIG = {
   showClock: false,
   // 是否允許盒子提示 OTA 更新（關閉可避免長輩看到更新視窗）
   otaEnabled: true,
+  // ── 警示（只給管理員；不會下發到盒子，見 ADMIN_ONLY_KEYS） ──
+  alertsEnabled: false,
+  tgBotToken: "",
+  tgChatId: "",
+  // 直播源異常持續幾分鐘才通知（看門狗自己 5～15 分內多半會修好，太短會吵）
+  alertSourceMin: 10,
+  // 「重點監控」的盒子離線幾分鐘才通知
+  alertDeviceOfflineMin: 180,
+  // 靜音時段（台灣時間，例如 "23-7"；空 = 不靜音）
+  alertQuiet: "",
+  // 盒子回報載入頻道失敗時通知
+  alertBoxFail: true,
   updatedAt: "2026-06-26T00:00:00Z",
 };
+
+/** 這些欄位只屬於管理員，/api/config 一律不下發（含 Telegram token） */
+export const ADMIN_ONLY_KEYS = ["alertsEnabled", "tgBotToken", "tgChatId", "alertSourceMin", "alertDeviceOfflineMin", "alertQuiet", "alertBoxFail"];
+
+/** 去掉管理員專用欄位後的設定（給盒子看的版本） */
+export function publicConfig(config) {
+  const out = { ...config };
+  for (const k of ADMIN_ONLY_KEYS) delete out[k];
+  return out;
+}
 
 /** 字體大小選項（值 → 顯示名稱） */
 export const FONT_SCALE_OPTIONS = [
@@ -124,6 +161,76 @@ export async function loadConfig(env) {
 
 export async function saveConfig(env, config) {
   await env.CONFIG_KV.put(CONFIG_KEY, JSON.stringify(config));
+}
+
+/* ────────────────────────── 設定版本歷史 ────────────────────────── */
+
+/** 把「即將被覆蓋的」設定快照推進歷史（最新在前，最多 CFG_HIST_MAX 份）。失敗不影響主流程 */
+export async function pushConfigHistory(env, prevConfig) {
+  if (!prevConfig || typeof prevConfig !== "object") return;
+  try {
+    const list = await loadConfigHistory(env);
+    if (list.length && list[0] && list[0].version === prevConfig.version && list[0].updatedAt === prevConfig.updatedAt) return;
+    list.unshift({ ...prevConfig });
+    await env.CONFIG_KV.put(CFG_HIST_KEY, JSON.stringify(list.slice(0, CFG_HIST_MAX)));
+  } catch (err) {
+    console.error("設定歷史寫入失敗:", err);
+  }
+}
+
+export async function loadConfigHistory(env) {
+  try {
+    const v = await env.CONFIG_KV.get(CFG_HIST_KEY, { type: "json" });
+    return Array.isArray(v) ? v.filter((x) => x && typeof x === "object") : [];
+  } catch (_) {
+    return [];
+  }
+}
+
+/** 兩份設定的差異欄位名稱（給歷史列表顯示「改了什麼」） */
+export function diffConfigKeys(a, b) {
+  const keys = new Set([...Object.keys(a || {}), ...Object.keys(b || {})]);
+  const out = [];
+  for (const k of keys) {
+    if (k === "version" || k === "updatedAt") continue;
+    if (JSON.stringify(a ? a[k] : undefined) !== JSON.stringify(b ? b[k] : undefined)) out.push(k);
+  }
+  return out;
+}
+
+/** 設定欄位的中文名稱（歷史 / 匯入顯示用） */
+export const CONFIG_LABELS = {
+  subscriptionUrl: "直播源", pollIntervalMinutes: "重載間隔", forceRefresh: "強制刷新", autostart: "開機自啟",
+  notice: "公告", noticeUntil: "公告到期", marquee: "跑馬燈", marqueeUntil: "跑馬燈到期", contactText: "聯絡文字", contactQrVer: "聯絡 QR",
+  requireActivation: "授權機制", activationTitle: "啟動頁標題", activationText: "啟動頁說明", codeDigits: "啟動碼位數",
+  fontScale: "全域字體", showClock: "時鐘", otaEnabled: "OTA 提示",
+  alertsEnabled: "警示開關", tgBotToken: "Telegram Token", tgChatId: "Telegram Chat", alertSourceMin: "直播源異常門檻",
+  alertDeviceOfflineMin: "盒子離線門檻", alertQuiet: "靜音時段", alertBoxFail: "載入失敗通知",
+};
+export function configLabel(k) {
+  return CONFIG_LABELS[k] || k;
+}
+
+/* ────────────────────────── 管理操作紀錄 ────────────────────────── */
+
+/** 記一筆管理操作（誰、何時、做了什麼）。失敗不影響主流程 */
+export async function appendAudit(env, request, what) {
+  try {
+    const list = await loadAudit(env);
+    list.unshift({ at: nowIso(), ip: clientIp(request), what: String(what || "").slice(0, 200) });
+    await env.CONFIG_KV.put(AUDIT_KEY, JSON.stringify(list.slice(0, AUDIT_MAX)));
+  } catch (err) {
+    console.error("操作紀錄寫入失敗:", err);
+  }
+}
+
+export async function loadAudit(env) {
+  try {
+    const v = await env.CONFIG_KV.get(AUDIT_KEY, { type: "json" });
+    return Array.isArray(v) ? v.filter((x) => x && typeof x === "object") : [];
+  } catch (_) {
+    return [];
+  }
 }
 
 /* ────────────────────────── 回應產生器 ────────────────────────── */

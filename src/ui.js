@@ -9,16 +9,31 @@
 import {
   CMD_TYPES,
   FONT_SCALE_OPTIONS,
+  configLabel,
+  diffConfigKeys,
   escapeHtml as esc,
   effectiveFontScale,
   formatTaipeiFull,
+  formatTaipeiTime,
   onlineState,
   pendingCmd,
   relativeTime,
 } from "./lib.js";
+import { describeSource, historySlots, isValidTgToken, reasonText, sourceState, telegramReady, uptime24h } from "./monitor.js";
 import { ADMIN_CSS, ADMIN_JS } from "./ui_assets.js";
 
 const DAY = 86400000;
+
+/** 盒子播放健康：近 15 分鐘內回報重連 ≥3 次視為「不穩」 */
+function playHealth(d, nowMs) {
+  const pe = d && typeof d.pe === "number" ? d.pe : 0;
+  const at = d && d.peAt ? Date.parse(d.peAt) || 0 : 0;
+  const fresh = at && nowMs - at < 15 * 60000;
+  if (!d || !("pe" in d)) return { level: "unknown", text: "未回報" };
+  if (pe >= 3 && fresh) return { level: "bad", text: `不穩：近 10 分鐘重連 ${pe} 次${d.le ? "（" + d.le + "）" : ""}` };
+  if (pe > 0 && fresh) return { level: "warn", text: `重連 ${pe} 次${d.le ? "（" + d.le + "）" : ""}` };
+  return { level: "ok", text: "正常" };
+}
 
 function fontLabel(v) {
   const o = FONT_SCALE_OPTIONS.find((x) => x[0] === v);
@@ -81,12 +96,13 @@ code{background:#0e1422;border:1px solid var(--stroke);border-radius:6px;padding
  * ================================================================ */
 
 export function renderAdminHtml(ctx) {
-  const { config, devices, codes } = ctx;
+  const { config, devices, codes, mon } = ctx;
   const nowMs = Date.now();
   const devList = Array.isArray(devices) ? devices : [];
   const unauth = devList.filter((d) => !devAuthed(d, nowMs)).length;
   const online = devList.filter((d) => onlineState(d, nowMs) === "online").length;
   const unusedCodes = (codes || []).filter((c) => c && c.status === "unused").length;
+  const recentAlerts = mon && Array.isArray(mon.log) ? mon.log.filter((l) => l && nowMs - (Date.parse(l.at) || 0) < DAY).length : 0;
 
   const tab = (name, label, extra) =>
     `<button type="button" class="tab" data-tab="${name}" onclick="showTab('${name}')">${label}${extra || ""}</button>`;
@@ -118,6 +134,7 @@ export function renderAdminHtml(ctx) {
     ${tab("source", "📡 直播源")}
     ${tab("auth", "🎟️ 授權", unusedCodes ? ` <span class="cnt">${unusedCodes}</span>` : "")}
     ${tab("notice", "📣 通知")}
+    ${tab("alerts", "🔔 警示", recentAlerts ? ` <span class="cnt">${recentAlerts}</span>` : "")}
     ${tab("system", "⚙️ 系統")}
   </nav></div>
 
@@ -126,9 +143,10 @@ export function renderAdminHtml(ctx) {
   <section class="panel" data-panel="source"><div data-part="source">${renderSourcePanel(ctx)}</div></section>
   <section class="panel" data-panel="auth"><div data-part="auth">${renderAuthSettings(ctx)}</div><div data-part="codes">${renderCodesSection(ctx)}</div></section>
   <section class="panel" data-panel="notice"><div data-part="notice">${renderNoticePanel(ctx)}</div></section>
+  <section class="panel" data-panel="alerts"><div data-part="alerts">${renderAlertsPanel(ctx)}</div></section>
   <section class="panel" data-panel="system"><div data-part="system">${renderSystemPanel(ctx)}</div></section>
 
-  <div class="footnote">App 端點 <code>/api/config</code> · <code>/api/activate</code> · <code>/api/update</code> · <code>/api/time</code><br>所有操作即時生效；盒子每 90 秒心跳一次、每 ${esc(config.pollIntervalMinutes)} 分鐘重載頻道。</div>
+  <div class="footnote">App 端點 <code>/api/config</code> · <code>/api/activate</code> · <code>/api/update</code> · <code>/api/time</code><br>所有操作即時生效；盒子每 90 秒心跳一次、每 ${esc(config.pollIntervalMinutes)} 分鐘重載頻道；監控每 5 分鐘檢查直播源。</div>
 </div>
 
 <div id="toast"></div>
@@ -147,6 +165,7 @@ export function renderPartial(name, ctx) {
     case "source": return renderSourcePanel(ctx);
     case "auth": return renderAuthSettings(ctx);
     case "notice": return renderNoticePanel(ctx);
+    case "alerts": return renderAlertsPanel(ctx);
     case "system": return renderSystemPanel(ctx);
     default: return null;
   }
@@ -156,8 +175,74 @@ export function renderPartial(name, ctx) {
  *  總覽
  * ================================================================ */
 
+/** 一眼狀態：綜合直播源、盒子、設定，算出 綠 / 黃 / 紅 與一句話 */
+function renderHeadline(ctx, stat, nowMs) {
+  const { config, devices, mon } = ctx;
+  const devList = Array.isArray(devices) ? devices : [];
+  const ss = ctx.sourceStatus;
+  const state = sourceState(ss, nowMs);
+  const issues = [];
+  if (state === "bad") issues.push(["red", `直播源異常：${reasonText(ss.reason)}，看門狗處理中`]);
+  else if (state === "stale") issues.push(["red", "直播源伺服器的看門狗沒回報，VPS 可能離線"]);
+  const failing = devList.filter((d) => onlineState(d, nowMs) === "online" && d.lastOk === false && nowMs - (Date.parse(d.lastResultAt) || 0) < 3600000).length;
+  if (failing) issues.push(["red", `${failing} 台線上盒子最近載入頻道失敗`]);
+  const unstable = devList.filter((d) => onlineState(d, nowMs) === "online" && playHealth(d, nowMs).level === "bad").length;
+  if (unstable) issues.push(["yellow", `${unstable} 台盒子播放不穩（一直重連）`]);
+  if (!config.subscriptionUrl) issues.push(["red", "尚未設定訂閱網址，盒子沒有頻道"]);
+  if (config.requireActivation && stat.unauth > 0) issues.push(["yellow", `${stat.unauth} 台盒子未授權`]);
+  if (config.forceRefresh) issues.push(["yellow", "強制刷新旗標開著"]);
+  if (stat.oldver > 0) issues.push(["yellow", `${stat.oldver} 台仍是舊版 App`]);
+  const watchedOff = devList.filter((d) => d.watch === true && onlineState(d, nowMs) === "offline").length;
+  if (watchedOff) issues.push(["yellow", `${watchedOff} 台重點監控的盒子離線`]);
+  const level = issues.some((i) => i[0] === "red") ? "red" : issues.length ? "yellow" : "green";
+  const title = level === "green" ? "一切正常" : level === "yellow" ? "需要留意" : "有問題要處理";
+
+  const parts = [];
+  parts.push(`${stat.online} 台線上` + (stat.total ? `（共 ${stat.total} 台）` : ""));
+  if (state !== "none") parts.push("直播源" + describeSource(ss, state, nowMs));
+  if (ss && ss.epg_updated) parts.push("節目表 " + esc(String(ss.epg_updated).slice(5, 16)) + " 更新");
+  const up = mon ? uptime24h(mon, nowMs) : null;
+  if (up != null) parts.push(`24 小時可用率 ${up}%`);
+  if (!telegramReady(config)) parts.push("Telegram 警示未設定");
+
+  return `<div class="head-card ${level}">
+      <div class="lamp"></div>
+      <div class="head-body">
+        <div class="head-title">${title}</div>
+        <div class="head-sub">${parts.map((p) => esc(p)).join(" · ")}</div>
+        ${issues.length ? `<div class="head-issues">${issues.map((i) => `<span class="issue ${i[0]}">${esc(i[1])}</span>`).join("")}</div>` : ""}
+      </div>
+    </div>`;
+}
+
+/** 24 小時健康色條（96 格 × 15 分鐘） */
+export function renderHistoryStrip(mon, nowMs) {
+  if (!mon || !Array.isArray(mon.hist) || !mon.hist.length) {
+    return `<div class="empty" style="padding:14px">監控啟動後（Cron 每 5 分鐘）這裡會畫出 24 小時的直播源健康色條</div>`;
+  }
+  const slots = historySlots(mon, nowMs, 96);
+  const bars = slots.map((s) => `<i class="${s.state}" title="${esc(formatTaipeiTime(new Date(s.t).toISOString()))} ${s.state === "ok" ? "正常" : s.state === "bad" ? "異常" : s.state === "stale" ? "沒回報" : "無資料"}"></i>`).join("");
+  const up = uptime24h(mon, nowMs);
+  const t0 = formatTaipeiTime(new Date(nowMs - DAY).toISOString());
+  const t1 = formatTaipeiTime(new Date(nowMs).toISOString());
+  return `<div class="hist">${bars}</div>
+    <div class="hist-axis"><span>${esc(t0)}（昨天）</span><span>${esc(t1)} 現在</span></div>
+    <div class="hist-legend"><span><i class="ok"></i>正常</span><span><i class="bad"></i>異常</span><span><i class="stale"></i>看門狗沒回報</span><span><i class="none"></i>無資料</span>${up != null ? `<span style="margin-left:auto;color:var(--text)">24 小時可用率 <b>${up}%</b></span>` : ""}</div>`;
+}
+
+const ALERT_KIND = { src_down: "直播源異常", src_stale: "看門狗沒回報", src_up: "直播源恢復", dev_off: "盒子離線", dev_on: "盒子回來", dev_fail: "盒子載入失敗" };
+function renderAlertRows(log, nowMs, limit) {
+  const rows = (Array.isArray(log) ? log : []).slice(0, limit || 8);
+  if (!rows.length) return `<div class="empty">尚無警示事件（這是好事）</div>`;
+  return `<div class="alog">${rows.map((l) => {
+    const st = String(l.status || "");
+    const stTxt = st === "sent" ? "已發 Telegram" : st === "muted" ? "靜音時段未發" : st === "no-telegram" ? "未設定 Telegram" : st.startsWith("failed") ? "發送失敗：" + st.slice(8) : st;
+    return `<div class="alog-row k-${esc(l.kind)}"><div class="am"><span>${esc(ALERT_KIND[l.kind] || l.kind)} · ${esc(formatTaipeiFull(l.at))}（${esc(relativeTime(l.at, nowMs))}）</span><span>${esc(stTxt)}</span></div>${esc(l.text)}</div>`;
+  }).join("")}</div>`;
+}
+
 export function renderOverview(ctx) {
-  const { config, devices, codes, ota } = ctx;
+  const { config, devices, codes, ota, mon } = ctx;
   const nowMs = Date.now();
   const devList = Array.isArray(devices) ? devices : [];
   const codeList = Array.isArray(codes) ? codes : [];
@@ -182,9 +267,11 @@ export function renderOverview(ctx) {
   const nowRows = devList
     .filter((d) => d.now && onlineState(d, nowMs) === "online")
     .slice(0, 12)
-    .map(
-      (d) => `<div class="now-row"><span class="sdot online"></span><span class="nm">${esc(d.nick || d.id)}</span><span class="ch">${esc(d.now)}</span><span class="tm">${esc(relativeTime(d.nowAt || d.lastSeen, nowMs))}</span></div>`
-    )
+    .map((d) => {
+      const ph = playHealth(d, nowMs);
+      const phTxt = ph.level === "bad" ? `<span class="ph bad" title="${esc(ph.text)}">⚠ 重連 ${d.pe} 次</span>` : ph.level === "warn" ? `<span class="ph warn">重連 ${d.pe} 次</span>` : "";
+      return `<div class="now-row"><span class="sdot online"></span><span class="nm">${esc(d.nick || d.id)}</span><span class="ch">${esc(d.now)}</span>${phTxt}<span class="tm">${esc(relativeTime(d.nowAt || d.lastSeen, nowMs))}</span></div>`;
+    })
     .join("");
 
   // 版本分布
@@ -210,7 +297,7 @@ export function renderOverview(ctx) {
     const actTxt = ss.last_action && ss.last_action !== "none"
       ? `最近自動處置：${esc(ss.last_action)}${ss.last_action_at ? "（" + esc(relativeTime(ss.last_action_at, nowMs)) + "）" : ""}`
       : "";
-    const reasonTxt = { vpn: "VPN 出口斷線", api_blocked: "4gtv 封鎖了目前出口 IP（API 400）", stale: "快取的播放網址失效", upstream: "上游 4gtv 不通" }[ss.reason] || "上游 4gtv 不通";
+    const reasonTxt = reasonText(ss.reason);
     if (stale) {
       banners.push(`<div class="banner warn"><span class="bi">⚠️</span><div>直播源伺服器的看門狗 <b>${when === "-" ? "沒有回報" : when + "後就沒再回報"}</b>，VPS 可能離線或排程停了。</div></div>`);
     } else if (ss.healthy) {
@@ -247,6 +334,7 @@ export function renderOverview(ctx) {
   }
 
   return `
+    ${renderHeadline(ctx, stat, nowMs)}
     <div class="block">
       <div class="block-head"><span class="block-title"><span class="ic">📊</span>營運概覽</span><span class="count-pill">更新於 ${esc(formatTaipeiFull(new Date().toISOString()))}</span></div>
       <div class="stat-grid">
@@ -272,6 +360,16 @@ export function renderOverview(ctx) {
     </div>
 
     <div class="block">
+      <div class="block-head"><span class="block-title"><span class="ic">🩺</span>直播源 24 小時健康</span><span class="count-pill">${mon && mon.lastTick ? "監控最近寫入 " + esc(relativeTime(new Date(mon.lastTick).toISOString(), nowMs)) : "監控尚未執行"}</span></div>
+      ${renderHistoryStrip(mon, nowMs)}
+    </div>
+
+    <div class="block">
+      <div class="block-head"><span class="block-title"><span class="ic">🔔</span>最近警示</span><button type="button" class="btn-mini" onclick="showTab('alerts')">警示設定 ›</button></div>
+      ${renderAlertRows(mon && mon.log, nowMs, 5)}
+    </div>
+
+    <div class="block">
       <div class="block-head"><span class="block-title"><span class="ic">⚡</span>快速操作</span></div>
       <div class="quick">
         <button type="button" onclick="showTab('source')">📡 換直播源</button>
@@ -290,7 +388,8 @@ export function renderOverview(ctx) {
         <div class="item"><div class="k">右上角時鐘</div><div class="v"><span class="badge ${config.showClock ? "on" : "off"}">${config.showClock ? "顯示" : "關閉"}</span></div></div>
         <div class="item"><div class="k">開機自啟（全域）</div><div class="v"><span class="badge ${config.autostart ? "on" : "off"}">${config.autostart ? "開啟" : "關閉"}</span></div></div>
         <div class="item"><div class="k">OTA 更新提示</div><div class="v"><span class="badge ${config.otaEnabled !== false ? "on" : "off"}">${config.otaEnabled !== false ? "允許" : "停用"}</span></div></div>
-        <div class="item full"><div class="k">最後更新</div><div class="v mono">${esc(formatTaipeiFull(config.updatedAt))}</div></div>
+        <div class="item"><div class="k">Telegram 警示</div><div class="v"><span class="badge ${telegramReady(config) ? "on" : "off"}">${telegramReady(config) ? "已啟用" : "未設定"}</span></div></div>
+        <div class="item"><div class="k">最後更新</div><div class="v mono">${esc(formatTaipeiFull(config.updatedAt))}</div></div>
         <div class="item full"><div class="k">目前訂閱網址</div><div class="v mono">${config.subscriptionUrl ? esc(config.subscriptionUrl) : "（尚未設定）"}</div></div>
       </div>
       <div class="inline-note">啟動碼：未用 ${unusedCodes} · 已用 ${usedCodes} · 共 ${codeList.length}${stat.blocked ? ` ｜ 已封鎖裝置 ${stat.blocked} 台` : ""}</div>
@@ -515,15 +614,19 @@ export function renderDeviceCard(d, config, latestVer, nowMs) {
       ? authActive ? `<span class="badge ok-b">已授權</span>` : dExpired ? `<span class="badge warn-b">已到期</span>` : `<span class="badge danger-b">未授權</span>`
       : authActive ? `<span class="badge mute-b">已授權</span>` : "") +
     (blocked ? `<span class="badge danger-b">已封鎖</span>` : "") +
+    (d && d.watch === true ? `<span class="badge info-b" title="離線超過門檻會 Telegram 通知">重點監控</span>` : "") +
     (isOld ? `<span class="badge warn-b" title="最新 v${latestVer}">舊版</span>` : "");
 
   let srcFact;
   if (d && d.lastResultAt) srcFact = d.lastOk ? ["來源", "✓ " + (d.lastCount != null ? d.lastCount : 0) + " 台 · " + relativeTime(d.lastResultAt, nowMs), "ok"] : ["來源", "✕ 載入失敗 · " + relativeTime(d.lastResultAt, nowMs), "bad"];
   else srcFact = ["來源", "未回報", "mute"];
+  const ph = playHealth(d, nowMs);
+  const phFact = ["播放", ph.level === "unknown" ? "未回報（舊版 App）" : ph.text + (d && d.peAt && ph.level !== "unknown" ? " · " + relativeTime(d.peAt, nowMs) : ""), ph.level === "bad" ? "bad" : ph.level === "warn" ? "warn" : ph.level === "ok" ? "ok" : "mute"];
 
   const facts = [
     ["授權", authText, authActive ? "ok" : dExpired || (config.requireActivation && !authed) ? "bad" : "mute"],
     srcFact,
+    phFact,
     ["最後上線", (relativeTime(d && d.lastSeen, nowMs) || "-") + "（" + stateText + "）", state === "online" ? "ok" : "mute"],
     ["版本", ver ? ver + (isOld ? " ↑可更新" : "") : "-", isOld ? "warn" : "mute"],
     ["機型", model || "-", "mute"],
@@ -531,7 +634,7 @@ export function renderDeviceCard(d, config, latestVer, nowMs) {
     ["開機自啟", autostartText, "mute"],
     ["IP", d && d.ip ? d.ip : "-", "mute"],
     ["首次上線", d && d.firstSeen ? formatTaipeiFull(d.firstSeen) : "-", "mute"],
-    ["回報次數", (d && d.count != null ? d.count : 0) + " 次", "mute"],
+    ["回報次數", (d && d.count != null ? d.count : 0) + " 次" + (d && typeof d.up === "number" ? " · App 已開 " + fmtUptime(d.up) : ""), "mute"],
   ];
   const factsHtml = facts.map((f) => `<div class="fact"><span class="fk">${f[0]}</span><span class="fv ${f[2]}">${esc(f[1])}</span></div>`).join("");
 
@@ -588,6 +691,7 @@ export function renderDeviceCard(d, config, latestVer, nowMs) {
       </form>
       <div class="btn-row" style="gap:8px">
         <form class="row-form" method="POST" action="/admin/device"><input type="hidden" name="id" value="${idAttr}"><input type="hidden" name="action" value="autostart"><input type="hidden" name="value" value="${autostartOn ? "off" : "on"}"><button class="btn-mini">開機自啟：改為${autostartOn ? "關" : "開"}</button></form>
+        <form class="row-form" method="POST" action="/admin/device"><input type="hidden" name="id" value="${idAttr}"><input type="hidden" name="action" value="watch"><input type="hidden" name="value" value="${d && d.watch === true ? "off" : "on"}"><button class="btn-mini${d && d.watch === true ? "" : " btn-info"}" title="離線超過門檻（警示分頁可調）就 Telegram 通知">${d && d.watch === true ? "🔕 取消重點監控" : "🔔 設為重點監控"}</button></form>
       </div>
       <div class="sect">名稱與紀錄</div>
       <form class="row-form wide" method="POST" action="/admin/device">
@@ -619,6 +723,90 @@ function devForm(idAttr, action, label, kind, confirmText, value) {
         <input type="hidden" name="id" value="${idAttr}"><input type="hidden" name="action" value="${action}">${value != null ? `<input type="hidden" name="value" value="${esc(value)}">` : ""}
         <button class="btn-mini${cls}">${label}</button>
       </form>`;
+}
+
+/** App 已運行時間（分鐘 → 人話） */
+function fmtUptime(min) {
+  const m = Math.max(0, parseInt(min, 10) || 0);
+  if (m < 60) return m + " 分鐘";
+  if (m < 1440) return Math.floor(m / 60) + " 小時" + (m % 60 ? " " + (m % 60) + " 分" : "");
+  return Math.floor(m / 1440) + " 天" + (Math.floor((m % 1440) / 60) ? " " + Math.floor((m % 1440) / 60) + " 小時" : "");
+}
+
+/* ================================================================
+ *  警示（Telegram）
+ * ================================================================ */
+
+export function renderAlertsPanel(ctx) {
+  const { config, devices, mon } = ctx;
+  const nowMs = Date.now();
+  const devList = Array.isArray(devices) ? devices : [];
+  const ready = telegramReady(config);
+  const hasToken = isValidTgToken(config.tgBotToken);
+  const watched = devList.filter((d) => d && d.watch === true);
+  const sw = (id, label, hint, checked) => `
+      <div class="switch-row" onclick="var c=this.querySelector('input');if(event.target!==c)c.checked=!c.checked;">
+        <input type="checkbox" id="${id}" name="${id}" ${checked ? "checked" : ""}>
+        <label for="${id}">${label}<span class="hint">${hint}</span></label>
+      </div>`;
+  const statusBanner = ready
+    ? `<div class="banner on"><span class="bi">🔔</span><div>Telegram 警示 <b>已啟用</b>：直播源異常超過 ${esc(config.alertSourceMin)} 分鐘、恢復、重點盒子離線超過 ${esc(config.alertDeviceOfflineMin)} 分鐘${config.alertBoxFail !== false ? "、盒子載入頻道失敗" : ""}都會通知${config.alertQuiet ? "；靜音時段 " + esc(config.alertQuiet) + " 時" : ""}。</div></div>`
+    : `<div class="banner warn"><span class="bi">🔕</span><div>Telegram 警示 <b>尚未啟用</b>。監控每 5 分鐘照樣在跑、事件會記在下方，但不會有人收到通知。照下面三步接上 Telegram，直播源出事你會第一個知道，不必等長輩打電話來。</div></div>`;
+
+  return `
+    <div class="block">
+      <div class="block-head"><span class="block-title"><span class="ic">🔔</span>警示通知（Telegram）</span>${mon && mon.lastTick ? `<span class="count-pill">監控最近寫入 ${esc(relativeTime(new Date(mon.lastTick).toISOString(), nowMs))}</span>` : `<span class="count-pill">監控尚未執行</span>`}</div>
+      ${statusBanner}
+      <details class="howto" ${hasToken ? "" : "open"}>
+        <summary>怎麼拿 Bot Token 和 Chat ID？（3 步，約 2 分鐘）</summary>
+        <ol class="steps">
+          <li>在 Telegram 搜尋 <b>@BotFather</b> → 傳 <code>/newbot</code> → 照提示取名字 → 會給你一串 <b>Token</b>（像 <code>123456789:AAxxxxxxxx</code>），貼到下面。</li>
+          <li>搜尋你剛建的機器人，按 <b>Start</b> 跟它說一句話（機器人不能主動先找你）。想發到家人群組就把機器人加進群組、在群組說一句。</li>
+          <li>搜尋 <b>@userinfobot</b> 按 Start，它會回你的 <b>Chat ID</b>（數字）；群組的話把 @userinfobot 加進群組也會回群組 ID（負數）。貼到下面 → 按「測試發送」→ 手機收到就成功。</li>
+        </ol>
+      </details>
+      <form method="POST" action="/admin/save" id="alertsForm">
+        <input type="hidden" name="_fields" value="alerts">
+        ${sw("alertsEnabled", "啟用 Telegram 警示", "關閉時仍會記錄事件，只是不發訊息", config.alertsEnabled)}
+        <label for="tgBotToken">Bot Token<span class="hint">${hasToken ? "已設定（為安全不顯示）。要換就貼新的；留空維持不變。" : "從 @BotFather 取得"}</span></label>
+        <input type="password" id="tgBotToken" name="tgBotToken" autocomplete="off" placeholder="${hasToken ? "已設定，留空不變" : "123456789:AAxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"}">
+        ${hasToken ? `<div class="switch-row" style="margin-top:8px" onclick="var c=this.querySelector('input');if(event.target!==c)c.checked=!c.checked;"><input type="checkbox" id="clearTg" name="clearTg"><label for="clearTg">清除已儲存的 Token</label></div>` : ""}
+        <label for="tgChatId">Chat ID<span class="hint">個人是正數，群組是負數（例如 -1001234567890）</span></label>
+        <input type="text" id="tgChatId" name="tgChatId" inputmode="numeric" value="${esc(config.tgChatId || "")}" placeholder="123456789">
+        <div class="row2">
+          <div><label for="alertSourceMin">直播源異常幾分鐘才通知<span class="hint">看門狗 5～15 分內多半自己修好，建議 10</span></label><input type="number" id="alertSourceMin" name="alertSourceMin" min="5" max="120" value="${esc(config.alertSourceMin || 10)}"></div>
+          <div><label for="alertDeviceOfflineMin">重點盒子離線幾分鐘才通知<span class="hint">長輩會關電視，別設太短；建議 180</span></label><input type="number" id="alertDeviceOfflineMin" name="alertDeviceOfflineMin" min="30" max="1440" value="${esc(config.alertDeviceOfflineMin || 180)}"></div>
+        </div>
+        <label for="alertQuiet">靜音時段（選填）<span class="hint">台灣時間「起-迄」小時，例如 23-7；此時段不發訊息只記錄</span></label>
+        <input type="text" id="alertQuiet" name="alertQuiet" value="${esc(config.alertQuiet || "")}" placeholder="例如 23-7">
+        ${sw("alertBoxFail", "盒子回報「載入頻道失敗」時通知", "每台每小時最多一則", config.alertBoxFail !== false)}
+        <div class="btn-row">
+          <button type="submit" class="btn btn-primary">💾 儲存警示設定</button>
+          <button type="submit" class="btn btn-secondary" formaction="/admin/alerts" name="action" value="test">📨 測試發送</button>
+        </div>
+      </form>
+    </div>
+
+    <div class="block">
+      <div class="block-head"><span class="block-title"><span class="ic">🩺</span>直播源 24 小時健康</span>
+        <form method="POST" action="/admin/alerts" style="margin:0"><input type="hidden" name="action" value="run"><button class="btn-mini btn-info">▶ 立即檢查一次</button></form></div>
+      ${renderHistoryStrip(mon, nowMs)}
+    </div>
+
+    <div class="block">
+      <div class="block-head"><span class="block-title"><span class="ic">📌</span>重點監控的盒子</span><span class="count-pill">${watched.length} 台</span></div>
+      <div class="block-sub">在「裝置」分頁每台卡片的「更多操作 → 設為重點監控」加入。離線超過門檻通知、回來也通知；沒設的盒子關機不會吵你。</div>
+      ${watched.length ? `<div class="now-list">${watched.map((d) => {
+        const st = onlineState(d, nowMs);
+        return `<div class="now-row"><span class="sdot ${st}"></span><span class="nm">${esc(d.nick || d.id)}</span><span class="ch" style="color:var(--text-dim)">${esc(st === "online" ? "線上" : "離線 · 最後 " + relativeTime(d.lastSeen, nowMs))}</span><span class="tm">${d.now ? esc(d.now) : ""}</span></div>`;
+      }).join("")}</div>` : `<div class="empty">尚未指定重點監控的盒子</div>`}
+    </div>
+
+    <div class="block">
+      <div class="block-head"><span class="block-title"><span class="ic">🗒️</span>警示紀錄</span>
+        ${mon && mon.log && mon.log.length ? `<form method="POST" action="/admin/alerts" data-confirm="清除全部警示紀錄？" style="margin:0"><input type="hidden" name="action" value="clear_log"><button class="btn-mini">清除</button></form>` : ""}</div>
+      ${renderAlertRows(mon && mon.log, nowMs, 40)}
+    </div>`;
 }
 
 /* ================================================================
@@ -687,7 +875,8 @@ export function renderNoticePanel(ctx) {
  * ================================================================ */
 
 export function renderSystemPanel(ctx) {
-  const { config, ota, hasGithubToken, origin } = ctx;
+  const { config, ota, hasGithubToken, origin, audit, hist } = ctx;
+  const nowMs = Date.now();
   const fsOptions = FONT_SCALE_OPTIONS.map(([v, l]) => `<option value="${v}"${config.fontScale === v ? " selected" : ""}>${l}</option>`).join("");
   const sw = (id, label, hint, checked) => `
       <div class="switch-row" onclick="var c=this.querySelector('input');if(event.target!==c)c.checked=!c.checked;">
@@ -708,6 +897,18 @@ export function renderSystemPanel(ctx) {
         <div class="item full"><div class="k">更新說明</div><div class="v" style="font-weight:500;font-size:13.5px;white-space:pre-wrap">${esc((ota.notes || "").slice(0, 600)) || "（無）"}</div></div>
       </div>`;
   }
+  const histList = Array.isArray(hist) ? hist : [];
+  const histRows = histList.length
+    ? histList.map((h, i) => {
+        const next = i === 0 ? config : histList[i - 1];   // 這份被「下一份」取代時改了什麼
+        const changed = diffConfigKeys(h, next).map(configLabel);
+        return `<div class="hist-row"><div class="hist-meta"><b>v${esc(h.version != null ? h.version : "?")}</b><span>${esc(formatTaipeiFull(h.updatedAt))}（${esc(relativeTime(h.updatedAt, nowMs))}）</span></div><div class="hist-diff">${changed.length ? "之後改了：" + esc(changed.join("、")) : "與後一版相同"}</div><div class="hist-src mono">${esc(h.subscriptionUrl ? h.subscriptionUrl.slice(0, 90) + (h.subscriptionUrl.length > 90 ? "…" : "") : "（無直播源）")}</div><form method="POST" action="/admin/system" data-confirm="把設定還原成 v${esc(h.version)} 的內容？（會另存成新版本，可再還原回來）"><input type="hidden" name="action" value="restore_config"><input type="hidden" name="idx" value="${i}"><button class="btn-mini btn-gold">↩ 還原成這版</button></form></div>`;
+      }).join("")
+    : `<div class="empty">尚無歷史（每次儲存設定會自動留一份，最多 12 份）</div>`;
+  const auditList = Array.isArray(audit) ? audit : [];
+  const auditRows = auditList.length
+    ? `<div class="audit">${auditList.slice(0, 40).map((a) => `<div class="audit-row"><span class="at">${esc(formatTaipeiFull(a.at))}</span><span class="what">${esc(a.what)}</span><span class="ip mono">${esc(a.ip || "")}</span></div>`).join("")}</div>`
+    : `<div class="empty">尚無操作紀錄</div>`;
   return `
     <form class="block" method="POST" action="/admin/save">
       <input type="hidden" name="_fields" value="system">
@@ -730,6 +931,36 @@ export function renderSystemPanel(ctx) {
     </div>
 
     <div class="block">
+      <div class="block-head"><span class="block-title"><span class="ic">🕘</span>設定版本歷史</span><span class="count-pill">目前 v${esc(config.version)} · 歷史 ${histList.length} 份</span></div>
+      <div class="block-sub">改錯直播源、誤刪公告都能一鍵退回。還原會另存成新版本（不會覆蓋歷史），盒子下次輪詢套用。</div>
+      <div class="hist-list">${histRows}</div>
+    </div>
+
+    <div class="block">
+      <div class="block-head"><span class="block-title"><span class="ic">💾</span>備份與搬家</span></div>
+      <div class="block-sub">匯出目前設定成 JSON（含直播源、公告、授權設定、警示設定），換 Worker 或重建時匯入即可，不必重填。裝置與啟動碼另有 CSV 匯出。</div>
+      <div class="btn-row">
+        <a class="btn btn-secondary" href="/admin/export?what=config" style="text-decoration:none">⬇️ 匯出設定 JSON</a>
+        <a class="btn btn-secondary" href="/admin/export?what=devices" style="text-decoration:none">⬇️ 裝置 CSV</a>
+        <a class="btn btn-secondary" href="/admin/export?what=codes" style="text-decoration:none">⬇️ 啟動碼 CSV</a>
+      </div>
+      <form method="POST" action="/admin/upload" enctype="multipart/form-data" style="margin-top:12px" data-reset data-confirm="匯入會覆蓋目前設定（舊設定會留在版本歷史，可還原）。確定？">
+        <input type="hidden" name="action" value="import_config">
+        <label>匯入設定 JSON<span class="hint">只接受本頁匯出的檔案格式</span></label>
+        <input type="file" name="file" accept="application/json,.json" class="file-input" required>
+        <button type="submit" class="btn btn-secondary">⬆️ 匯入並套用</button>
+      </form>
+    </div>
+
+    <div class="block">
+      <div class="block-head"><span class="block-title"><span class="ic">📜</span>操作紀錄</span>
+        <span class="count-pill">最近 ${Math.min(40, auditList.length)} 筆</span></div>
+      <div class="block-sub">誰在什麼時候改了什麼（IP 為管理者連線位置），出問題時可以回頭對照。</div>
+      ${auditRows}
+      ${auditList.length ? `<form method="POST" action="/admin/system" data-confirm="清除全部操作紀錄？" style="margin-top:10px"><input type="hidden" name="action" value="clear_audit"><button class="btn-mini">清除紀錄</button></form>` : ""}
+    </div>
+
+    <div class="block">
       <div class="block-head"><span class="block-title"><span class="ic">🔗</span>端點</span></div>
       <div class="kv">
         <div class="item full"><div class="k">盒子設定端點（App 內建）</div><div class="v mono">${esc(origin)}/api/config</div></div>
@@ -738,7 +969,7 @@ export function renderSystemPanel(ctx) {
         <div class="item"><div class="k">OTA 查詢</div><div class="v mono">${esc(origin)}/api/update</div></div>
         <div class="item"><div class="k">APK 下載</div><div class="v mono">${esc(origin)}/dl/latest.apk</div></div>
       </div>
-      <div class="inline-note">KV 寫入節流：盒子心跳沒有變化時最多每 10 分鐘寫一次，免費方案每日 1000 次寫入也夠用。</div>
+      <div class="inline-note">KV 寫入節流：盒子心跳沒有變化時最多每 10 分鐘寫一次；監控每 15 分鐘寫一次歷史。免費方案每日 1000 次寫入也夠用。</div>
     </div>`;
 }
 
