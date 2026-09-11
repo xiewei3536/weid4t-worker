@@ -25,7 +25,7 @@ export const CFG_HIST_KEY = "cfghist";
 export const CFG_HIST_MAX = 12;
 
 /** 程式版本（/api/health 回傳，部署後用來確認新版已生效） */
-export const BUILD = "2.2.0";
+export const BUILD = "2.2.1";
 
 /** 管理密碼猜錯限速：同一 IP 每 10 分鐘最多幾次 */
 export const ADMIN_RL_MAX = 20;

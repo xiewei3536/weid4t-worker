@@ -28,7 +28,8 @@ const LOG_MAX = 40;
 
 export const REASON_TEXT = {
   vpn: "VPN 出口斷線",
-  api_blocked: "4gtv 封鎖了目前出口 IP（API 回 400）",
+  api_blocked: "4gtv 封鎖了目前出口 IP（API 回 400 或官網 403）",
+  web_key: "4gtv 更換了官網播放器金鑰，需更新 keystream.bin（換節點無效）",
   stale: "快取的播放網址失效",
   upstream: "上游 4gtv 不通",
   auth: "NordVPN 帳密錯誤或到期（AUTH_FAILED）",
