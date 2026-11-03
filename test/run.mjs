@@ -835,6 +835,702 @@ await test("2.2：公告 / 跑馬燈只改文字時留空維持原到期", async
   assert.match(p.text, /維持原到期/);
 });
 
+/* ───────────────────────── 2.3：備援線路 / 家用備援 / ln / 看門狗新代碼 ───────────────────────── */
+
+const lib = await import("../src/lib.js");
+const monitor = await import("../src/monitor.js");
+const MAIN = "http://1.2.3.4:5050/channel?type=m3u&token=MAINTOKEN0001";
+const BACKUP = "http://5.6.7.8:5050/channel?type=m3u&token=BACKUPTOKEN99";
+const HOME_KEY = "TestHomeKey_0123456789abcdefABCDEF";
+const HP_BODY = { lanUrl: "http://192.168.31.100:5050", version: "2.3.0", channels: 118, healthy: true };
+
+/** 家用代理登記（JSON 本文；key 選用）。注意：同一 IP 每分鐘最多 6 次，各測試用不同 IP */
+function homeReg(env, body, opts) {
+  opts = opts || {};
+  const headers = { "Content-Type": "application/json" };
+  if (opts.key) headers["X-Home-Key"] = opts.key;
+  return call(env, "/api/home-proxy", { method: "POST", body: typeof body === "string" ? body : JSON.stringify(body), headers, ip: opts.ip });
+}
+
+/** 在 ip 這個家放一台盒子（心跳一次）；authorize !== false 時再由管理員授權 */
+async function homeBox(env, id, ip, authorize) {
+  await call(env, `/api/config?id=${id}&m=Box&v=1.0.0.30`, { ip });
+  if (authorize !== false) await call(env, "/admin/device", { method: "POST", body: { id, action: "authorize", value: "0" } });
+}
+
+/** 依主機回 status.json：函式回物件 = 看門狗 JSON、null = 404、數字 = 該 HTTP 狀態、"throw" = 連線失敗；Telegram 一併 mock */
+function statusMock(tg, byHost, realFetch) {
+  return async (url, init) => {
+    const u = String(url);
+    if (u.startsWith("https://api.telegram.org/bot")) {
+      tg.push(JSON.parse(init.body).text);
+      return new Response(JSON.stringify({ ok: true }), { headers: { "Content-Type": "application/json" } });
+    }
+    const m = /^https?:\/\/([^/]+)\/status\.json/.exec(u);
+    if (m) {
+      const f = byHost[m[1]];
+      const s = f ? f(u) : null;
+      if (s === "throw") throw new TypeError("fetch failed");
+      if (typeof s === "number") return new Response("err", { status: s });
+      return s ? new Response(JSON.stringify(s), { headers: { "Content-Type": "application/json" } }) : new Response("nf", { status: 404 });
+    }
+    return realFetch(url, init);
+  };
+}
+
+await test("2.3：/api/health 回報 build 2.3.0", async () => {
+  const h = (await call(makeEnv(), "/api/health")).json;
+  assert.equal(h.build, "2.3.0");
+});
+
+await test("2.3：備援直播源 — 驗證、儲存、下發條件、舊表單不清掉、操作紀錄與歷史遮罩 token、直播源分頁兩顆測試鈕", async () => {
+  const env = makeEnv({ config: { version: 1, subscriptionUrl: MAIN } });
+  let r = await call(env, "/admin/save", { method: "POST", body: { _fields: "source", subscriptionUrl: MAIN, backupSubscriptionUrl: "ftp://x" } });
+  assert.equal(r.status, 400);
+  assert.match(r.json.message, /備援訂閱網址格式不正確/);
+  r = await call(env, "/admin/save", { method: "POST", body: { _fields: "source", subscriptionUrl: MAIN, backupSubscriptionUrl: MAIN } });
+  assert.equal(r.json.ok, false, "跟主線路一樣要擋");
+  r = await call(env, "/admin/save", { method: "POST", body: { _fields: "source", subscriptionUrl: MAIN, backupSubscriptionUrl: "http://b/" + "x".repeat(2000) } });
+  assert.equal(r.json.ok, false);
+  assert.match(r.json.message, /太長/);
+  assert.equal((await env.CONFIG_KV.get("config", { type: "json" })).version, 1, "被擋的不存");
+  r = await call(env, "/admin/save", { method: "POST", body: { _fields: "source", subscriptionUrl: MAIN, backupSubscriptionUrl: "  " + BACKUP + "  " } });
+  assert.equal(r.json.ok, true, r.text);
+  assert.ok(r.json.refresh.includes("home"));
+  assert.equal((await env.CONFIG_KV.get("config", { type: "json" })).backupSubscriptionUrl, BACKUP, "前後空白去掉");
+  let c = (await call(env, "/api/config?id=tv-1", { ip: "70.0.0.1" })).json;
+  assert.equal(c.subscriptionUrl, MAIN);
+  assert.equal(c.backupSubscriptionUrl, BACKUP);
+  assert.equal(c.homeProxy, "");
+  assert.equal((await call(env, "/api/config")).json.backupSubscriptionUrl, "", "沒帶 id 不給");
+  await call(env, "/admin/device", { method: "POST", body: { id: "tv-1", action: "block" } });
+  assert.equal((await call(env, "/api/config?id=tv-1", { ip: "70.0.0.1" })).json.backupSubscriptionUrl, "", "封鎖不給");
+  await call(env, "/admin/save", { method: "POST", body: { _fields: "auth", requireActivation: "on", codeDigits: "8" } });
+  c = (await call(env, "/api/config?id=tv-2", { ip: "70.0.0.2" })).json;
+  assert.equal(c.authorized, false);
+  assert.equal(c.backupSubscriptionUrl, "", "未授權不給");
+  // 舊版管理頁的表單沒有備援欄位 → 維持原值
+  r = await call(env, "/admin/save", { method: "POST", body: { _fields: "source", subscriptionUrl: MAIN + "2" } });
+  assert.equal(r.json.ok, true);
+  assert.equal((await env.CONFIG_KV.get("config", { type: "json" })).backupSubscriptionUrl, BACKUP);
+  let audit = await env.CONFIG_KV.get("audit", { type: "json" });
+  const setAudit = audit.find((a) => /；備援 /.test(a.what));
+  assert.ok(setAudit, JSON.stringify(audit));
+  assert.ok(!setAudit.what.includes("BACKUPTOKEN99"), "操作紀錄不可有完整 token");
+  assert.match(setAudit.what, /token=BACK…EN99/);
+  // 清空 = 停用備援
+  r = await call(env, "/admin/save", { method: "POST", body: { _fields: "source", subscriptionUrl: MAIN, backupSubscriptionUrl: "" } });
+  assert.equal(r.json.ok, true);
+  assert.equal((await env.CONFIG_KV.get("config", { type: "json" })).backupSubscriptionUrl, "");
+  audit = await env.CONFIG_KV.get("audit", { type: "json" });
+  assert.match(audit[0].what, /備援已移除/);
+  const s = await call(env, "/admin/partial?name=system");
+  assert.match(s.text, /備援 http:\/\/5\.6\.7\.8:5050/, "版本歷史列出備援網址（遮罩）");
+  assert.ok(!s.text.includes("BACKUPTOKEN99"));
+  const src = await call(env, "/admin/partial?name=source");
+  assert.match(src.text, /id="backupSubscriptionUrl"/);
+  assert.match(src.text, /testSource\('backup'\)/);
+  assert.match(src.text, /id="testResultBackup"/);
+  assert.match(src.text, /同名頻道合併多線路/);
+});
+
+await test("2.3：匯出 / 匯入 / 還原 — 備援網址驗證；家用金鑰格式對才套用；還原舊版不換金鑰", async () => {
+  const env = makeEnv({ config: { version: 1, subscriptionUrl: MAIN, backupSubscriptionUrl: BACKUP, homeProxyKey: HOME_KEY } });
+  const ex = JSON.parse((await call(env, "/admin/export?what=config")).text);
+  assert.equal(ex.backupSubscriptionUrl, BACKUP);
+  const imp = (obj) => {
+    const fd = new FormData();
+    fd.append("action", "import_config");
+    fd.append("file", new Blob([JSON.stringify(obj)], { type: "application/json" }), "cfg.json");
+    return call(env, "/admin/upload", { method: "POST", body: fd });
+  };
+  let r = await imp({ ...ex, backupSubscriptionUrl: "javascript:alert(1)" });
+  assert.equal(r.json.ok, false);
+  assert.match(r.json.message, /匯入的備援訂閱網址格式不正確/);
+  r = await imp({ ...ex, backupSubscriptionUrl: "http://c/9", homeProxyKey: "短", homeProxyRole: "weird" });
+  assert.equal(r.json.ok, true, r.text);
+  let cfg = await env.CONFIG_KV.get("config", { type: "json" });
+  assert.equal(cfg.backupSubscriptionUrl, "http://c/9");
+  assert.equal(cfg.homeProxyKey, HOME_KEY, "格式不對的金鑰不套用");
+  assert.equal(cfg.homeProxyRole, "backup", "不認得的角色回預設");
+  const newKey = lib.genHomeKey();
+  r = await imp({ ...ex, homeProxyKey: newKey, homeProxyRole: "primary" });
+  assert.equal(r.json.ok, true);
+  cfg = await env.CONFIG_KV.get("config", { type: "json" });
+  assert.equal(cfg.homeProxyKey, newKey, "搬家可沿用舊金鑰");
+  assert.equal(cfg.homeProxyRole, "primary");
+  r = await call(env, "/admin/system", { method: "POST", body: { action: "restore_config", idx: "1" } });
+  assert.equal(r.json.ok, true, r.text);
+  cfg = await env.CONFIG_KV.get("config", { type: "json" });
+  assert.equal(cfg.backupSubscriptionUrl, BACKUP, "還原成 v1 的備援網址");
+  assert.equal(cfg.homeProxyRole, "backup");
+  assert.equal(cfg.homeProxyKey, newKey, "金鑰是憑證，還原不換");
+});
+
+await test("2.3：監控兩條線路 — 主壞備好較不緊急、備援也壞升級成一則緊急；恢復分開通知；備援自己壞是低優先；舊 mon:state 相容", async () => {
+  const env = makeEnv({
+    config: { version: 1, subscriptionUrl: MAIN, backupSubscriptionUrl: BACKUP, alertsEnabled: true, tgBotToken: TOK, tgChatId: "9", alertSourceMin: 10 },
+    // 2.2 版寫的 mon:state（沒有 bsrc）
+    "mon:state": { v: 1, lastTick: 1, lastWrite: 1, src: { state: "ok", since: 1, downSince: 0, alerted: false, ip: "1.1.1.1", reason: "", fails: 0, lastAction: "" }, dev: {}, hist: [], log: [] },
+  });
+  const realFetch = globalThis.fetch;
+  const tg = [];
+  let T = Date.parse("2026-09-10T04:00:00Z");
+  let main = { healthy: true, consecutive_failures: 0, public_ip: "1.1.1.1" };
+  let bk = { healthy: true, consecutive_failures: 0, public_ip: "2.2.2.2" };
+  globalThis.fetch = statusMock(tg, {
+    "1.2.3.4:5050": () => ({ ...main, checked_at_ms: T - 30000 }),
+    "5.6.7.8:5050": () => (typeof bk === "object" ? { ...bk, checked_at_ms: T - 30000 } : bk),
+  }, realFetch);
+  try {
+    let r = await monitor.runMonitorTick(env, T);
+    assert.equal(r.state, "ok");
+    assert.equal(r.bstate, "ok");
+    assert.equal(r.st.bsrc.state, "ok", "舊資料補上備援線路狀態機");
+    main = { healthy: false, consecutive_failures: 2, reason: "vpn", public_ip: "1.1.1.1", last_action: "restart_4gtv_reconnect" };
+    T += 5 * 60000; await monitor.runMonitorTick(env, T);
+    T += 5 * 60000; await monitor.runMonitorTick(env, T);
+    T += 5 * 60000; r = await monitor.runMonitorTick(env, T);
+    assert.equal(tg.length, 1, JSON.stringify(tg));
+    assert.equal(r.events[0].kind, "src_down_bk");
+    assert.match(tg[0], /主線路異常/);
+    assert.match(tg[0], /較不緊急/);
+    assert.match(tg[0], /盒子會自動改用備援線路/);
+    assert.match(tg[0], /VPN 重連，清快取重啟/);
+    bk = { healthy: false, consecutive_failures: 3, reason: "auth", public_ip: "2.2.2.2" };
+    T += 5 * 60000; await monitor.runMonitorTick(env, T);
+    assert.equal(tg.length, 1, "備援剛壞不吵");
+    T += 5 * 60000; await monitor.runMonitorTick(env, T);
+    T += 5 * 60000; r = await monitor.runMonitorTick(env, T);
+    assert.equal(tg.length, 2, JSON.stringify(tg));
+    assert.equal(r.events[0].kind, "both_down");
+    assert.match(tg[1], /主線路與備援線路都異常/);
+    assert.match(tg[1], /緊急/);
+    assert.match(tg[1], /NordVPN 帳密錯誤/);
+    T += 5 * 60000; await monitor.runMonitorTick(env, T);
+    assert.equal(tg.length, 2, "持續都壞不重複");
+    main = { healthy: true, consecutive_failures: 0, public_ip: "1.1.1.1" };
+    T += 5 * 60000; await monitor.runMonitorTick(env, T);
+    assert.equal(tg.length, 3, "主線路恢復一則；備援已在緊急通知裡講過，不另發異常");
+    assert.match(tg[2], /直播源已恢復/);
+    bk = { healthy: true, consecutive_failures: 0, public_ip: "2.2.2.2" };
+    T += 5 * 60000; await monitor.runMonitorTick(env, T);
+    assert.equal(tg.length, 4);
+    assert.match(tg[3], /備援線路已恢復/);
+    bk = 500;
+    T += 5 * 60000; await monitor.runMonitorTick(env, T);
+    T += 10 * 60000; r = await monitor.runMonitorTick(env, T);
+    assert.equal(r.bstate, "stale", "5xx = 連不上主機");
+    assert.equal(tg.length, 5, JSON.stringify(tg));
+    assert.equal(r.events[0].kind, "bsrc_down");
+    assert.match(tg[4], /備援線路異常/);
+    assert.match(tg[4], /不影響觀看/);
+    assert.match(tg[4], /連不上主機（HTTP 500）/);
+    const a = await call(env, "/admin/partial?name=alerts");
+    assert.match(a.text, /主備線路都異常/);
+    assert.match(a.text, /主線路異常（有備援）/);
+    const cfg = await env.CONFIG_KV.get("config", { type: "json" });
+    await env.CONFIG_KV.put("config", JSON.stringify({ ...cfg, backupSubscriptionUrl: "" }));
+    T += 5 * 60000; r = await monitor.runMonitorTick(env, T);
+    assert.equal(r.bstate, "off");
+    assert.equal(r.st.bsrc.state, "off", "拿掉備援線路 → 狀態歸零");
+    assert.equal(r.st.bsrc.alerted, false);
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+});
+
+await test("2.3：監控 — 兩條同時壞只發一則緊急；看門狗主機連不上算「沒回報」（不再當第三方源默不作聲）", async () => {
+  const env = makeEnv({ config: { version: 1, subscriptionUrl: MAIN, backupSubscriptionUrl: BACKUP, alertsEnabled: true, tgBotToken: TOK, tgChatId: "9", alertSourceMin: 10 } });
+  const realFetch = globalThis.fetch;
+  const tg = [];
+  let T = Date.parse("2026-09-11T04:00:00Z");
+  globalThis.fetch = statusMock(tg, {
+    "1.2.3.4:5050": () => "throw",
+    "5.6.7.8:5050": () => ({ healthy: false, consecutive_failures: 4, reason: "web_key", public_ip: "2.2.2.2", checked_at_ms: T - 30000 }),
+  }, realFetch);
+  try {
+    let r = await monitor.runMonitorTick(env, T);
+    assert.equal(r.state, "stale", "連不上主機 = 沒回報");
+    assert.equal(r.bstate, "bad");
+    T += 5 * 60000; await monitor.runMonitorTick(env, T);
+    T += 5 * 60000; r = await monitor.runMonitorTick(env, T);
+    assert.equal(tg.length, 1, JSON.stringify(tg));
+    assert.equal(r.events.length, 1);
+    assert.equal(r.events[0].kind, "both_down");
+    assert.match(tg[0], /連不上主機（連線失敗）/);
+    assert.match(tg[0], /keystream/);
+    T += 5 * 60000; await monitor.runMonitorTick(env, T);
+    assert.equal(tg.length, 1);
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+  // 沒設備援、VPS 整台連不上 → 以前被當成「第三方源」不通知，現在會發「沒回報」
+  const env2 = makeEnv({ config: { version: 1, subscriptionUrl: MAIN, alertsEnabled: true, tgBotToken: TOK, tgChatId: "9", alertSourceMin: 10 } });
+  const tg2 = [];
+  globalThis.fetch = statusMock(tg2, { "1.2.3.4:5050": () => 502 }, realFetch);
+  try {
+    T = Date.parse("2026-09-11T08:00:00Z");
+    await monitor.runMonitorTick(env2, T);
+    T += 10 * 60000; await monitor.runMonitorTick(env2, T);
+    assert.equal(tg2.length, 1, JSON.stringify(tg2));
+    assert.match(tg2[0], /沒回報/);
+    assert.match(tg2[0], /連不上主機：HTTP 502/);
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+});
+
+await test("2.3：監控 — 主線路壞、沒設備援但家用備援在線 → 較不緊急，並說明其他地點仍受影響", async () => {
+  const env = makeEnv({ config: { version: 1, subscriptionUrl: MAIN, alertsEnabled: true, tgBotToken: TOK, tgChatId: "9", alertSourceMin: 10 } });
+  const realFetch = globalThis.fetch;
+  const tg = [];
+  let T = Date.parse("2026-09-12T04:00:00Z");
+  await env.CONFIG_KV.put("homeproxy", JSON.stringify({ lanUrl: "http://192.168.31.100:5050", publicIp: "61.9.9.9", version: "2.3.0", channels: 118, healthy: true, lastSeen: new Date(T).toISOString(), via: "box", boxId: "tv-h" }));
+  globalThis.fetch = statusMock(tg, { "1.2.3.4:5050": () => ({ healthy: false, consecutive_failures: 3, reason: "upstream", checked_at_ms: T - 30000 }) }, realFetch);
+  try {
+    await monitor.runMonitorTick(env, T);
+    T += 10 * 60000;
+    const r = await monitor.runMonitorTick(env, T);
+    assert.equal(tg.length, 1, JSON.stringify(tg));
+    assert.equal(r.events[0].kind, "src_down_bk");
+    assert.match(tg[0], /家用備援在線/);
+    assert.match(tg[0], /其他地點的盒子仍會受影響/);
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+});
+
+await test("2.3：看門狗新處置代碼與原因白話；status.json 的 self_heal → 「代理自動修復 N 次」", async () => {
+  assert.equal(lib.actionText("restart_4gtv_reconnect"), "VPN 重連，清快取重啟");
+  assert.equal(lib.actionText("renew_nord_credentials"), "Nord 憑證失效，已自動換新");
+  for (const k of ["auth", "web_key", "vpn", "stale", "api_blocked", "nginx", "upstream"]) {
+    assert.ok(monitor.REASON_TEXT[k], "缺原因 " + k);
+    assert.equal(monitor.reasonText(k), monitor.REASON_TEXT[k]);
+  }
+  assert.match(monitor.selfHealText({ self_heal: { forced_reresolves: 3, session_resets: 2 } }), /^代理自動修復 5 次/);
+  assert.equal(monitor.selfHealText({ healthy: true }), "");
+  assert.equal(monitor.selfHealText({ self_heal: { other: 1 } }), "");
+  const env = makeEnv({ config: { version: 1, subscriptionUrl: MAIN } });
+  const realFetch = globalThis.fetch;
+  let withHeal = true;
+  globalThis.fetch = statusMock([], {
+    "1.2.3.4:5050": () => ({ healthy: true, consecutive_failures: 0, public_ip: "1.1.1.1", checked_at_ms: Date.now() - 60000, last_action: "renew_nord_credentials", ...(withHeal ? { self_heal: { forced_reresolves: 3, session_resets: 2 } } : {}) }),
+  }, realFetch);
+  try {
+    let o = await call(env, "/admin/partial?name=overview");
+    assert.match(o.text, /代理自動修復 5 次/);
+    assert.match(o.text, /Nord 憑證失效，已自動換新/);
+    withHeal = false;
+    o = await call(env, "/admin/partial?name=overview");
+    assert.ok(!o.text.includes("代理自動修復"), "沒有 self_heal 就不顯示");
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+});
+
+await test("2.3：心跳 ln（目前線路）— 存進 dev:、切換才寫且有節流；裝置卡 / 總覽 / 測試來源顯示", async () => {
+  const env = makeEnv({ config: { version: 1, subscriptionUrl: MAIN } });
+  const kv = env.CONFIG_KV;
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = async (url, init) => {
+    const u = String(url);
+    if (u.includes("/status.json")) return new Response("nf", { status: 404 });
+    if (u.startsWith("http://bk.test/")) return new Response("#EXTM3U\n#EXTINF:-1 group-title=\"新聞\",民視\nhttp://x/1.m3u8\n");
+    return realFetch(url, init);
+  };
+  try {
+    const q = "/api/config?id=tv-ln&m=Box&v=1.0.0.30&now=%E6%B0%91%E8%A6%96";
+    await call(env, q + "&ln=0", { ip: "70.1.1.1" });
+    assert.equal((await kv.get("dev:tv-ln", { type: "json" })).ln, 0);
+    let w = kv.writes;
+    await call(env, q + "&ln=0", { ip: "70.1.1.1" });
+    assert.equal(kv.writes, w, "沒換線路不寫");
+    await call(env, q + "&ln=1", { ip: "70.1.1.1" });
+    assert.equal(kv.writes, w + 1, "切到備援立刻寫");
+    let dev = await kv.get("dev:tv-ln", { type: "json" });
+    assert.equal(dev.ln, 1);
+    assert.ok(dev.lnAt);
+    w = kv.writes;
+    await call(env, q + "&ln=0", { ip: "70.1.1.1" });
+    await call(env, q + "&ln=1", { ip: "70.1.1.1" });
+    await call(env, q + "&ln=0", { ip: "70.1.1.1" });
+    assert.equal(kv.writes, w, "10 分鐘內來回切照 3 分鐘節流，不會每次都寫");
+    dev = await kv.get("dev:tv-ln", { type: "json" });
+    dev.lastWrite = new Date(Date.now() - 4 * 60000).toISOString();
+    await kv.put("dev:tv-ln", JSON.stringify(dev));
+    w = kv.writes;
+    await call(env, q + "&ln=0", { ip: "70.1.1.1" });
+    assert.equal(kv.writes, w + 1, "距上次寫入超過 3 分鐘的切換會寫");
+    assert.equal((await kv.get("dev:tv-ln", { type: "json" })).ln, 0);
+    await call(env, "/api/config?id=tv-bk&m=Box&v=1.0.0.30&now=%E4%B8%AD%E8%A6%96&ln=1", { ip: "70.1.1.2" });
+    assert.equal((await kv.get("dev:tv-bk", { type: "json" })).ln, 1);
+    const p = await call(env, "/admin/partial?name=devices");
+    assert.match(p.text, /備援線路中/);
+    assert.match(p.text, /data-backup="1"/);
+    assert.match(p.text, /<span class="fv ok">主線路<\/span>/);
+    assert.match(p.text, /走備援線路（1）/);
+    const o = await call(env, "/admin/partial?name=overview");
+    assert.match(o.text, /class="ph bk"/);
+    assert.match(o.text, /1 台盒子還在走備援線路/);
+    const t = await call(env, "/admin/test", { method: "POST", body: { subscriptionUrl: "http://bk.test/list.m3u" } });
+    assert.equal(t.json.ok, true, t.text);
+    assert.equal(t.json.channelCount, 1);
+    assert.equal(t.json.boxes.onBackup, 1, "測試來源附上目前走備援的盒子數");
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+});
+
+await test("2.3：家用代理登記（帶金鑰）— 錯金鑰 401 並計入防暴力、錯太多次 429；沒產生金鑰 401；lanUrl 只收私有 IPv4", async () => {
+  const good = {
+    "http://192.168.31.100:5050": "http://192.168.31.100:5050",
+    "http://10.0.0.5": "http://10.0.0.5",
+    "http://172.16.0.1:8080/": "http://172.16.0.1:8080",
+    "http://172.31.255.254:5050": "http://172.31.255.254:5050",
+    " http://192.168.001.002:5050 ": "http://192.168.1.2:5050",
+  };
+  for (const [u, want] of Object.entries(good)) assert.equal(lib.parseLanUrl(u), want, u);
+  for (const u of ["http://8.8.8.8:5050", "http://172.32.0.1", "http://172.15.0.1", "http://169.254.1.1", "http://127.0.0.1:5050", "https://192.168.1.2:5050",
+    "http://nas.local:5050", "http://192.168.1.2:5050/playlist.m3u", "http://192.168.1.256", "http://192.168.1.2:0", "http://192.168.1.2:70000", "http://user@192.168.1.2", "", null, 123]) {
+    assert.equal(lib.parseLanUrl(u), "", "應拒絕 " + u);
+  }
+  const env = makeEnv({ config: { version: 1, subscriptionUrl: MAIN, homeProxyKey: HOME_KEY } });
+  const kv = env.CONFIG_KV;
+  let w = kv.writes;
+  let r = await homeReg(env, HP_BODY, { key: "wrong-key-wrong-key-wrong", ip: "80.0.0.1" });
+  assert.equal(r.status, 401);
+  assert.equal(r.json.ok, false);
+  assert.equal(r.json.reason, "bad_key");
+  assert.equal(kv.writes, w + 1, "錯金鑰計入限速（rl:hpkey）");
+  assert.equal(await kv.get("rl:hpkey:80.0.0.1"), "1");
+  assert.equal(await kv.get("homeproxy"), null);
+  await kv.put("rl:hpkey:80.0.0.2", "20");
+  r = await homeReg(env, HP_BODY, { key: "wrong-key-wrong-key-wrong", ip: "80.0.0.2" });
+  assert.equal(r.status, 429);
+  assert.equal(r.json.reason, "key_locked");
+  assert.equal(r.headers.get("retry-after"), "600");
+  assert.equal(await kv.get("rl:adm:80.0.0.2"), null, "跟管理密碼限速分開計數");
+  r = await homeReg(env, HP_BODY, { key: HOME_KEY, ip: "80.0.0.3" });
+  assert.equal(r.status, 200, r.text);
+  assert.ok(Date.parse(r.json.lastSeen) > 0);
+  assert.deepEqual({ ...r.json, lastSeen: "" }, { ok: true, stored: true, via: "key", role: "backup", publicIp: "80.0.0.3", playlist: "http://192.168.31.100:5050/playlist.m3u", lastSeen: "" });
+  const rec = await kv.get("homeproxy", { type: "json" });
+  assert.equal(rec.lanUrl, "http://192.168.31.100:5050");
+  assert.equal(rec.publicIp, "80.0.0.3");
+  assert.equal(rec.version, "2.3.0");
+  assert.equal(rec.channels, 118);
+  assert.equal(rec.healthy, true);
+  assert.equal(rec.via, "key");
+  r = await homeReg(env, "not json", { key: HOME_KEY, ip: "80.0.0.3" });
+  assert.equal(r.status, 400);
+  assert.equal(r.json.reason, "bad_body");
+  for (const lanUrl of ["http://8.8.8.8:5050", "https://192.168.1.2:5050", "http://nas.local:5050"]) {
+    r = await homeReg(env, { ...HP_BODY, lanUrl }, { key: HOME_KEY, ip: "80.0.0.4" });
+    assert.equal(r.status, 400, lanUrl);
+    assert.equal(r.json.reason, "bad_lan_url");
+  }
+  assert.equal((await kv.get("homeproxy", { type: "json" })).lanUrl, "http://192.168.31.100:5050", "被拒的不會蓋掉紀錄");
+  // 管理中心沒有金鑰、請求卻帶了 → 401（沒東西可猜，不寫 KV）
+  const env2 = makeEnv({ config: { version: 1, subscriptionUrl: MAIN } });
+  const w2 = env2.CONFIG_KV.writes;
+  r = await homeReg(env2, HP_BODY, { key: HOME_KEY, ip: "80.0.0.5" });
+  assert.equal(r.status, 401);
+  assert.equal(r.json.reason, "no_key_configured");
+  assert.equal(env2.CONFIG_KV.writes, w2);
+});
+
+await test("2.3：家用代理登記（免金鑰）— 同 IP 有已授權盒子 → 200；沒有 → 403；未授權 / 封鎖 / 到期 / 超過 24 小時不算；403 不寫 KV", async () => {
+  let env = makeEnv({ config: { version: 1, subscriptionUrl: MAIN } });
+  let w = env.CONFIG_KV.writes;
+  let r = await homeReg(env, HP_BODY, { ip: "81.0.0.1" });
+  assert.equal(r.status, 403);
+  assert.equal(r.json.ok, false);
+  assert.equal(r.json.reason, "no_home_box");
+  assert.equal(r.json.publicIp, "81.0.0.1");
+  assert.match(r.json.error, /24 小時內沒有已授權的盒子/);
+  assert.equal(env.CONFIG_KV.writes, w, "403 不寫 KV");
+
+  env = makeEnv({ config: { version: 1, subscriptionUrl: MAIN } });
+  await homeBox(env, "tv-h1", "81.0.0.2");
+  r = await homeReg(env, HP_BODY, { ip: "81.0.0.2" });
+  assert.equal(r.status, 200, r.text);
+  assert.equal(r.json.via, "box");
+  assert.equal(r.json.stored, true);
+  const rec = await env.CONFIG_KV.get("homeproxy", { type: "json" });
+  assert.equal(rec.publicIp, "81.0.0.2");
+  assert.equal(rec.via, "box");
+  assert.equal(rec.boxId, "tv-h1");
+  const lists = env.CONFIG_KV.lists;
+  r = await homeReg(env, { ...HP_BODY, channels: 117 }, { ip: "81.0.0.2" });
+  assert.equal(r.status, 200);
+  assert.equal(env.CONFIG_KV.lists, lists, "平常用上次擔保的盒子驗證，不列舉裝置");
+  await call(env, "/admin/device", { method: "POST", body: { id: "tv-h1", action: "block" } });
+  w = env.CONFIG_KV.writes;
+  r = await homeReg(env, HP_BODY, { ip: "81.0.0.2" });
+  assert.equal(r.status, 403, "盒子被封鎖就不算數（立即生效）");
+  assert.equal(r.json.reason, "no_home_box");
+  assert.equal(env.CONFIG_KV.writes, w);
+  r = await homeReg(env, HP_BODY, { ip: "81.0.0.99" });
+  assert.equal(r.status, 403, "外人（別的公網 IP）登記不了");
+
+  env = makeEnv({ config: { version: 1, subscriptionUrl: MAIN } });
+  await homeBox(env, "tv-h2", "81.0.0.3", false);
+  r = await homeReg(env, HP_BODY, { ip: "81.0.0.3" });
+  assert.equal(r.status, 403, "只心跳、沒授權的盒子不能擔保（授權機制關著也一樣）");
+
+  env = makeEnv({ config: { version: 1, subscriptionUrl: MAIN } });
+  await homeBox(env, "tv-h3", "81.0.0.4");
+  const adm = await env.CONFIG_KV.get("devadm:tv-h3", { type: "json" });
+  await env.CONFIG_KV.put("devadm:tv-h3", JSON.stringify({ ...adm, expireAt: new Date(Date.now() - 60000).toISOString() }));
+  r = await homeReg(env, HP_BODY, { ip: "81.0.0.4" });
+  assert.equal(r.status, 403, "授權到期的盒子不能擔保");
+
+  env = makeEnv({ config: { version: 1, subscriptionUrl: MAIN } });
+  await homeBox(env, "tv-h4", "81.0.0.5");
+  const d4 = await env.CONFIG_KV.get("dev:tv-h4", { type: "json" });
+  await env.CONFIG_KV.put("dev:tv-h4", JSON.stringify({ ...d4, lastSeen: new Date(Date.now() - 25 * 3600000).toISOString() }));
+  r = await homeReg(env, HP_BODY, { ip: "81.0.0.5" });
+  assert.equal(r.status, 403, "超過 24 小時沒心跳不算");
+});
+
+await test("2.3：家用代理登記（免金鑰）— 監控整理已授權盒子 IP（不必 list）；另一個家正在用 → 403、帶金鑰可接手；那邊沒動靜後自動接手", async () => {
+  const env = makeEnv({ config: { version: 1, subscriptionUrl: "http://src/x", homeProxyKey: HOME_KEY } });
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = tgMock([], null, realFetch);
+  try {
+    await homeBox(env, "tv-a", "82.0.0.1");
+    await homeBox(env, "tv-b", "82.0.0.2");
+    await homeBox(env, "tv-c", "82.0.0.3", false);
+    await monitor.runMonitorTick(env, Date.now());
+    const st = await env.CONFIG_KV.get("mon:state", { type: "json" });
+    assert.deepEqual(st.homeIps, [["82.0.0.1", "tv-a"], ["82.0.0.2", "tv-b"]], "只收已授權盒子");
+    const lists = env.CONFIG_KV.lists;
+    let r = await homeReg(env, HP_BODY, { ip: "82.0.0.1" });
+    assert.equal(r.status, 200, r.text);
+    assert.equal(env.CONFIG_KV.lists, lists, "有監控整理的清單就不 list");
+    r = await homeReg(env, { ...HP_BODY, lanUrl: "http://192.168.1.50:5050" }, { ip: "82.0.0.2" });
+    assert.equal(r.status, 403);
+    assert.equal(r.json.reason, "other_home_active");
+    assert.equal((await env.CONFIG_KV.get("homeproxy", { type: "json" })).publicIp, "82.0.0.1", "沒被蓋掉");
+    r = await homeReg(env, { ...HP_BODY, lanUrl: "http://192.168.1.50:5050" }, { ip: "82.0.0.2", key: HOME_KEY });
+    assert.equal(r.status, 200, "帶金鑰 = 管理員明確要換");
+    assert.equal((await env.CONFIG_KV.get("homeproxy", { type: "json" })).publicIp, "82.0.0.2");
+    r = await homeReg(env, HP_BODY, { ip: "82.0.0.1" });
+    assert.equal(r.json.reason, "other_home_active", "新家的盒子還在線 → 舊家搶不回來");
+    const db = await env.CONFIG_KV.get("dev:tv-b", { type: "json" });
+    await env.CONFIG_KV.put("dev:tv-b", JSON.stringify({ ...db, lastSeen: new Date(Date.now() - 20 * 60000).toISOString() }));
+    r = await homeReg(env, HP_BODY, { ip: "82.0.0.1" });
+    assert.equal(r.status, 200, r.text);
+    assert.equal((await env.CONFIG_KV.get("homeproxy", { type: "json" })).publicIp, "82.0.0.1", "那邊沒動靜 → 自動接手");
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+});
+
+await test("2.3：家用代理登記 — 內容沒變 30 分鐘內不寫 KV；同一 IP 每分鐘超過 6 次 → 429 且不碰 KV", async () => {
+  const env = makeEnv({ config: { version: 1, subscriptionUrl: MAIN, homeProxyKey: HOME_KEY } });
+  const kv = env.CONFIG_KV;
+  let r = await homeReg(env, HP_BODY, { key: HOME_KEY, ip: "83.0.0.1" });
+  assert.equal(r.json.stored, true);
+  let w = kv.writes;
+  r = await homeReg(env, HP_BODY, { key: HOME_KEY, ip: "83.0.0.1" });
+  assert.equal(r.status, 200);
+  assert.equal(r.json.stored, false);
+  assert.equal(kv.writes, w, "內容沒變不寫");
+  r = await homeReg(env, { ...HP_BODY, channels: 90 }, { key: HOME_KEY, ip: "83.0.0.1" });
+  assert.equal(r.json.stored, true, "頻道數變了就寫");
+  assert.equal(kv.writes, w + 1);
+  const rec = await kv.get("homeproxy", { type: "json" });
+  await kv.put("homeproxy", JSON.stringify({ ...rec, lastSeen: new Date(Date.now() - 31 * 60000).toISOString() }));
+  r = await homeReg(env, { ...HP_BODY, channels: 90 }, { key: HOME_KEY, ip: "83.0.0.1" });
+  assert.equal(r.json.stored, true, "超過 30 分鐘照寫（更新最後回報時間）");
+  let last = null;
+  for (let i = 0; i < 6; i++) {
+    last = await homeReg(env, HP_BODY, { key: HOME_KEY, ip: "83.0.0.2" });
+    assert.equal(last.status, 200, "第 " + (i + 1) + " 次");
+  }
+  w = kv.writes;
+  const reads = kv.reads;
+  last = await homeReg(env, HP_BODY, { key: HOME_KEY, ip: "83.0.0.2" });
+  assert.equal(last.status, 429);
+  assert.equal(last.json.reason, "rate_limited");
+  assert.equal(last.headers.get("retry-after"), "60");
+  assert.equal(kv.writes, w, "被擋的請求不寫 KV");
+  assert.equal(kv.reads, reads, "也不讀 KV");
+  assert.equal((await homeReg(env, HP_BODY, { key: HOME_KEY, ip: "83.0.0.3" })).status, 200, "別的 IP 不受影響");
+});
+
+await test("2.3：/api/config 下發家用備援 — 只給同一個家（IPv4 相同 / IPv6 同 /64）、手動備援優先、角色優先時主備對調、異常或超過 2 小時不下發", async () => {
+  const env = makeEnv({ config: { version: 1, subscriptionUrl: MAIN } });
+  const kv = env.CONFIG_KV;
+  const HOME_PL = "http://192.168.31.100:5050/playlist.m3u";
+  const putHp = (o) => kv.put("homeproxy", JSON.stringify({ lanUrl: "http://192.168.31.100:5050", publicIp: "84.0.0.1", version: "2.3.0", channels: 118, healthy: true, lastSeen: new Date().toISOString(), via: "box", boxId: "tv-x", ...(o || {}) }));
+  const cfgOf = async (id, ip) => (await call(env, "/api/config?id=" + id, { ip })).json;
+  await putHp();
+  let c = await cfgOf("tv-home", "84.0.0.1");
+  assert.equal(c.subscriptionUrl, MAIN);
+  assert.equal(c.backupSubscriptionUrl, HOME_PL);
+  assert.equal(c.homeProxy, "backup");
+  c = await cfgOf("tv-away", "84.0.0.2");
+  assert.equal(c.backupSubscriptionUrl, "", "別的地點拿不到區網網址");
+  assert.equal(c.homeProxy, "");
+  const cfg = await kv.get("config", { type: "json" });
+  await kv.put("config", JSON.stringify({ ...cfg, backupSubscriptionUrl: BACKUP }));
+  c = await cfgOf("tv-home", "84.0.0.1");
+  assert.equal(c.backupSubscriptionUrl, BACKUP, "手動備援優先");
+  assert.equal(c.homeProxy, "");
+  let r = await call(env, "/admin/save", { method: "POST", body: { _fields: "home", homeProxyRole: "bogus" } });
+  assert.equal(r.json.ok, false);
+  r = await call(env, "/admin/save", { method: "POST", body: { _fields: "home", homeProxyRole: "primary" } });
+  assert.equal(r.json.ok, true, r.text);
+  assert.ok(r.json.refresh.includes("home"));
+  assert.match((await kv.get("audit", { type: "json" }))[0].what, /家用備援角色/);
+  c = await cfgOf("tv-home", "84.0.0.1");
+  assert.equal(c.subscriptionUrl, HOME_PL, "優先：同一個家的盒子以家用清單為主");
+  assert.equal(c.backupSubscriptionUrl, MAIN);
+  assert.equal(c.homeProxy, "primary");
+  c = await cfgOf("tv-away", "84.0.0.2");
+  assert.equal(c.subscriptionUrl, MAIN);
+  assert.equal(c.backupSubscriptionUrl, BACKUP);
+  await putHp({ healthy: false });
+  c = await cfgOf("tv-home", "84.0.0.1");
+  assert.equal(c.subscriptionUrl, MAIN, "代理自報異常不下發");
+  assert.equal(c.homeProxy, "");
+  await putHp({ lastSeen: new Date(Date.now() - 3 * 3600000).toISOString() });
+  assert.equal((await cfgOf("tv-home", "84.0.0.1")).homeProxy, "", "超過 2 小時沒登記不下發");
+  await putHp({ publicIp: "2001:db8:1:2::1" });
+  assert.equal((await cfgOf("tv-v6", "2001:db8:1:2:abcd::5")).homeProxy, "primary", "IPv6 同一個 /64");
+  assert.equal((await cfgOf("tv-v6b", "2001:db8:1:3::5")).homeProxy, "");
+  assert.equal(lib.sameHomeIp("::ffff:84.0.0.1", "84.0.0.1"), true);
+  assert.equal(lib.sameHomeIp("84.0.0.1", "2001:db8::1"), false);
+  await call(env, "/admin/device", { method: "POST", body: { id: "tv-v6", action: "block" } });
+  c = await cfgOf("tv-v6", "2001:db8:1:2:abcd::5");
+  assert.equal(c.subscriptionUrl, "");
+  assert.equal(c.backupSubscriptionUrl, "");
+  assert.equal(c.homeProxy, "");
+  for (const k of ["homeProxyKey", "homeProxyRole"]) assert.ok(!(k in c), "不該外流 " + k);
+});
+
+await test("2.3：家用備援金鑰 — 開卡片自動產生、只出現在管理頁、盒子端點不外流；重新產生要確認並記錄、舊金鑰立即失效", async () => {
+  const env = makeEnv({ config: { version: 1, subscriptionUrl: MAIN } });
+  const kv = env.CONFIG_KV;
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = statusMock([], {}, realFetch);
+  try {
+    let p = await call(env, "/admin/partial?name=home");
+    assert.equal(p.status, 200);
+    let cfg = await kv.get("config", { type: "json" });
+    const key1 = cfg.homeProxyKey;
+    assert.equal(key1.length, 40);
+    assert.ok(lib.isValidHomeKey(key1));
+    assert.equal(cfg.version, 1, "自動產生金鑰不升版本（盒子不必重載）");
+    assert.match((await kv.get("audit", { type: "json" }))[0].what, /自動產生家用備援金鑰/);
+    assert.ok(p.text.includes(`value="${key1}"`), "金鑰放在密碼欄");
+    assert.ok(!p.text.includes(`data-copy="${key1}"`), "複製提示不回顯金鑰");
+    assert.match(p.text, /換新電腦執行安裝指令就會自動登記，不用改這裡/);
+    assert.match(p.text, /尚未登記/);
+    assert.match(p.text, /data-confirm="重新產生後舊金鑰立即失效/);
+    await call(env, "/admin/partial?name=home");
+    assert.equal((await kv.get("config", { type: "json" })).homeProxyKey, key1, "不會每次重產");
+    const page = await call(env, "/admin");
+    assert.match(page.text, /data-part="home"/);
+    for (const path of ["/api/config", "/api/config?id=tv-1", "/api/update", "/api/health"]) {
+      const t = (await call(env, path)).text;
+      assert.ok(!t.includes(key1), path + " 外流金鑰");
+      assert.ok(!t.includes("homeProxyKey"), path);
+    }
+    const r = await call(env, "/admin/system", { method: "POST", body: { action: "regen_home_key" } });
+    assert.equal(r.json.ok, true, r.text);
+    assert.ok(r.json.refresh.includes("home"));
+    cfg = await kv.get("config", { type: "json" });
+    assert.notEqual(cfg.homeProxyKey, key1);
+    assert.ok(lib.isValidHomeKey(cfg.homeProxyKey));
+    assert.equal(cfg.version, 1, "盒子看不到金鑰 → 不升版本，免得盒子以為設定變了");
+    assert.equal(await kv.get("cfghist"), null, "也不進設定歷史");
+    const audit = await kv.get("audit", { type: "json" });
+    assert.match(audit[0].what, /重新產生家用備援金鑰/);
+    assert.ok(!audit.some((a) => a.what.includes(key1) || a.what.includes(cfg.homeProxyKey)), "操作紀錄不含金鑰");
+    assert.equal((await homeReg(env, HP_BODY, { key: key1, ip: "85.0.0.1" })).status, 401, "舊金鑰立即失效");
+    assert.equal((await homeReg(env, HP_BODY, { key: cfg.homeProxyKey, ip: "85.0.0.1" })).status, 200);
+    p = await call(env, "/admin/partial?name=home");
+    assert.match(p.text, /badge good-b">在線/);
+    assert.match(p.text, /192\.168\.31\.100:5050/);
+    assert.match(p.text, /85\.0\.0\.1/);
+    const s = await call(env, "/admin/partial?name=system");
+    assert.match(s.text, /重新產生家用備援金鑰/, "操作紀錄只記事件");
+    assert.ok(!s.text.includes(key1));
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+});
+
+await test("2.3：總覽 — 主 / 備援線路分開顯示與分級（主壞備好黃燈、兩條都壞紅燈、備援連不上黃燈）；家用備援一行", async () => {
+  const env = makeEnv({ config: { version: 1, subscriptionUrl: MAIN, backupSubscriptionUrl: BACKUP } });
+  const realFetch = globalThis.fetch;
+  let main = { healthy: false, consecutive_failures: 3, reason: "api_blocked", public_ip: "1.1.1.1" };
+  let bk = { healthy: true, consecutive_failures: 0, public_ip: "2.2.2.2" };
+  globalThis.fetch = statusMock([], {
+    "1.2.3.4:5050": () => ({ ...main, checked_at_ms: Date.now() - 60000 }),
+    "5.6.7.8:5050": () => (typeof bk === "object" ? { ...bk, checked_at_ms: Date.now() - 60000 } : bk),
+  }, realFetch);
+  try {
+    let o = await call(env, "/admin/partial?name=overview");
+    assert.match(o.text, /head-card yellow/);
+    assert.match(o.text, /主線路異常（4gtv 封鎖/);
+    assert.match(o.text, /盒子已自動改用備援線路/);
+    assert.match(o.text, /直播源伺服器（主線路） <b>異常<\/b>/);
+    assert.match(o.text, /備援線路 <b>正常<\/b>/);
+    assert.match(o.text, /備援訂閱網址/);
+    assert.ok(!o.text.includes("BACKUPTOKEN99"), "總覽只顯示遮罩後的備援網址");
+    bk = { healthy: false, consecutive_failures: 2, reason: "vpn", public_ip: "2.2.2.2" };
+    o = await call(env, "/admin/partial?name=overview");
+    assert.match(o.text, /head-card red/);
+    assert.match(o.text, /主線路與備援線路都異常/);
+    main = { healthy: true, consecutive_failures: 0, public_ip: "1.1.1.1" };
+    bk = "throw";
+    o = await call(env, "/admin/partial?name=overview");
+    assert.match(o.text, /head-card yellow/);
+    assert.match(o.text, /備援線路異常（連不上主機）/);
+    assert.match(o.text, /備援線路 <b>連不上<\/b>/);
+    const T = Date.now();
+    const hp = { lanUrl: "http://192.168.31.100:5050", publicIp: "86.0.0.1", version: "2.3.0", channels: 118, healthy: true, lastSeen: new Date(T).toISOString(), via: "box", boxId: "tv-h" };
+    await env.CONFIG_KV.put("homeproxy", JSON.stringify(hp));
+    o = await call(env, "/admin/partial?name=overview");
+    assert.match(o.text, /家用備援在線（118 台頻道/);
+    assert.match(o.text, /目前用手動備援、不下發/);
+    await env.CONFIG_KV.put("homeproxy", JSON.stringify({ ...hp, lastSeen: new Date(T - 2 * 3600000).toISOString() }));
+    o = await call(env, "/admin/partial?name=overview");
+    assert.match(o.text, /家用備援離線（最後紀錄 2 小時前）/);
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+});
+
+await test("2.3：總覽 / 裝置 — 沒設備援、主線路壞：家用備援顧得到全部線上盒子 → 黃燈，有盒子在別處 → 紅燈；裝置卡標出家用代理線路", async () => {
+  const env = makeEnv({ config: { version: 1, subscriptionUrl: MAIN } });
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = statusMock([], { "1.2.3.4:5050": () => ({ healthy: false, consecutive_failures: 3, reason: "stale", public_ip: "1.1.1.1", checked_at_ms: Date.now() - 60000 }) }, realFetch);
+  try {
+    await env.CONFIG_KV.put("homeproxy", JSON.stringify({ lanUrl: "http://192.168.31.100:5050", publicIp: "87.0.0.1", version: "2.3.0", channels: 118, healthy: true, lastSeen: new Date().toISOString(), via: "box", boxId: "tv-h" }));
+    await call(env, "/api/config?id=tv-h&m=Box&v=1.0.0.30&ln=1", { ip: "87.0.0.1" });
+    let o = await call(env, "/admin/partial?name=overview");
+    assert.match(o.text, /head-card yellow/);
+    assert.match(o.text, /同一個家的盒子有家用備援撐著/);
+    assert.match(o.text, /家用備援在線（118 台頻道，同一個家 1 台盒子線上）/);
+    assert.match(o.text, /1 台走備援線路/);
+    await call(env, "/api/config?id=tv-away&m=Box&v=1.0.0.30", { ip: "87.0.0.9" });
+    o = await call(env, "/admin/partial?name=overview");
+    assert.match(o.text, /head-card red/);
+    assert.match(o.text, /家用備援只顧得到同一個家的 1 台，其他 1 台受影響/);
+    const d = await call(env, "/admin/partial?name=devices");
+    assert.match(d.text, /備援線路（家用代理）/);
+    assert.match(d.text, /未回報（舊版 App）/);
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+});
+
 console.log(`\n${passed} passed, ${failures.length} failed`);
 if (failures.length) {
   for (const [n, e] of failures) console.log("FAIL:", n, "\n", e && e.stack);

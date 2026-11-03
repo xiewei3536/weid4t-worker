@@ -23,9 +23,19 @@ export const AUDIT_MAX = 200;
 /** 設定版本歷史（最多 CFG_HIST_MAX 份快照，供還原） */
 export const CFG_HIST_KEY = "cfghist";
 export const CFG_HIST_MAX = 12;
+/** 家用備援代理的登記紀錄（POST /api/home-proxy 寫入） */
+export const HOME_PROXY_KEY = "homeproxy";
+/** 家用代理登記內容沒變時，最短寫回間隔（省 KV 寫入額度） */
+export const HOME_WRITE_MIN_MS = 30 * 60 * 1000;
+/** 家用代理「線上」判定：最後紀錄在此時間內（寫入節流 30 分 ＋ 15 分寬限；紀錄最多舊 30 分鐘） */
+export const HOME_ONLINE_MS = 45 * 60 * 1000;
+/** /api/config 只把這段時間內登記過的家用代理下發給盒子 */
+export const HOME_FRESH_MS = 2 * 60 * 60 * 1000;
+/** 家用代理免金鑰登記：同一個公網 IP 在這段時間內要有已授權盒子的心跳 */
+export const HOME_BOX_WINDOW_MS = 24 * 60 * 60 * 1000;
 
 /** 程式版本（/api/health 回傳，部署後用來確認新版已生效） */
-export const BUILD = "2.2.1";
+export const BUILD = "2.3.0";
 
 /** 管理密碼猜錯限速：同一 IP 每 10 分鐘最多幾次 */
 export const ADMIN_RL_MAX = 20;
@@ -68,6 +78,8 @@ export const ACTIVATE_RL_TTL_SEC = 600;
 export const DEFAULT_CONFIG = {
   version: 1,
   subscriptionUrl: "",
+  // 備援線路（選填；空 = 不用）：主線路連續失敗時盒子自動改用，兩份清單同名頻道合併成多條線路
+  backupSubscriptionUrl: "",
   pollIntervalMinutes: 180,
   forceRefresh: false,
   autostart: true,
@@ -101,11 +113,16 @@ export const DEFAULT_CONFIG = {
   alertQuiet: "",
   // 盒子回報載入頻道失敗時通知
   alertBoxFail: true,
+  // ── 家用備援代理（家裡電腦跑的代理，POST /api/home-proxy 自動登記；只給同一個家的盒子） ──
+  // backup：當備援線路（預設）｜primary：同一個家的盒子以家用清單為主、原本的主網址改當備援
+  homeProxyRole: "backup",
+  // 家用代理登記金鑰（選用，免金鑰時靠同一個家的已授權盒子擔保；管理員專用、不下發；第一次開管理頁時自動產生）
+  homeProxyKey: "",
   updatedAt: "2026-06-26T00:00:00Z",
 };
 
-/** 這些欄位只屬於管理員，/api/config 一律不下發（含 Telegram token） */
-export const ADMIN_ONLY_KEYS = ["alertsEnabled", "tgBotToken", "tgChatId", "alertSourceMin", "alertDeviceOfflineMin", "alertQuiet", "alertBoxFail"];
+/** 這些欄位只屬於管理員，/api/config 一律不下發（含 Telegram token、家用代理金鑰） */
+export const ADMIN_ONLY_KEYS = ["alertsEnabled", "tgBotToken", "tgChatId", "alertSourceMin", "alertDeviceOfflineMin", "alertQuiet", "alertBoxFail", "homeProxyRole", "homeProxyKey"];
 
 /** 去掉管理員專用欄位後的設定（給盒子看的版本） */
 export function publicConfig(config) {
@@ -214,12 +231,13 @@ export function diffConfigKeys(a, b) {
 
 /** 設定欄位的中文名稱（歷史 / 匯入顯示用） */
 export const CONFIG_LABELS = {
-  subscriptionUrl: "直播源", pollIntervalMinutes: "重載間隔", forceRefresh: "強制刷新", autostart: "開機自啟",
+  subscriptionUrl: "直播源", backupSubscriptionUrl: "備援直播源", pollIntervalMinutes: "重載間隔", forceRefresh: "強制刷新", autostart: "開機自啟",
   notice: "公告", noticeUntil: "公告到期", marquee: "跑馬燈", marqueeUntil: "跑馬燈到期", contactText: "聯絡文字", contactQrVer: "聯絡 QR",
   requireActivation: "授權機制", activationTitle: "啟動頁標題", activationText: "啟動頁說明", codeDigits: "啟動碼位數",
   fontScale: "全域字體", showClock: "時鐘", otaEnabled: "OTA 提示",
   alertsEnabled: "警示開關", tgBotToken: "Telegram Token", tgChatId: "Telegram Chat", alertSourceMin: "直播源異常門檻",
   alertDeviceOfflineMin: "盒子離線門檻", alertQuiet: "靜音時段", alertBoxFail: "載入失敗通知",
+  homeProxyRole: "家用備援角色", homeProxyKey: "家用備援金鑰",
 };
 export function configLabel(k) {
   return CONFIG_LABELS[k] || k;
@@ -298,6 +316,8 @@ export const ACTION_TEXT = {
   restart_4gtv_stale: "清快取重啟（網址失效）",
   restart_4gtv: "清快取重啟",
   restart_4gtv_ipchange: "出口 IP 變動，清快取重啟",
+  restart_4gtv_reconnect: "VPN 重連，清快取重啟",
+  renew_nord_credentials: "Nord 憑證失效，已自動換新",
   restart_nginx: "重啟對外入口 nginx",
 };
 export function actionText(a) {
@@ -492,6 +512,144 @@ export function pendingCmd(dev, nowMs) {
   const t = Date.parse(c.at) || 0;
   if (t && (nowMs || Date.now()) - t > CMD_TTL_MS) return null;
   return { id: String(c.id), type: String(c.type), arg: c.arg == null ? "" : String(c.arg) };
+}
+
+/* ────────────────────────── 家用備援代理 ────────────────────────── */
+
+/** 產生家用代理金鑰：40 碼英數（拒絕取樣避免取模偏差） */
+export function genHomeKey(len) {
+  const n = len || 40;
+  const chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+  let s = "";
+  while (s.length < n) {
+    const arr = new Uint8Array(n * 2);
+    crypto.getRandomValues(arr);
+    for (const b of arr) {
+      if (b >= 248) continue; // 248 = 62 × 4 → 0~247 均勻對應 62 個字
+      s += chars[b % 62];
+      if (s.length >= n) break;
+    }
+  }
+  return s;
+}
+
+/** 金鑰格式（匯入時檢查用） */
+export function isValidHomeKey(k) {
+  return /^[A-Za-z0-9_-]{20,128}$/.test(String(k || ""));
+}
+
+/**
+ * 家用代理回報的區網網址：只收 http:// ＋ 私有 IPv4（10/8、172.16/12、192.168/16）＋ 可選 port。
+ * 網域、公網 IP、https、帶路徑一律不收（盒子要走區網直連，網址不能指到外面）。
+ * 合格回傳正規化後的網址（去掉結尾斜線、八位元前導零），不合格回 ""。
+ */
+export function parseLanUrl(u) {
+  const m = /^http:\/\/(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})(?::(\d{1,5}))?\/?$/i.exec(String(u == null ? "" : u).trim());
+  if (!m) return "";
+  const o = m.slice(1, 5).map(Number);
+  if (o.some((n) => n > 255)) return "";
+  const priv = o[0] === 10 || (o[0] === 172 && o[1] >= 16 && o[1] <= 31) || (o[0] === 192 && o[1] === 168);
+  if (!priv) return "";
+  let port = "";
+  if (m[5] != null) {
+    const p = Number(m[5]);
+    if (!(p >= 1 && p <= 65535)) return "";
+    port = ":" + p;
+  }
+  return "http://" + o.join(".") + port;
+}
+
+/** IPv6 → 8 段補零的陣列；不是合法 IPv6 回 null */
+function expandIpv6(ip) {
+  const s = String(ip).split("%")[0].toLowerCase();
+  const halves = s.split("::");
+  if (halves.length > 2) return null;
+  const head = halves[0] ? halves[0].split(":") : [];
+  const tail = halves.length === 2 && halves[1] ? halves[1].split(":") : [];
+  const fill = halves.length === 2 ? 8 - head.length - tail.length : 0;
+  if (fill < 0) return null;
+  const groups = head.concat(new Array(fill).fill("0"), tail);
+  if (groups.length !== 8 || groups.some((g) => !/^[0-9a-f]{1,4}$/.test(g))) return null;
+  return groups.map((g) => g.padStart(4, "0"));
+}
+
+/**
+ * 兩個公網 IP 是不是同一個家：IPv4 完全相同（NAT 後同一個對外位址）；
+ * IPv6 比 /64 前綴（同一個區網的每台裝置位址都不同、前綴相同）。一邊 IPv4 一邊 IPv6 無法判定 → false。
+ */
+export function sameHomeIp(a, b) {
+  const v4 = (x) => {
+    const s = String(x == null ? "" : x).trim().toLowerCase();
+    const m = /^::ffff:(\d{1,3}(?:\.\d{1,3}){3})$/.exec(s);
+    return m ? m[1] : s;
+  };
+  const x = v4(a);
+  const y = v4(b);
+  if (!x || !y) return false;
+  const x6 = x.includes(":");
+  const y6 = y.includes(":");
+  if (x6 !== y6) return false;
+  if (!x6) return x === y;
+  const ex = expandIpv6(x);
+  const ey = expandIpv6(y);
+  return !!ex && !!ey && ex.slice(0, 4).join(":") === ey.slice(0, 4).join(":");
+}
+
+/** 讀家用代理登記紀錄；沒有或 KV 讀取失敗回 null（備援功能不該讓主流程出錯） */
+export async function loadHomeProxy(env) {
+  try {
+    const v = await env.CONFIG_KV.get(HOME_PROXY_KEY, { type: "json" });
+    return v && typeof v === "object" && v.lanUrl ? v : null;
+  } catch (_) {
+    return null;
+  }
+}
+
+/** 家用代理狀態：none（從沒登記）/ online（45 分鐘內有紀錄）/ offline */
+export function homeProxyState(hp, nowMs) {
+  const t = Date.parse(hp && hp.lastSeen) || 0;
+  if (!t) return "none";
+  return (nowMs || Date.now()) - t < HOME_ONLINE_MS ? "online" : "offline";
+}
+
+/** 這台盒子能用的家用清單網址：2 小時內登記過、代理自報健康、且與盒子同一個家；否則 "" */
+export function homePlaylistUrl(hp, boxIp, nowMs) {
+  if (!hp || !hp.lanUrl || !hp.publicIp || hp.healthy === false) return "";
+  const seen = Date.parse(hp.lastSeen) || 0;
+  if (!seen || (nowMs || Date.now()) - seen > HOME_FRESH_MS) return "";
+  if (!sameHomeIp(boxIp, hp.publicIp)) return "";
+  return String(hp.lanUrl).replace(/\/+$/, "") + "/playlist.m3u";
+}
+
+/** 這台盒子要不要讀家用代理紀錄（手動備援已填且角色不是 primary 時用不到，省一次 KV 讀取） */
+export function needsHomeProxy(config) {
+  return config.homeProxyRole === "primary" || !String(config.backupSubscriptionUrl || "").trim();
+}
+
+/**
+ * 能替家用代理「擔保同一個家」的盒子：管理員授權過（authorized，未封鎖、未到期）、24 小時內有心跳、有公網 IP。
+ * 只認明確授權——授權機制關閉時任何人都能用亂數 id 心跳一次「生出」一台盒子，不能拿來當擔保。
+ */
+export function homeBoxEligible(d, nowMs) {
+  if (!d || !d.id || !d.ip || d.blocked || d.authorized !== true) return false;
+  if (d.expireAt && (Date.parse(d.expireAt) || 0) <= (nowMs || Date.now())) return false;
+  const seen = Date.parse(d.lastSeen) || 0;
+  return seen > 0 && (nowMs || Date.now()) - seen <= HOME_BOX_WINDOW_MS;
+}
+
+/**
+ * 某台盒子實際拿到的主 / 備援訂閱網址：
+ *  - 手動填的 backupSubscriptionUrl 優先；沒填時，同一個家的盒子拿家用清單當備援
+ *  - homeProxyRole = primary：同一個家的盒子以家用清單為主、原本的主網址改當備援
+ * 回傳 { subscriptionUrl, backupSubscriptionUrl, homeProxy: "primary" | "backup" | "" }
+ */
+export function effectiveLines(config, hp, boxIp, nowMs) {
+  const main = String(config.subscriptionUrl || "");
+  const manual = String(config.backupSubscriptionUrl || "").trim();
+  const home = homePlaylistUrl(hp, boxIp, nowMs);
+  if (home && config.homeProxyRole === "primary") return { subscriptionUrl: home, backupSubscriptionUrl: main, homeProxy: "primary" };
+  if (home && !manual) return { subscriptionUrl: main, backupSubscriptionUrl: home, homeProxy: "backup" };
+  return { subscriptionUrl: main, backupSubscriptionUrl: manual, homeProxy: "" };
 }
 
 /* ────────────────────────── 簡易限速（KV 計數 + TTL） ────────────────────────── */

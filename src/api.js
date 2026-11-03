@@ -7,6 +7,7 @@
  *  GET /dl/latest.apk OTA 下載（代理私有 GitHub Release）
  *  GET /api/time      對時（老盒子 NTP 不通時的備援）
  *  GET /api/health    健康檢查
+ *  POST /api/home-proxy 家用備援代理自動登記（同一個家的已授權盒子擔保，或 X-Home-Key 金鑰）
  *
  * 裝置紀錄分兩把 key：
  *  dev:<id>     盒子自己回報的（上線 / 版本 / 正在看 / 播放健康…），只有心跳會寫
@@ -17,6 +18,8 @@
 import {
   ACTIVATE_RL_MAX,
   ACTIVATE_RL_TTL_SEC,
+  ADMIN_RL_MAX,
+  ADMIN_RL_TTL_SEC,
   BUILD,
   CODE_LIST_MAX,
   CODE_PREFIX,
@@ -25,24 +28,37 @@ import {
   DEVICE_LIST_MAX,
   DEVICE_PREFIX,
   DEVICE_WRITE_MIN_MS,
+  HOME_BOX_WINDOW_MS,
+  HOME_PROXY_KEY,
+  HOME_WRITE_MIN_MS,
   KvUnavailable,
+  MON_KEY,
   NEWDEV_RL_MAX,
   NEWDEV_RL_TTL_SEC,
   NEWDEV_TTL_SEC,
+  ONLINE_MS,
   OTA_CACHE_KEY,
   clientIp,
   computeAuth,
   effectiveFontScale,
+  effectiveLines,
+  homeBoxEligible,
+  homeProxyState,
   jsonResponse,
   loadConfig,
+  loadHomeProxy,
   mergeDevice,
+  needsHomeProxy,
   nowIso,
   parseIntOr,
+  parseLanUrl,
   pendingCmd,
   publicConfig,
   rateLimited,
+  sameHomeIp,
   splitAdminFields,
   stripAdminFields,
+  timingSafeEqual,
 } from "./lib.js";
 
 /* ================================================================
@@ -97,8 +113,19 @@ export async function handleGetConfig(request, env, ctx) {
     deviceNick: (dev && dev.nick) || "",
   };
 
-  // 被封鎖 / 未授權 / 沒帶裝置編號（不是我們的 App）→ 不給直播源網址（裡面有 token）
-  if (blocked || !auth.authorized || !dev) payload.subscriptionUrl = "";
+  // 被封鎖 / 未授權 / 沒帶裝置編號（不是我們的 App）→ 不給直播源網址（裡面有 token）；備援線路同一套規則
+  if (blocked || !auth.authorized || !dev) {
+    payload.subscriptionUrl = "";
+    payload.backupSubscriptionUrl = "";
+    payload.homeProxy = "";
+  } else {
+    // 主 / 備援線路：手動備援優先；同一個家的盒子可拿到家用代理（區網直連）當備援，或角色 primary 時當主線路
+    const hp = needsHomeProxy(config) ? await loadHomeProxy(env) : null;
+    const lines = effectiveLines(config, hp, clientIp(request), nowMs);
+    payload.subscriptionUrl = lines.subscriptionUrl;
+    payload.backupSubscriptionUrl = lines.backupSubscriptionUrl;
+    payload.homeProxy = lines.homeProxy;
+  }
 
   if (config.noticeUntil && (Date.parse(config.noticeUntil) || 0) <= nowMs) payload.notice = "";
   if (!config.marqueeUntil || (Date.parse(config.marqueeUntil) || 0) <= nowMs) payload.marquee = "";
@@ -168,6 +195,7 @@ export async function saveDeviceAdmin(env, id, adm) {
  *   now 正在觀看的頻道名稱   fs 目前生效的字體等級
  *   ack 已執行的遠端指令 id
  *   pe  近 10 分鐘播放重連次數  le 最近一次播放錯誤（短文字）  up App 已運行分鐘數
+ *   ln  目前播放所用線路（0 = 主線路、1 = 備援線路）
  */
 export async function touchDevice(request, env, ctx) {
   const url = new URL(request.url);
@@ -253,6 +281,20 @@ export async function touchDevice(request, env, ctx) {
   if (q.has("up")) {
     const up = parseIntOr(q.get("up"), -1);
     if (up >= 0) dev.up = up;
+  }
+  if (q.has("ln")) {
+    // 目前播放用的線路（0 = 主線路、1 = 備援線路）：切換時記下時間。距上次切換超過 10 分鐘的那次切換立刻寫
+    // （管理員馬上看得到「這台撐在備援上」）；10 分鐘內來回切照 3 分鐘節流，免得一台盒子反覆切線吃光寫入額度
+    const ln = Math.max(0, Math.min(9, parseIntOr(q.get("ln"), 0)));
+    if (ln !== dev.ln) {
+      const prev = typeof dev.ln === "number" ? dev.ln : 0;
+      const lastSwitchMs = Date.parse(dev.lnAt || "") || 0;
+      dev.ln = ln;
+      if (ln !== prev) {   // 真的換了線路（新版 App 第一次回報主線路不算，跟著下次寫入一起存）
+        dev.lnAt = iso;
+        if (sinceWrite >= 3 * 60 * 1000 || now.getTime() - lastSwitchMs >= 10 * 60 * 1000) mustWrite = true;
+      }
+    }
   }
 
   // 指令回條：清掉 devadm 的待送指令並記回條（這是心跳唯一會碰 devadm 的時機，且只在有 ack 時）
@@ -430,6 +472,195 @@ export async function handleActivate(request, env) {
     return jsonResponse({ ok: false, error: "授權寫入失敗，請重試" }, 200);
   }
   return jsonResponse({ ok: true, expireAt, message: "啟動成功" }, 200);
+}
+
+/* ================================================================
+ *  家用備援代理自動登記
+ * ================================================================ */
+
+/**
+ * 同 IP 每分鐘最多 HOME_RL_MAX 次：計數放 Worker 記憶體（每次登記都寫 KV 計數會吃光每日寫入額度；
+ * 多個執行個體之間是近似值，擋暴衝夠用）。金鑰錯的嘗試另外走 KV 限速（見 handleHomeProxy）。
+ */
+const HOME_RL = new Map();
+const HOME_RL_MAX = 6;
+const HOME_RL_WINDOW_MS = 60 * 1000;
+function homeRateLimited(ip, nowMs) {
+  const key = ip || "-";
+  const recent = (HOME_RL.get(key) || []).filter((t) => nowMs - t < HOME_RL_WINDOW_MS);
+  const limited = recent.length >= HOME_RL_MAX;
+  if (!limited) recent.push(nowMs);
+  HOME_RL.set(key, recent);
+  if (HOME_RL.size > 500) {
+    for (const [k, v] of HOME_RL) if (!v.length || nowMs - v[v.length - 1] >= HOME_RL_WINDOW_MS) HOME_RL.delete(k);
+  }
+  return limited;
+}
+
+/**
+ * 免金鑰登記時的候選盒子：監控每 5 分鐘把「已授權盒子的公網 IP」整理進 mon:state.homeIps（[[ip, id], …]），
+ * 這裡只讀那一把 key，不列舉裝置（KV list 每日額度很少，不能讓沒帶金鑰的請求每次都 list）。
+ * 監控還沒產生這份資料時（剛部署）才退回列舉一次，每個執行個體每分鐘最多一次。
+ */
+const HOME_LIST_GUARD = new WeakMap();
+async function homeBoxCandidates(env, memo, nowMs) {
+  if (memo.cands) return memo.cands;
+  let cands = null;
+  try {
+    const mon = await env.CONFIG_KV.get(MON_KEY, { type: "json" });
+    if (mon && Array.isArray(mon.homeIps)) {
+      cands = mon.homeIps.filter((e) => Array.isArray(e) && e[0] && e[1]).map((e) => ({ ip: String(e[0]), id: String(e[1]) }));
+    }
+  } catch (_) {}
+  if (!cands) {
+    cands = [];
+    const kv = env.CONFIG_KV;
+    if (kv && typeof kv === "object" && nowMs - (HOME_LIST_GUARD.get(kv) || 0) >= 60 * 1000) {
+      HOME_LIST_GUARD.set(kv, nowMs);
+      try {
+        for (const d of await loadDevices(env)) if (homeBoxEligible(d, nowMs)) cands.push({ ip: String(d.ip), id: String(d.id) });
+      } catch (_) {}
+    }
+  }
+  memo.cands = cands;
+  return cands;
+}
+
+/**
+ * 找一台跟 ip 同一個家、已授權（未封鎖、未到期）、maxAgeMs 內有心跳的盒子；沒有回 null。
+ * 候選盒子一律重讀最新紀錄再確認，管理員剛封鎖 / 撤銷授權立即生效。hintId（上次擔保的盒子）先試，平常只花 2 次讀取。
+ */
+async function findHomeBox(env, ip, hintId, nowMs, maxAgeMs, memo) {
+  const tried = new Set();
+  const check = async (id) => {
+    if (!id || tried.has(id) || tried.size >= 8) return null;
+    tried.add(id);
+    try {
+      const r = await loadDevice(env, id, { noMigrate: true });
+      const d = mergeDevice(r.dev, r.adm);
+      return d && homeBoxEligible(d, nowMs) && sameHomeIp(d.ip, ip) && nowMs - (Date.parse(d.lastSeen) || 0) <= maxAgeMs ? d : null;
+    } catch (_) {
+      return null;
+    }
+  };
+  const hit = await check(hintId);
+  if (hit) return hit;
+  for (const c of await homeBoxCandidates(env, memo, nowMs)) {
+    if (!sameHomeIp(c.ip, ip)) continue;
+    const d = await check(c.id);
+    if (d) return d;
+  }
+  return null;
+}
+
+/**
+ * POST /api/home-proxy — 家裡電腦的家用備援代理定時回報（建議每 5 分鐘）。本文 JSON {lanUrl, version, channels, healthy}。
+ * 身分驗證（二選一）：
+ *   • 標頭 X-Home-Key（選用）：帶了就必須正確，錯的回 401 並計入防暴力限速
+ *   • 沒帶金鑰：這個公網 IP（CF-Connecting-IP）24 小時內要有已授權（未封鎖、未到期）盒子的心跳 = 同一個家，否則 403。
+ *     另一個家的代理正在使用中（45 分內有登記、那邊的盒子 15 分內有心跳）時也回 403，免得兩台輪流蓋掉對方；帶金鑰可強制接手
+ * 記錄 {lanUrl, publicIp, version, channels, healthy, lastSeen, via, boxId} 到 KV「homeproxy」；
+ * 內容沒變且上次紀錄未滿 30 分鐘就不寫 KV（照樣回 200，stored:false）。
+ * 回應：200 {ok, stored, via, role, publicIp, playlist, lastSeen}｜400 內容不對｜401 金鑰錯｜403 不是同一個家 / 另一個家使用中
+ *       ｜429 太頻繁 / 金鑰錯太多次｜503 KV 故障。錯誤一律 {ok:false, reason, error}（reason 給程式判斷，error 給人看）。
+ */
+export async function handleHomeProxy(request, env) {
+  const nowMs = Date.now();
+  const ip = clientIp(request);
+  const fail = (status, reason, error, extra, headers) => jsonResponse({ ok: false, reason, error, ...(extra || {}) }, status, headers);
+  if (homeRateLimited(ip, nowMs)) {
+    return fail(429, "rate_limited", "回報太頻繁（同一 IP 每分鐘最多 6 次）", { retryAfter: 60 }, { "Retry-After": "60" });
+  }
+  let config;
+  try {
+    config = await loadConfig(env);
+  } catch (_) {
+    return kvUnavailable();
+  }
+  const sentKey = request.headers.get("X-Home-Key") || "";
+  if (sentKey) {
+    const expected = String(config.homeProxyKey || "");
+    // 管理中心根本沒有金鑰：沒有東西可猜，不計入限速（省一次 KV 寫入）
+    if (!expected) return fail(401, "no_key_configured", "管理中心還沒有家用備援金鑰：拿掉 X-Home-Key 改用免金鑰登記，或先到管理頁「直播源 → 家用備援」產生金鑰");
+    if (!timingSafeEqual(sentKey, expected)) {
+      // 金鑰錯：沿用管理密碼同一套限速（同 IP 每 10 分鐘 20 次），但計數另開一桶——
+      // 家用代理和管理員常是同一個家用 IP，代理金鑰設錯時不該連帶把管理頁登入鎖住
+      if (await rateLimited(env, "hpkey", ip, ADMIN_RL_MAX, ADMIN_RL_TTL_SEC)) {
+        return fail(429, "key_locked", "金鑰錯誤次數過多，請 10 分鐘後再試", { retryAfter: 600 }, { "Retry-After": "600" });
+      }
+      return fail(401, "bad_key", "金鑰錯誤（管理頁重新產生過金鑰的話，舊金鑰已失效）");
+    }
+  }
+  let body = null;
+  try {
+    const text = await request.text();
+    if (text.length > 4000) throw new Error("too large");
+    body = JSON.parse(text);
+  } catch (_) {
+    return fail(400, "bad_body", "本文必須是 JSON：{lanUrl, version, channels, healthy}");
+  }
+  if (!body || typeof body !== "object" || Array.isArray(body)) {
+    return fail(400, "bad_body", "本文必須是 JSON 物件");
+  }
+  const lanUrl = parseLanUrl(body.lanUrl);
+  if (!lanUrl) {
+    return fail(400, "bad_lan_url", "lanUrl 必須是 http://私有 IPv4[:port]（10.x、172.16～31.x、192.168.x），不接受網域、公網 IP、https 或路徑");
+  }
+  let prev = null;
+  try {
+    prev = await env.CONFIG_KV.get(HOME_PROXY_KEY, { type: "json" });
+  } catch (_) {
+    return kvUnavailable();
+  }
+  if (prev && typeof prev !== "object") prev = null;
+
+  let via = "key";
+  let boxId = "";
+  if (!sentKey) {
+    const memo = {};
+    const box = await findHomeBox(env, ip, prev && prev.boxId, nowMs, HOME_BOX_WINDOW_MS, memo);
+    if (!box) {
+      return fail(403, "no_home_box", `公網 IP ${ip} 24 小時內沒有已授權的盒子上線，無法免金鑰登記。請確認這台電腦跟電視盒接同一台路由器、盒子開過偉電視且已授權（未封鎖、未到期）；或改帶 X-Home-Key 金鑰登記`, { publicIp: ip });
+    }
+    if (prev && prev.publicIp && !sameHomeIp(prev.publicIp, ip) && homeProxyState(prev, nowMs) === "online" &&
+        (await findHomeBox(env, prev.publicIp, prev.boxId, nowMs, ONLINE_MS, memo))) {
+      return fail(403, "other_home_active", "另一個家的家用代理正在使用中（同時只能登記一台）。要改用這台請帶 X-Home-Key 金鑰登記；或等那台離線約 45 分鐘後，這台會自動接手", { publicIp: ip });
+    }
+    via = "box";
+    boxId = String(box.id);
+  }
+
+  const rec = {
+    lanUrl,
+    publicIp: ip,
+    version: String(body.version == null ? "" : body.version).slice(0, 30),
+    channels: Math.max(0, Math.min(10000, parseIntOr(body.channels, 0))),
+    healthy: body.healthy !== false && body.healthy !== "false",
+    lastSeen: new Date(nowMs).toISOString(),
+    via,
+    boxId,
+  };
+  const same = !!prev && prev.lanUrl === rec.lanUrl && prev.publicIp === rec.publicIp && prev.version === rec.version &&
+    prev.channels === rec.channels && prev.healthy === rec.healthy && (prev.via || "key") === rec.via && (prev.boxId || "") === rec.boxId;
+  const recent = !!prev && nowMs - (Date.parse(prev.lastSeen) || 0) < HOME_WRITE_MIN_MS;
+  let stored = false;
+  if (!(same && recent)) {
+    try {
+      await env.CONFIG_KV.put(HOME_PROXY_KEY, JSON.stringify(rec));
+      stored = true;
+    } catch (_) {
+      return kvUnavailable();
+    }
+  }
+  return jsonResponse({
+    ok: true,
+    stored,
+    via,
+    role: config.homeProxyRole === "primary" ? "primary" : "backup",
+    publicIp: ip,
+    playlist: lanUrl + "/playlist.m3u",
+    lastSeen: stored ? rec.lastSeen : prev.lastSeen,
+  }, 200);
 }
 
 /* ================================================================

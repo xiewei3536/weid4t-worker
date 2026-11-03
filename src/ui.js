@@ -3,25 +3,30 @@
  * ----------------------------------------------------------------
  * renderAdminHtml(ctx)      整頁
  * renderPartial(name, ctx)  單一區塊（前端局部刷新用）
- * ctx = { config, devices, codes, ota, origin, hasGithubToken }
+ * ctx = { config, devices, codes, ota, sourceStatus, backupStatus, mon, audit, hist, homeProxy, origin, hasGithubToken }
  */
 
 import {
   CMD_TYPES,
   FONT_SCALE_OPTIONS,
+  HOME_FRESH_MS,
   actionText,
   configLabel,
   diffConfigKeys,
   escapeHtml as esc,
   effectiveFontScale,
+  effectiveLines,
   formatTaipeiFull,
   formatTaipeiTime,
+  homeProxyState,
   maskToken,
+  needsHomeProxy,
   onlineState,
   pendingCmd,
   relativeTime,
+  sameHomeIp,
 } from "./lib.js";
-import { describeSource, historySlots, isValidTgToken, reasonText, sourceState, telegramReady, uptime24h } from "./monitor.js";
+import { backupState, describeSource, historySlots, isValidTgToken, reasonText, selfHealText, sourceState, telegramReady, uptime24h } from "./monitor.js";
 import { ADMIN_CSS, ADMIN_JS } from "./ui_assets.js";
 
 const DAY = 86400000;
@@ -147,7 +152,7 @@ export function renderAdminHtml(ctx) {
 
   <section class="panel active" data-panel="overview"><div data-part="overview">${renderOverview(ctx)}</div></section>
   <section class="panel" data-panel="devices"><div data-part="devices">${renderDevicesSection(ctx)}</div></section>
-  <section class="panel" data-panel="source"><div data-part="source">${renderSourcePanel(ctx)}</div></section>
+  <section class="panel" data-panel="source"><div data-part="source">${renderSourcePanel(ctx)}</div><div data-part="home">${renderHomeProxyCard(ctx)}</div></section>
   <section class="panel" data-panel="auth"><div data-part="auth">${renderAuthSettings(ctx)}</div><div data-part="codes">${renderCodesSection(ctx)}</div></section>
   <section class="panel" data-panel="notice"><div data-part="notice">${renderNoticePanel(ctx)}</div></section>
   <section class="panel" data-panel="alerts"><div data-part="alerts">${renderAlertsPanel(ctx)}</div></section>
@@ -170,6 +175,7 @@ export function renderPartial(name, ctx) {
     case "devices": return renderDevicesSection(ctx);
     case "codes": return renderCodesSection(ctx);
     case "source": return renderSourcePanel(ctx);
+    case "home": return renderHomeProxyCard(ctx);
     case "auth": return renderAuthSettings(ctx);
     case "notice": return renderNoticePanel(ctx);
     case "alerts": return renderAlertsPanel(ctx);
@@ -182,15 +188,37 @@ export function renderPartial(name, ctx) {
  *  總覽
  * ================================================================ */
 
-/** 一眼狀態：綜合直播源、盒子、設定，算出 綠 / 黃 / 紅 與一句話 */
+/** 一眼狀態：綜合直播源（主 / 備援線路、家用備援）、盒子、設定，算出 綠 / 黃 / 紅 與一句話 */
 function renderHeadline(ctx, stat, nowMs) {
   const { config, devices, mon } = ctx;
   const devList = Array.isArray(devices) ? devices : [];
   const ss = ctx.sourceStatus;
   const state = sourceState(ss, nowMs);
+  const bss = ctx.backupStatus;
+  const bstate = backupState(config, bss, nowMs);
+  const hasBackup = bstate !== "off";
+  const hp = ctx.homeProxy;
+  const hpState = homeProxyState(hp, nowMs);
+  // 家用備援真的派得上用場：在線、自報健康、而且會下發（手動備援沒蓋過它）
+  const homeUsable = !!hp && hp.healthy !== false && hpState === "online" && needsHomeProxy(config);
+  const onlineDevs = devList.filter((d) => onlineState(d, nowMs) === "online");
+  const homeBoxes = hp && hp.publicIp ? onlineDevs.filter((d) => sameHomeIp(d.ip, hp.publicIp)).length : 0;
+  const onBackup = onlineDevs.filter((d) => d.ln === 1).length;
+  const down = (s) => s === "bad" || s === "stale";
   const issues = [];
-  if (state === "bad") issues.push(["red", `直播源異常：${reasonText(ss.reason)}，看門狗處理中`]);
-  else if (state === "stale") issues.push(["red", "直播源伺服器的看門狗沒回報，VPS 可能離線"]);
+  if (down(state)) {
+    const why = state === "bad" ? reasonText(ss.reason) : ss && ss._unreachable ? `連不上主機（${ss._unreachable}）` : "看門狗沒回報，VPS 可能離線";
+    const away = onlineDevs.length - homeBoxes;
+    if (down(bstate)) issues.push(["red", `主線路與備援線路都異常（主線路：${why}），盒子可能沒有畫面`]);
+    else if (bstate === "ok") issues.push(["yellow", `主線路異常（${why}）→ 盒子已自動改用備援線路`]);
+    else if (homeUsable && away <= 0) issues.push(["yellow", `主線路異常（${why}）→ 同一個家的盒子有家用備援撐著`]);
+    else if (homeUsable) issues.push(["red", `主線路異常（${why}）；家用備援只顧得到同一個家的 ${homeBoxes} 台，其他 ${away} 台受影響`]);
+    else if (state === "bad") issues.push(["red", `直播源異常：${why}，看門狗處理中${bstate === "none" ? "（備援線路沒有監測資料，盒子會自動嘗試改用）" : ""}`]);
+    else issues.push(["red", (ss && ss._unreachable ? `連不上直播源主機（${ss._unreachable}），VPS 可能離線` : "直播源伺服器的看門狗沒回報，VPS 可能離線") + (bstate === "none" ? "（盒子會自動嘗試備援線路）" : "")]);
+  } else if (down(bstate)) {
+    issues.push(["yellow", `備援線路異常（${bstate === "bad" ? reasonText(bss.reason) : bss && bss._unreachable ? "連不上主機" : "看門狗沒回報"}），主線路正常、不影響觀看`]);
+  }
+  if (onBackup && !down(state)) issues.push(["yellow", `${onBackup} 台盒子還在走備援線路`]);
   const failing = devList.filter((d) => onlineState(d, nowMs) === "online" && d.lastOk === false && nowMs - (Date.parse(d.lastResultAt) || 0) < 3600000).length;
   if (failing) issues.push(["red", `${failing} 台線上盒子最近載入頻道失敗`]);
   const unstable = devList.filter((d) => onlineState(d, nowMs) === "online" && playHealth(d, nowMs).level === "bad").length;
@@ -206,7 +234,10 @@ function renderHeadline(ctx, stat, nowMs) {
 
   const parts = [];
   parts.push(`${stat.online} 台線上` + (stat.total ? `（共 ${stat.total} 台）` : ""));
-  if (state !== "none") parts.push("直播源" + describeSource(ss, state, nowMs));
+  if (state !== "none") parts.push((hasBackup ? "主線路" : "直播源") + describeSource(ss, state, nowMs));
+  if (hasBackup) parts.push("備援線路" + describeSource(bss, bstate, nowMs));
+  if (onBackup && down(state)) parts.push(`${onBackup} 台走備援線路`);
+  if (hp) parts.push(homeProxyLine(hp, hpState, homeBoxes, config, nowMs));
   if (ss && ss.epg_updated) parts.push("節目表 " + esc(String(ss.epg_updated).slice(5, 16)) + " 更新");
   const up = mon ? uptime24h(mon, nowMs) : null;
   if (up != null) parts.push(`24 小時可用率 ${up}%`);
@@ -220,6 +251,41 @@ function renderHeadline(ctx, stat, nowMs) {
         ${issues.length ? `<div class="head-issues">${issues.map((i) => `<span class="issue ${i[0]}">${esc(i[1])}</span>`).join("")}</div>` : ""}
       </div>
     </div>`;
+}
+
+/** 總覽一句話裡的家用備援狀態 */
+function homeProxyLine(hp, hpState, homeBoxes, config, nowMs) {
+  if (hpState !== "online") return `家用備援離線（最後紀錄 ${relativeTime(hp.lastSeen, nowMs) || "-"}）`;
+  const extra = [];
+  extra.push(`${hp.channels != null ? hp.channels : "?"} 台頻道`);
+  if (homeBoxes) extra.push(`同一個家 ${homeBoxes} 台盒子線上`);
+  if (hp.healthy === false) extra.push("但代理自報異常、暫不下發");
+  else if (!needsHomeProxy(config)) extra.push("目前用手動備援、不下發");
+  else if (config.homeProxyRole === "primary") extra.push("家裡的盒子優先走它");
+  return `家用備援在線（${extra.join("，")}）`;
+}
+
+/** 一條線路的看門狗狀態橫幅（主線路 / 備援線路共用） */
+function sourceBanner(ss, label, nowMs, isBackup) {
+  if (ss._unreachable) {
+    return `<div class="banner warn"><span class="bi">⚠️</span><div>${label} <b>連不上</b>（${esc(ss._unreachable)}），VPS 可能離線、關機或網路斷了。${isBackup ? "主線路正常時不影響觀看。" : ""}</div></div>`;
+  }
+  const ageMs = ss.checked_at_ms ? nowMs - ss.checked_at_ms : NaN;
+  const stale = !Number.isFinite(ageMs) || ageMs > 20 * 60 * 1000;
+  const when = ss.checked_at_ms ? relativeTime(new Date(ss.checked_at_ms).toISOString(), nowMs) : "-";
+  const ipTxt = ss.public_ip ? `出口 IP ${esc(ss.public_ip)}` : "出口 IP 未知";
+  const epgTxt = ss.epg_updated ? `節目表更新於 ${esc(String(ss.epg_updated).slice(5, 16))}` : "";
+  const actTxt = ss.last_action && ss.last_action !== "none"
+    ? `最近自動處置：${esc(actionText(ss.last_action))}${ss.last_action_at ? "（" + esc(relativeTime(ss.last_action_at, nowMs)) + "）" : ""}`
+    : "";
+  const heal = selfHealText(ss);
+  if (stale) {
+    return `<div class="banner warn"><span class="bi">⚠️</span><div>${label}的看門狗 <b>${when === "-" ? "沒有回報" : when + "後就沒再回報"}</b>，VPS 可能離線或排程停了。</div></div>`;
+  }
+  if (ss.healthy) {
+    return `<div class="banner off"><span class="bi">🟢</span><div>${label} <b>正常</b>（實測熱門台切片與冷門台 API 解析，${when}）。${ipTxt}。${epgTxt}${actTxt ? " " + actTxt : ""}${heal ? `<br>🛠️ ${esc(heal)}` : ""}</div></div>`;
+  }
+  return `<div class="banner warn"><span class="bi">${isBackup ? "🟡" : "🔴"}</span><div>${label} <b>異常</b>：連續 <b>${esc(ss.consecutive_failures)}</b> 次實測失敗（${esc(reasonText(ss.reason))}，${when}，${ipTxt}）。看門狗會自動清快取、重啟與更換出口節點${actTxt ? "；" + actTxt : ""}。${isBackup ? "主線路正常時不影響觀看，有空再處理。" : "若 30 分鐘內未恢復請通知維護人員。"}${heal ? `<br>🛠️ ${esc(heal)}` : ""}</div></div>`;
 }
 
 /** 24 小時健康色條（96 格 × 15 分鐘） */
@@ -237,7 +303,11 @@ export function renderHistoryStrip(mon, nowMs) {
     <div class="hist-legend"><span><i class="ok"></i>正常</span><span><i class="bad"></i>異常</span><span><i class="stale"></i>看門狗沒回報</span><span><i class="none"></i>無資料</span>${up != null ? `<span style="margin-left:auto;color:var(--text)">24 小時可用率 <b>${up}%</b></span>` : ""}</div>`;
 }
 
-const ALERT_KIND = { src_down: "直播源異常", src_stale: "看門狗沒回報", src_up: "直播源恢復", dev_off: "盒子離線", dev_on: "盒子回來", dev_fail: "盒子載入失敗" };
+const ALERT_KIND = {
+  src_down: "直播源異常", src_stale: "看門狗沒回報", src_up: "直播源恢復",
+  src_down_bk: "主線路異常（有備援）", both_down: "主備線路都異常", bsrc_down: "備援線路異常", bsrc_up: "備援線路恢復",
+  dev_off: "盒子離線", dev_on: "盒子回來", dev_fail: "盒子載入失敗",
+};
 function renderAlertRows(log, nowMs, limit) {
   const rows = (Array.isArray(log) ? log : []).slice(0, limit || 8);
   if (!rows.length) return `<div class="empty">尚無警示事件（這是好事）</div>`;
@@ -277,7 +347,8 @@ export function renderOverview(ctx) {
     .map((d) => {
       const ph = playHealth(d, nowMs);
       const phTxt = ph.level === "bad" ? `<span class="ph bad" title="${esc(ph.text)}">⚠ 重連 ${d.pe} 次</span>` : ph.level === "warn" ? `<span class="ph warn">重連 ${d.pe} 次</span>` : "";
-      return `<div class="now-row"><span class="sdot online"></span><span class="nm">${esc(d.nick || d.id)}</span><span class="ch">${esc(d.now)}</span>${phTxt}<span class="tm">${esc(relativeTime(d.nowAt || d.lastSeen, nowMs))}</span></div>`;
+      const lnTxt = d.ln === 1 ? `<span class="ph bk" title="主線路連續失敗，盒子自動改用備援線路">備援線路</span>` : "";
+      return `<div class="now-row"><span class="sdot online"></span><span class="nm">${esc(d.nick || d.id)}</span><span class="ch">${esc(d.now)}</span>${lnTxt}${phTxt}<span class="tm">${esc(relativeTime(d.nowAt || d.lastSeen, nowMs))}</span></div>`;
     })
     .join("");
 
@@ -293,25 +364,15 @@ export function renderOverview(ctx) {
     .join("");
 
   const banners = [];
-  // 直播源伺服器看門狗（VPS 每 5 分鐘實測頻道解析與切片）
+  // 直播源伺服器看門狗（VPS 每 5 分鐘實測頻道解析與切片）；有備援線路時兩條各一條橫幅
   const ss = ctx.sourceStatus;
-  if (ss) {
-    const ageMs = ss.checked_at_ms ? nowMs - ss.checked_at_ms : NaN;
-    const stale = !Number.isFinite(ageMs) || ageMs > 20 * 60 * 1000;
-    const when = ss.checked_at_ms ? relativeTime(new Date(ss.checked_at_ms).toISOString(), nowMs) : "-";
-    const ipTxt = ss.public_ip ? `出口 IP ${esc(ss.public_ip)}` : "出口 IP 未知";
-    const epgTxt = ss.epg_updated ? `節目表更新於 ${esc(String(ss.epg_updated).slice(5, 16))}` : "";
-    const actTxt = ss.last_action && ss.last_action !== "none"
-      ? `最近自動處置：${esc(actionText(ss.last_action))}${ss.last_action_at ? "（" + esc(relativeTime(ss.last_action_at, nowMs)) + "）" : ""}`
-      : "";
-    const reasonTxt = reasonText(ss.reason);
-    if (stale) {
-      banners.push(`<div class="banner warn"><span class="bi">⚠️</span><div>直播源伺服器的看門狗 <b>${when === "-" ? "沒有回報" : when + "後就沒再回報"}</b>，VPS 可能離線或排程停了。</div></div>`);
-    } else if (ss.healthy) {
-      banners.push(`<div class="banner off"><span class="bi">🟢</span><div>直播源伺服器 <b>正常</b>（實測熱門台切片與冷門台 API 解析，${when}）。${ipTxt}。${epgTxt}${actTxt ? " " + actTxt : ""}</div></div>`);
-    } else {
-      banners.push(`<div class="banner warn"><span class="bi">🔴</span><div>直播源伺服器 <b>異常</b>：連續 <b>${esc(ss.consecutive_failures)}</b> 次實測失敗（${esc(reasonTxt)}，${when}，${ipTxt}）。看門狗會自動清快取、重啟與更換出口節點${actTxt ? "；" + actTxt : ""}。若 30 分鐘內未恢復請通知維護人員。</div></div>`);
-    }
+  const bss = ctx.backupStatus;
+  const hasBackup = !!String(config.backupSubscriptionUrl || "").trim();
+  if (ss) banners.push(sourceBanner(ss, hasBackup ? "直播源伺服器（主線路）" : "直播源伺服器", nowMs, false));
+  if (hasBackup) {
+    banners.push(bss
+      ? sourceBanner(bss, "備援線路", nowMs, true)
+      : `<div class="banner off"><span class="bi">🛟</span><div>備援線路 <b>已設定</b>（沒有看門狗資料，無法監測健康）。主線路連續失敗時盒子會自動改用它。</div></div>`);
   }
   banners.push(
     config.requireActivation
@@ -398,6 +459,7 @@ export function renderOverview(ctx) {
         <div class="item"><div class="k">Telegram 警示</div><div class="v"><span class="badge ${telegramReady(config) ? "on" : "off"}">${telegramReady(config) ? "已啟用" : "未設定"}</span></div></div>
         <div class="item"><div class="k">最後更新</div><div class="v mono">${esc(formatTaipeiFull(config.updatedAt))}</div></div>
         <div class="item full"><div class="k">目前訂閱網址</div><div class="v mono" title="token 已遮罩；完整網址在「直播源」分頁">${config.subscriptionUrl ? esc(maskToken(config.subscriptionUrl)) : "（尚未設定）"}</div></div>
+        <div class="item full"><div class="k">備援訂閱網址</div><div class="v mono" title="token 已遮罩；完整網址在「直播源」分頁">${hasBackup ? esc(maskToken(config.backupSubscriptionUrl)) : "（未設定）"}</div></div>
       </div>
       ${ctx.devicesError ? `<div class="inline-note" style="color:var(--danger)">⚠ 裝置清單讀取失敗（資料庫暫時無法使用，或今日免費額度用完），數字可能不完整，稍後再試。</div>` : ""}
       ${stat.blocked ? `<div class="inline-note">已封鎖裝置 ${stat.blocked} 台</div>` : ""}
@@ -415,13 +477,17 @@ export function renderSourcePanel(ctx) {
       <input type="hidden" name="_fields" value="source">
       <div class="block-head"><span class="block-title"><span class="ic">📡</span>直播源</span></div>
       <div class="block-sub">含 token 的 m3u 清單網址。App 不內建任何 token，一律由這裡下發；換 token 只要改這裡，盒子下次輪詢（最長 ${esc(config.pollIntervalMinutes)} 分鐘）或按「重載頻道」遠端指令就會更新。</div>
-      <label for="subscriptionUrl">訂閱網址<span class="hint">例如 http://你的IP:5050/channel?type=m3u&amp;token=…（HTTP 連接埠對老盒子最穩）</span></label>
+      <label for="subscriptionUrl">訂閱網址（主線路）<span class="hint">例如 http://你的IP:5050/channel?type=m3u&amp;token=…（HTTP 連接埠對老盒子最穩）</span></label>
       <textarea id="subscriptionUrl" name="subscriptionUrl" spellcheck="false">${esc(config.subscriptionUrl)}</textarea>
+      <label for="backupSubscriptionUrl">備援訂閱網址（選填）<span class="hint">主線路連續失敗時盒子自動改用，同名頻道合併多線路。不用請留空（留空時，跟家用備援同一個家的盒子會自動拿家用代理當備援，見下方）。</span></label>
+      <textarea id="backupSubscriptionUrl" name="backupSubscriptionUrl" spellcheck="false" placeholder="例如另一台主機的 http://…/channel?type=m3u&amp;token=…（不用請留空）">${esc(config.backupSubscriptionUrl || "")}</textarea>
       <div class="btn-row">
-        <button type="button" class="btn btn-secondary" onclick="testSource()">🔍 測試來源</button>
+        <button type="button" class="btn btn-secondary" onclick="testSource()">🔍 測試主線路</button>
+        <button type="button" class="btn btn-secondary" onclick="testSource('backup')">🔍 測試備援</button>
         <button type="submit" class="btn btn-primary">💾 儲存直播源</button>
       </div>
       <div id="testResult"></div>
+      <div id="testResultBackup"></div>
     </form>
     <div class="block">
       <div class="block-head"><span class="block-title"><span class="ic">🛰️</span>全部盒子立即重載</span></div>
@@ -430,6 +496,68 @@ export function renderSourcePanel(ctx) {
         <input type="hidden" name="action" value="cmd_all"><input type="hidden" name="value" value="reload">
         <button class="btn btn-secondary">🔁 所有盒子重新載入頻道</button>
       </form>
+    </div>`;
+}
+
+/**
+ * 家用備援卡片（直播源分頁）：家裡電腦的代理自動登記的狀態、角色、進階金鑰。
+ * 金鑰只出現在這張卡的密碼欄（管理員專用頁面），複製時提示訊息不回顯金鑰內容。
+ */
+export function renderHomeProxyCard(ctx) {
+  const { config, origin } = ctx;
+  const hp = ctx.homeProxy;
+  const nowMs = Date.now();
+  const st = homeProxyState(hp, nowMs);
+  const role = config.homeProxyRole === "primary" ? "primary" : "backup";
+  const manual = !!String(config.backupSubscriptionUrl || "").trim();
+  const key = String(config.homeProxyKey || "");
+  const badge = st === "online"
+    ? hp.healthy === false ? `<span class="badge warn-b">在線・自報異常</span>` : `<span class="badge good-b">在線</span>`
+    : st === "offline" ? `<span class="badge danger-b">離線</span>` : `<span class="badge off">尚未登記</span>`;
+
+  const notes = [];
+  if (hp && hp.healthy === false) notes.push(["warn", "家用代理自報異常（抓不到頻道）→ 暫時不下發給盒子，恢復後自動繼續。"]);
+  if (hp && nowMs - (Date.parse(hp.lastSeen) || 0) > HOME_FRESH_MS) notes.push(["warn", "超過 2 小時沒有登記 → 暫時不下發給盒子（電腦關機、睡眠或代理沒在跑）。"]);
+  if (manual && role === "backup") notes.push(["mute", "上面已手動填「備援訂閱網址」→ 盒子用手動那條，家用代理只顯示狀態、不下發。想讓家裡的盒子用家用代理，就清空手動備援，或把角色改成「優先」。"]);
+
+  const info = hp
+    ? `<div class="kv">
+        <div class="item"><div class="k">區網網址</div><div class="v mono">${esc(hp.lanUrl)}</div></div>
+        <div class="item"><div class="k">家裡的公網 IP</div><div class="v mono">${esc(hp.publicIp || "-")}</div></div>
+        <div class="item"><div class="k">代理版本</div><div class="v">${esc(hp.version || "-")}</div></div>
+        <div class="item"><div class="k">頻道數</div><div class="v">${esc(hp.channels != null ? hp.channels : "-")} 台</div></div>
+        <div class="item"><div class="k">最後回報</div><div class="v">${esc(relativeTime(hp.lastSeen, nowMs) || "-")}<span class="sub-v">${esc(formatTaipeiFull(hp.lastSeen))}（沒變化時每 30 分鐘記一次）</span></div></div>
+        <div class="item"><div class="k">登記方式</div><div class="v">${hp.via === "box" ? "免金鑰" + (hp.boxId ? `<span class="sub-v">同一個家的已授權盒子 ${esc(hp.boxId)} 擔保</span>` : "") : "金鑰"}</div></div>
+      </div>`
+    : `<div class="empty">還沒有家用代理登記過。在家裡的 Windows 電腦執行安裝指令，裝好幾分鐘內就會出現在這裡。</div>`;
+
+  return `
+    <div class="block">
+      <div class="block-head"><span class="block-title"><span class="ic">🏠</span>家用備援（家裡電腦）</span>${badge}</div>
+      <div class="block-sub">家裡電腦跑的代理會自動登記，只下發給跟它同一個家（同一個公網 IP）的盒子，走區網直連；45 分鐘內有紀錄算在線。<b>換新電腦執行安裝指令就會自動登記，不用改這裡。</b></div>
+      ${info}
+      ${notes.map((n) => `<div class="note-box ${n[0]}">${esc(n[1])}</div>`).join("")}
+      <form method="POST" action="/admin/save">
+        <input type="hidden" name="_fields" value="home">
+        <label>家用備援的角色<span class="hint">只影響跟家用代理同一個家的盒子；其他地點的盒子照舊</span></label>
+        <div class="radio-row">
+          <label class="radio"><input type="radio" name="homeProxyRole" value="backup"${role === "backup" ? " checked" : ""}><span><b>備援</b>（預設）：雲端主線路壞了才改用家用代理</span></label>
+          <label class="radio"><input type="radio" name="homeProxyRole" value="primary"${role === "primary" ? " checked" : ""}><span><b>優先</b>：家裡的盒子優先走家用代理（區網直連），雲端主線路改當備援</span></label>
+        </div>
+        <button type="submit" class="btn btn-secondary">💾 儲存角色</button>
+      </form>
+      <details class="howto">
+        <summary>進階：登記金鑰（選用）</summary>
+        <div class="inline-note">平常不用金鑰：同一個家 24 小時內有已授權（未封鎖、未到期）的盒子上線，家用代理就能自動登記。盒子還沒授權、或要讓另一個地方的電腦強制接手時，才在安裝時帶這把金鑰（標頭 <code>X-Home-Key</code>）。登記端點 <code>POST ${esc(origin)}/api/home-proxy</code></div>
+        ${key
+          ? `<input type="password" id="homeKey" value="${esc(key)}" readonly autocomplete="off" spellcheck="false" class="mono" style="margin-top:10px">
+        <div class="btn-row" style="gap:8px;margin-top:8px">
+          <button type="button" class="btn-mini" onclick="toggleHomeKey(this)">👁 顯示</button>
+          <button type="button" class="btn-mini btn-info" onclick="copyHomeKey()">📋 複製金鑰</button>
+          <form class="row-form" method="POST" action="/admin/system" data-confirm="重新產生後舊金鑰立即失效：帶舊金鑰登記的家用代理要改用新金鑰（免金鑰登記的不受影響）。確定？"><input type="hidden" name="action" value="regen_home_key"><button class="btn-mini btn-danger">🔄 重新產生</button></form>
+        </div>`
+          : `<form method="POST" action="/admin/system" style="margin-top:10px"><input type="hidden" name="action" value="regen_home_key"><button class="btn-mini btn-info">🔑 產生金鑰</button></form>`}
+      </details>
     </div>`;
 }
 
@@ -552,8 +680,9 @@ export function renderDevicesSection(ctx) {
   const nowMs = Date.now();
   const latestVer = ota && ota.version ? ota.version : 0;
   const online = list.filter((d) => onlineState(d, nowMs) === "online").length;
+  const onBackup = list.filter((d) => d.ln === 1 && onlineState(d, nowMs) === "online").length;
   const body = list.length
-    ? list.map((d) => renderDeviceCard(d, config, latestVer, nowMs)).join("")
+    ? list.map((d) => renderDeviceCard(d, config, latestVer, nowMs, ctx.homeProxy)).join("")
     : ctx.devicesError
     ? `<div class="empty" style="color:var(--danger)">裝置清單讀取失敗（資料庫暫時無法使用，或今日免費額度用完）。這不代表盒子有問題，稍後再按「重新整理」。</div>`
     : `<div class="empty">尚無裝置上線（盒子裝好 App 開過後會出現）</div>`;
@@ -574,6 +703,7 @@ export function renderDevicesSection(ctx) {
         <button type="button" class="fchip" data-f="unauth" onclick="setDevFilter(this)">未授權</button>
         <button type="button" class="fchip" data-f="blocked" onclick="setDevFilter(this)">已封鎖</button>
         ${latestVer ? `<button type="button" class="fchip" data-f="oldver" onclick="setDevFilter(this)">舊版 App</button>` : ""}
+        ${onBackup ? `<button type="button" class="fchip" data-f="backup" onclick="setDevFilter(this)">走備援線路（${onBackup}）</button>` : ""}
       </div>
       <div class="bulk-row">
         <span class="bulk-label">全部裝置</span>
@@ -592,7 +722,7 @@ export function renderDevicesSection(ctx) {
     </div>`;
 }
 
-export function renderDeviceCard(d, config, latestVer, nowMs) {
+export function renderDeviceCard(d, config, latestVer, nowMs, hp) {
   const id = String(d && d.id != null ? d.id : "");
   const nick = String(d && d.nick ? d.nick : "");
   const title = nick || id || "（未命名）";
@@ -618,12 +748,25 @@ export function renderDeviceCard(d, config, latestVer, nowMs) {
   const fsEff = effectiveFontScale(d, config);
   const fsOverride = d && d.fontScale ? d.fontScale : "";
   const cmd = pendingCmd(d, nowMs);
+  // 目前播放用的線路（App 心跳 ln：0 主線路、1 備援線路）；家用代理當哪條線就標出來
+  const ln = d && typeof d.ln === "number" ? d.ln : null;
+  const onBackupNow = ln === 1 && state === "online";
+  let lineFact;
+  if (ln == null) lineFact = ["線路", "未回報（舊版 App）", "mute"];
+  else {
+    const lines = effectiveLines(config, hp || null, d.ip, nowMs);
+    const homeTag = (ln === 0 && lines.homeProxy === "primary") || (ln === 1 && lines.homeProxy === "backup") ? "（家用代理）" : "";
+    lineFact = ln === 1
+      ? ["線路", "備援線路" + homeTag + (d.lnAt ? " · " + relativeTime(d.lnAt, nowMs) + "切換" : ""), "info"]
+      : ["線路", "主線路" + homeTag, "ok"];
+  }
 
   const badges =
     (config.requireActivation
       ? authActive ? `<span class="badge ok-b">已授權</span>` : dExpired ? `<span class="badge warn-b">已到期</span>` : `<span class="badge danger-b">未授權</span>`
       : authActive ? `<span class="badge mute-b">已授權</span>` : "") +
     (blocked ? `<span class="badge danger-b">已封鎖</span>` : "") +
+    (onBackupNow ? `<span class="badge info-b" title="主線路連續失敗，盒子自動改用備援線路">備援線路中</span>` : "") +
     (d && d.watch === true ? `<span class="badge info-b" title="離線超過門檻會 Telegram 通知">重點監控</span>` : "") +
     (isOld ? `<span class="badge warn-b" title="最新 v${latestVer}">舊版</span>` : "");
 
@@ -637,6 +780,7 @@ export function renderDeviceCard(d, config, latestVer, nowMs) {
     ["授權", authText, authActive ? "ok" : dExpired || (config.requireActivation && !authed) ? "bad" : "mute"],
     srcFact,
     phFact,
+    lineFact,
     ["最後上線", (relativeTime(d && d.lastSeen, nowMs) || "-") + "（" + stateText + "）", state === "online" ? "ok" : "mute"],
     ["版本", ver ? ver + (isOld ? " ↑可更新" : "") : "-", isOld ? "warn" : "mute"],
     ["機型", model || "-", "mute"],
@@ -715,7 +859,7 @@ export function renderDeviceCard(d, config, latestVer, nowMs) {
       ${devForm(idAttr, "delete", "🗑️ 刪除裝置紀錄", "danger", `確定刪除 ${esc(title)} 的紀錄？（盒子下次上線會重新登記，授權會消失）`)}`;
 
   const searchKey = (id + " " + nick + " " + model + " " + (d && d.now ? d.now : "")).toLowerCase().replace(/"/g, "");
-  return `<div class="dev-card${blocked ? " is-blocked" : ""}" data-search="${esc(searchKey)}" data-online="${state === "online" ? 1 : 0}" data-authed="${authActive ? 1 : 0}" data-blocked="${blocked ? 1 : 0}" data-oldver="${isOld ? 1 : 0}">
+  return `<div class="dev-card${blocked ? " is-blocked" : ""}${onBackupNow ? " on-backup" : ""}" data-search="${esc(searchKey)}" data-online="${state === "online" ? 1 : 0}" data-authed="${authActive ? 1 : 0}" data-blocked="${blocked ? 1 : 0}" data-oldver="${isOld ? 1 : 0}" data-backup="${onBackupNow ? 1 : 0}">
     <div class="dev-head">
       <div class="dev-title"><span class="sdot ${state}" title="${stateText}"></span><div><div class="dev-name">${esc(title)}</div><div class="dev-id mono">${idAttr}</div></div></div>
       <div class="dev-badges">${badges}</div>
@@ -763,7 +907,7 @@ export function renderAlertsPanel(ctx) {
         <label for="${id}">${label}<span class="hint">${hint}</span></label>
       </div>`;
   const statusBanner = ready
-    ? `<div class="banner on"><span class="bi">🔔</span><div>Telegram 警示 <b>已啟用</b>：直播源異常超過 ${esc(config.alertSourceMin)} 分鐘、恢復、重點盒子離線超過 ${esc(config.alertDeviceOfflineMin)} 分鐘${config.alertBoxFail !== false ? "、盒子載入頻道失敗" : ""}都會通知${config.alertQuiet ? "；靜音時段 " + esc(config.alertQuiet) + " 時" : ""}。</div></div>`
+    ? `<div class="banner on"><span class="bi">🔔</span><div>Telegram 警示 <b>已啟用</b>：直播源異常超過 ${esc(config.alertSourceMin)} 分鐘、恢復、重點盒子離線超過 ${esc(config.alertDeviceOfflineMin)} 分鐘${config.alertBoxFail !== false ? "、盒子載入頻道失敗" : ""}都會通知${config.alertQuiet ? "；靜音時段 " + esc(config.alertQuiet) + " 時" : ""}。${String(config.backupSubscriptionUrl || "").trim() ? "主 / 備援線路各自監控：主線路壞但備援正常標為「較不緊急」，兩條都壞才是緊急。" : ""}</div></div>`
     : `<div class="banner warn"><span class="bi">🔕</span><div>Telegram 警示 <b>尚未啟用</b>。監控每 5 分鐘照樣在跑、事件會記在下方，但不會有人收到通知。照下面三步接上 Telegram，直播源出事你會第一個知道，不必等長輩打電話來。</div></div>`;
 
   return `
@@ -915,7 +1059,7 @@ export function renderSystemPanel(ctx) {
     ? histList.map((h, i) => {
         const next = i === 0 ? config : histList[i - 1];   // 這份被「下一份」取代時改了什麼
         const changed = diffConfigKeys(h, next).map(configLabel);
-        return `<div class="hist-row"><div class="hist-meta"><b>v${esc(h.version != null ? h.version : "?")}</b><span>${esc(formatTaipeiFull(h.updatedAt))}（${esc(relativeTime(h.updatedAt, nowMs))}）</span></div><div class="hist-diff">${changed.length ? "之後改了：" + esc(changed.join("、")) : "與後一版相同"}</div><div class="hist-src mono">${esc(h.subscriptionUrl ? maskToken(h.subscriptionUrl).slice(0, 90) + (h.subscriptionUrl.length > 90 ? "…" : "") : "（無直播源）")}</div><form method="POST" action="/admin/system" data-confirm="把設定還原成 v${esc(h.version)} 的內容？（會另存成新版本，可再還原回來）"><input type="hidden" name="action" value="restore_config"><input type="hidden" name="idx" value="${i}"><button class="btn-mini btn-gold">↩ 還原成這版</button></form></div>`;
+        return `<div class="hist-row"><div class="hist-meta"><b>v${esc(h.version != null ? h.version : "?")}</b><span>${esc(formatTaipeiFull(h.updatedAt))}（${esc(relativeTime(h.updatedAt, nowMs))}）</span></div><div class="hist-diff">${changed.length ? "之後改了：" + esc(changed.join("、")) : "與後一版相同"}</div><div class="hist-src mono">${esc(h.subscriptionUrl ? maskToken(h.subscriptionUrl).slice(0, 90) + (h.subscriptionUrl.length > 90 ? "…" : "") : "（無直播源）")}${h.backupSubscriptionUrl ? "<br>備援 " + esc(maskToken(h.backupSubscriptionUrl).slice(0, 90) + (h.backupSubscriptionUrl.length > 90 ? "…" : "")) : ""}</div><form method="POST" action="/admin/system" data-confirm="把設定還原成 v${esc(h.version)} 的內容？（會另存成新版本，可再還原回來）"><input type="hidden" name="action" value="restore_config"><input type="hidden" name="idx" value="${i}"><button class="btn-mini btn-gold">↩ 還原成這版</button></form></div>`;
       }).join("")
     : `<div class="empty">尚無歷史（每次儲存設定會自動留一份，最多 12 份）</div>`;
   const auditList = Array.isArray(audit) ? audit : [];
@@ -981,6 +1125,7 @@ export function renderSystemPanel(ctx) {
         <div class="item"><div class="k">健康檢查</div><div class="v mono">${esc(origin)}/api/health</div></div>
         <div class="item"><div class="k">OTA 查詢</div><div class="v mono">${esc(origin)}/api/update</div></div>
         <div class="item"><div class="k">APK 下載</div><div class="v mono">${esc(origin)}/dl/latest.apk</div></div>
+        <div class="item full"><div class="k">家用備援登記（家裡電腦的代理用，POST）</div><div class="v mono">${esc(origin)}/api/home-proxy</div></div>
       </div>
       <div class="inline-note">KV 寫入節流：盒子心跳沒有變化時最多每 10 分鐘寫一次；監控每 15 分鐘寫一次歷史。免費方案每日 1000 次寫入也夠用。</div>
     </div>`;

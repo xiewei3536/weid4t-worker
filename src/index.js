@@ -7,6 +7,7 @@
  *   2. 管理員用手機瀏覽器登入的管理頁（GET /admin）：換直播源、公告、跑馬燈、
  *      啟動碼授權、裝置管理、字體大小、OTA。
  *   3. OTA：代理私有 GitHub Release 的 APK 給盒子。
+ *   4. 家用備援：家裡電腦的代理自動登記（POST /api/home-proxy），只下發給同一個家的盒子。
  *
  * 設計重點：
  *   - 零依賴，只用 Workers 內建 Web API；程式拆成 lib / api / admin / ui 四個模組。
@@ -21,6 +22,7 @@ import {
   handleDownloadApk,
   handleGetConfig,
   handleHealth,
+  handleHomeProxy,
   handleTime,
   handleUpdateInfo,
 } from "./api.js";
@@ -63,6 +65,7 @@ export default {
       if (pathname === "/api/update" && method === "GET") return await handleUpdateInfo(request, env);
       if (pathname === "/api/time" && method === "GET") return handleTime();
       if (pathname === "/api/health" && method === "GET") return await handleHealth(env);
+      if (pathname === "/api/home-proxy" && method === "POST") return await handleHomeProxy(request, env);
       if (pathname === "/dl/latest.apk" && method === "GET") return await handleDownloadApk(request, env);
       if (pathname === "/asset/qr" && method === "GET") return await handleAssetQr(env);
       if (pathname === "/manifest.webmanifest" && method === "GET") return manifestResponse(url.origin);

@@ -14,6 +14,7 @@ import {
   DEFAULT_CONFIG,
   DEVADM_PREFIX,
   DEVICE_PREFIX,
+  ONLINE_MS,
   OTA_CACHE_KEY,
   QR_ASSET_KEY,
   appendAudit,
@@ -23,12 +24,15 @@ import {
   diffConfigKeys,
   escapeHtml,
   formatTaipeiFull,
+  genHomeKey,
   htmlResponse,
   isValidFontScale,
+  isValidHomeKey,
   jsonResponse,
   loadAudit,
   loadConfig,
   loadConfigHistory,
+  loadHomeProxy,
   maskToken,
   nowIso,
   parseFloatOr,
@@ -148,11 +152,12 @@ const str = (form, k) => (form.get(k) == null ? "" : String(form.get(k))).trim()
  *   page（整頁）= 全部；partial 名稱 → 只載該區塊會用到的東西。
  */
 const NEED = {
-  page: ["devices", "codes", "ota", "status", "mon", "audit", "hist"],
-  overview: ["devices", "ota", "status", "mon"],
-  devices: ["devices", "ota"],
+  page: ["devices", "codes", "ota", "status", "bstatus", "mon", "audit", "hist", "home", "homekey"],
+  overview: ["devices", "ota", "status", "bstatus", "mon", "home"],
+  devices: ["devices", "ota", "home"],
   codes: ["codes"],
   source: [],
+  home: ["home", "homekey"],
   auth: [],
   notice: [],
   system: ["ota", "audit", "hist"],
@@ -162,20 +167,34 @@ const NEED = {
 async function buildContext(request, env, part) {
   const need = new Set(NEED[part] || NEED.page);
   const config = await loadConfig(env);
+  // 「家用備援」卡片第一次出現時自動產生登記金鑰（只寫這一欄，不升版本、不進歷史）
+  if (need.has("homekey") && !config.homeProxyKey) {
+    config.homeProxyKey = genHomeKey();
+    try {
+      await saveConfig(env, config);
+      await appendAudit(env, request, "自動產生家用備援金鑰");
+    } catch (err) {
+      console.error("家用備援金鑰寫入失敗:", err);
+      config.homeProxyKey = "";   // 沒存成功就別顯示（卡片會改顯示「產生金鑰」按鈕）
+    }
+  }
+  const hasBackup = !!String(config.backupSubscriptionUrl || "").trim();
   let devicesError = false;
-  const [devices, codes, ota, sourceStatus, mon, audit, hist] = await Promise.all([
+  const [devices, codes, ota, sourceStatus, backupStatus, mon, audit, hist, homeProxy] = await Promise.all([
     need.has("devices")
       ? loadDevices(env).catch((err) => { console.error("裝置列舉失敗:", err); devicesError = true; return []; })
       : Promise.resolve([]),
     need.has("codes") ? loadCodes(env) : Promise.resolve([]),
     need.has("ota") ? getLatestRelease(env).catch(() => null) : Promise.resolve(null),
     need.has("status") ? fetchSourceStatus(config.subscriptionUrl) : Promise.resolve(null),
+    need.has("bstatus") && hasBackup ? fetchSourceStatus(config.backupSubscriptionUrl) : Promise.resolve(null),
     need.has("mon") ? loadMonState(env) : Promise.resolve(null),
     need.has("audit") ? loadAudit(env) : Promise.resolve([]),
     need.has("hist") ? loadConfigHistory(env) : Promise.resolve([]),
+    need.has("home") ? loadHomeProxy(env) : Promise.resolve(null),
   ]);
   return {
-    config, devices, codes, ota, sourceStatus, mon, audit, hist, devicesError,
+    config, devices, codes, ota, sourceStatus, backupStatus, mon, audit, hist, homeProxy, devicesError,
     origin: new URL(request.url).origin,
     hasGithubToken: !!env.GITHUB_TOKEN,
   };
@@ -189,7 +208,7 @@ export async function handleAdminPage(request, env) {
   return htmlResponse(renderAdminHtml(ctx), 200);
 }
 
-/** GET /admin/partial?name=overview|devices|codes|source|system|notice|auth|alerts → HTML 片段 */
+/** GET /admin/partial?name=overview|devices|codes|source|home|system|notice|auth|alerts → HTML 片段 */
 export async function handleAdminPartial(request, env) {
   const blocked = await guard(request, env);
   if (blocked) return blocked;
@@ -234,6 +253,21 @@ export async function handleAdminSave(request, env) {
     }
     updated.subscriptionUrl = subscriptionUrl;
     changes.push("直播源");
+    // 備援線路（選填）：表單沒帶這欄（舊版管理頁還開著 / 直接 POST）就維持原值，免得一存主線路就把備援清掉
+    if (form.has("backupSubscriptionUrl")) {
+      const backupSubscriptionUrl = str(form, "backupSubscriptionUrl");
+      if (backupSubscriptionUrl && !/^https?:\/\//i.test(backupSubscriptionUrl)) {
+        return respond(request, false, "備援訂閱網址格式不正確（必須以 http:// 或 https:// 開頭；不用備援請留空）", null, current);
+      }
+      if (backupSubscriptionUrl.length > 2000) {
+        return respond(request, false, "備援訂閱網址太長", null, current);
+      }
+      if (backupSubscriptionUrl && backupSubscriptionUrl === subscriptionUrl) {
+        return respond(request, false, "備援訂閱網址跟主訂閱網址一樣，請填另一條線路（不用備援請留空）", null, current);
+      }
+      updated.backupSubscriptionUrl = backupSubscriptionUrl;
+      if (backupSubscriptionUrl !== (current.backupSubscriptionUrl || "")) changes.push("備援直播源");
+    }
   }
 
   if (fields === "all" || fields === "notice") {
@@ -290,6 +324,13 @@ export async function handleAdminSave(request, env) {
     changes.push("授權設定");
   }
 
+  if (fields === "home") {
+    const role = str(form, "homeProxyRole");
+    if (role !== "backup" && role !== "primary") return respond(request, false, "家用備援角色只能是「備援」或「優先」", null, current);
+    updated.homeProxyRole = role;
+    changes.push("家用備援角色");
+  }
+
   if (fields === "alerts") {
     updated.alertsEnabled = form.get("alertsEnabled") === "on";
     const tok = str(form, "tgBotToken");
@@ -323,12 +364,19 @@ export async function handleAdminSave(request, env) {
   }
 
   const what = changes.length ? changes.join("、") : "設定";
-  await appendAudit(env, request, `儲存${what}（v${updated.version}）${fields === "source" ? "：" + maskToken(updated.subscriptionUrl).slice(0, 120) : ""}`);
+  let srcNote = "";
+  if (fields === "source") {
+    srcNote = "：" + maskToken(updated.subscriptionUrl).slice(0, 100);
+    if ((updated.backupSubscriptionUrl || "") !== (current.backupSubscriptionUrl || "")) {
+      srcNote += updated.backupSubscriptionUrl ? "；備援 " + maskToken(updated.backupSubscriptionUrl).slice(0, 80) : "；備援已移除";
+    }
+  }
+  await appendAudit(env, request, `儲存${what}（v${updated.version}）${srcNote}`);
   return respond(
     request,
     true,
     `${what}已儲存（版本 v${updated.version}），盒子下次輪詢就會套用`,
-    { version: updated.version, refresh: ["overview", fields === "source" ? "source" : "", fields === "alerts" ? "alerts" : ""].filter(Boolean) },
+    { version: updated.version, refresh: ["overview", fields === "source" || fields === "home" ? "home" : "", fields === "alerts" ? "alerts" : ""].filter(Boolean) },
     updated
   );
 }
@@ -422,8 +470,11 @@ async function summarizeBoxes(env) {
   } catch (_) {
     devices = [];
   }
-  let reported = 0, ok = 0, maxCount = 0, recentMs = 0, recentAt = "";
+  let reported = 0, ok = 0, maxCount = 0, recentMs = 0, recentAt = "", onBackup = 0;
+  const nowMs = Date.now();
   for (const d of devices) {
+    // 目前在線、且回報正走備援線路的盒子（ln=1）
+    if (d && d.ln === 1 && nowMs - (Date.parse(d.lastSeen) || 0) < ONLINE_MS) onBackup++;
     if (!d || !d.lastResultAt) continue;
     reported++;
     const ms = Date.parse(d.lastResultAt) || 0;
@@ -434,7 +485,7 @@ async function summarizeBoxes(env) {
       if (c > maxCount) maxCount = c;
     }
   }
-  return { reported, ok, maxCount, recentAt, recentRel: recentAt ? relativeTime(recentAt) : "" };
+  return { reported, ok, maxCount, recentAt, recentRel: recentAt ? relativeTime(recentAt) : "", onBackup };
 }
 
 /* ================================================================
@@ -828,10 +879,17 @@ export async function handleAdminUpload(request, env) {
       if (want === "boolean") v = v === true || v === "true" || v === "on";
       else if (want === "number") { v = parseIntOr(v, DEFAULT_CONFIG[k]); }
       else v = String(v == null ? "" : v);
+      // 家用代理金鑰：格式對才換（搬家沿用舊金鑰，家用代理不必重設）；不對就維持目前的
+      if (k === "homeProxyKey" && !isValidHomeKey(v)) continue;
+      if (k === "homeProxyRole" && v !== "primary") v = "backup";
+      if (k === "backupSubscriptionUrl") v = v.trim();
       if (JSON.stringify(v) !== JSON.stringify(config[k])) applied.push(configLabel(k));
       imported[k] = v;
     }
     if (imported.subscriptionUrl && !/^https?:\/\//i.test(imported.subscriptionUrl)) return respond(request, false, "匯入的訂閱網址格式不正確", null, config);
+    if (imported.backupSubscriptionUrl && (!/^https?:\/\//i.test(imported.backupSubscriptionUrl) || imported.backupSubscriptionUrl.length > 2000)) {
+      return respond(request, false, "匯入的備援訂閱網址格式不正確", null, config);
+    }
     if (!isValidFontScale(imported.fontScale)) imported.fontScale = "auto";
     if (imported.tgBotToken && !isValidTgToken(imported.tgBotToken)) imported.tgBotToken = "";
     imported.version = (config.version || 0) + 1;
@@ -844,7 +902,7 @@ export async function handleAdminUpload(request, env) {
     }
     await appendAudit(env, request, `匯入設定（v${imported.version}，${applied.length ? "變更：" + applied.join("、") : "無變更"}）`);
     return respond(request, true, `已匯入設定（v${imported.version}）${applied.length ? "，變更：" + applied.join("、") : "，內容與目前相同"}`, {
-      refresh: ["overview", "source", "notice", "system", "auth", "alerts"], version: imported.version,
+      refresh: ["overview", "source", "home", "notice", "system", "auth", "alerts"], version: imported.version,
     }, imported);
   }
 
@@ -948,8 +1006,9 @@ export async function handleAdminSystem(request, env) {
     const snap = hist[idx];
     if (!snap) return respond(request, false, "找不到這份歷史設定（可能已被新的擠掉）", null, current);
     const restored = { ...DEFAULT_CONFIG, ...snap, version: (current.version || 0) + 1, updatedAt: nowIso() };
-    // QR 圖本體沒有版本化，維持目前的
+    // QR 圖本體沒有版本化，維持目前的；家用代理金鑰是憑證不是設定，還原舊版也不換（否則家用代理會突然登記失敗）
     restored.contactQrVer = current.contactQrVer;
+    restored.homeProxyKey = current.homeProxyKey;
     const changed = diffConfigKeys(current, restored).map(configLabel);
     try {
       await pushConfigHistory(env, current);
@@ -959,8 +1018,23 @@ export async function handleAdminSystem(request, env) {
     }
     await appendAudit(env, request, `還原設定 v${snap.version || "?"} → v${restored.version}（${changed.length ? changed.join("、") : "無變更"}）`);
     return respond(request, true, `已還原成 v${snap.version || "?"} 的內容（新版本 v${restored.version}）${changed.length ? "，變更：" + changed.join("、") : ""}`, {
-      refresh: ["overview", "source", "notice", "system", "auth", "alerts"], version: restored.version,
+      refresh: ["overview", "source", "home", "notice", "system", "auth", "alerts"], version: restored.version,
     }, restored);
+  }
+
+  if (action === "regen_home_key") {
+    // 金鑰只有家用代理用、盒子看不到：只換這一欄，不升版本、不進歷史（免得盒子以為設定變了而重載）
+    const current = await loadConfig(env);
+    const updated = { ...current, homeProxyKey: genHomeKey() };
+    try {
+      await saveConfig(env, updated);
+    } catch (_) {
+      return respond(request, false, "KV 寫入失敗", null, current);
+    }
+    await appendAudit(env, request, current.homeProxyKey ? "重新產生家用備援金鑰（舊金鑰立即失效）" : "產生家用備援金鑰");
+    return respond(request, true, current.homeProxyKey ? "已重新產生家用備援金鑰：帶舊金鑰登記的家用代理要換成新金鑰（免金鑰登記的不受影響）" : "已產生家用備援金鑰", {
+      refresh: ["home"],
+    }, updated);
   }
 
   if (action === "clear_audit") {
@@ -999,7 +1073,8 @@ export async function handleAdminAlerts(request, env) {
 
   if (action === "run") {
     const r = await runMonitorTick(env, Date.now(), { force: true });
-    const stateTxt = { ok: "正常", bad: "異常", stale: "沒回報", none: "無看門狗資料" }[r.state] || r.state;
+    const T = { ok: "正常", bad: "異常", stale: "沒回報", none: "無看門狗資料", off: "未設定" };
+    const stateTxt = (T[r.state] || r.state) + (r.bstate && r.bstate !== "off" ? "；備援線路 " + (T[r.bstate] || r.bstate) : "");
     await appendAudit(env, request, `手動執行監控（直播源 ${stateTxt}，${r.events.length} 則事件）`);
     return respond(request, true, `已檢查：直播源 ${stateTxt}${r.events.length ? "，產生 " + r.events.length + " 則通知" : "，沒有新事件"}`, { refresh: ["alerts", "overview"] });
   }

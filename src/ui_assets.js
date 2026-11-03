@@ -187,7 +187,7 @@ select.sel{appearance:none;-webkit-appearance:none;background-image:linear-gradi
 code{background:var(--surface-2);border:1px solid var(--border);padding:2px 7px;border-radius:7px;word-break:break-all;font-family:var(--mono);font-size:12.5px;color:var(--accent)}
 
 /* ── 測試結果 ── */
-#testResult{margin-top:14px;display:none}
+#testResult,#testResultBackup{margin-top:14px;display:none}
 .result-card{border-radius:14px;padding:15px;border:1px solid var(--border);background:var(--surface-2)}
 .result-head{display:flex;align-items:center;gap:12px}
 .result-icon{width:38px;height:38px;flex:none;border-radius:11px;display:flex;align-items:center;justify-content:center;font-size:20px;font-weight:800;background:rgba(151,162,180,.12);color:var(--text-dim)}
@@ -209,6 +209,7 @@ code{background:var(--surface-2);border:1px solid var(--border);padding:2px 7px;
 .note-box.bad{background:rgba(255,92,108,.08);border-color:rgba(255,92,108,.35);color:var(--danger)}
 .note-box.warn{background:rgba(251,191,36,.10);border-color:rgba(251,191,36,.35);color:var(--gold)}
 .note-box.mute{background:rgba(151,162,180,.08);border-color:var(--border);color:var(--text-dim)}
+.note-box.info{background:rgba(96,165,250,.08);border-color:rgba(96,165,250,.35);color:var(--info)}
 
 /* ── 搜尋 / 篩選 ── */
 .search{width:100%;padding:12px 14px;font-size:16px;border-radius:12px;border:1px solid var(--border);background:var(--surface-2);color:var(--text);font-family:inherit;margin-bottom:10px}
@@ -227,6 +228,7 @@ code{background:var(--surface-2);border:1px solid var(--border);padding:2px 7px;
 .dev-card:hover{border-color:var(--border-hi)}
 .dev-card.hide,.code-row.hide{display:none}
 .dev-card.is-blocked{border-color:rgba(255,92,108,.35)}
+.dev-card.on-backup{border-color:rgba(96,165,250,.45);box-shadow:inset 3px 0 0 var(--info)}
 .dev-head{display:flex;align-items:flex-start;justify-content:space-between;gap:10px}
 .dev-title{min-width:0;display:flex;align-items:center;gap:10px}
 .sdot{width:11px;height:11px;border-radius:50%;flex:none;position:relative}
@@ -246,7 +248,7 @@ code{background:var(--surface-2);border:1px solid var(--border);padding:2px 7px;
 .fact{display:flex;justify-content:space-between;gap:8px;font-size:12.5px;border-bottom:1px dashed #1E2636;padding-bottom:5px;min-width:0}
 .fk{color:var(--text-dim);flex:0 0 auto}
 .fv{font-weight:600;text-align:right;word-break:break-all;color:var(--text)}
-.fv.ok{color:var(--accent)}.fv.bad{color:var(--danger)}.fv.mute{color:var(--text)}.fv.warn{color:var(--gold)}
+.fv.ok{color:var(--accent)}.fv.bad{color:var(--danger)}.fv.mute{color:var(--text)}.fv.warn{color:var(--gold)}.fv.info{color:var(--info)}
 .dev-curmsg{margin-top:10px;padding:9px 11px;border-radius:9px;font-size:13px;border:1px solid var(--border);word-break:break-word}
 .dev-curmsg.lv-info{color:var(--accent);background:rgba(45,212,191,.08);border-color:rgba(45,212,191,.3)}
 .dev-curmsg.lv-warn{color:var(--gold);background:rgba(251,191,36,.10);border-color:rgba(251,191,36,.35)}
@@ -350,8 +352,9 @@ code{background:var(--surface-2);border:1px solid var(--border);padding:2px 7px;
 .alog{display:flex;flex-direction:column;gap:8px;max-height:460px;overflow:auto;padding-right:2px}
 .alog-row{padding:10px 12px;border-radius:11px;background:var(--surface-2);border:1px solid var(--border);font-size:13px;line-height:1.6;white-space:pre-wrap;word-break:break-word;color:var(--text)}
 .alog-row .am{display:flex;justify-content:space-between;gap:8px;color:var(--text-faint);font-size:11.5px;margin-bottom:4px;white-space:normal;flex-wrap:wrap}
-.alog-row.k-src_down,.alog-row.k-src_stale,.alog-row.k-dev_off,.alog-row.k-dev_fail{border-color:rgba(255,92,108,.35);background:rgba(255,92,108,.05)}
-.alog-row.k-src_up,.alog-row.k-dev_on{border-color:rgba(52,211,153,.35);background:rgba(52,211,153,.05)}
+.alog-row.k-src_down,.alog-row.k-src_stale,.alog-row.k-both_down,.alog-row.k-dev_off,.alog-row.k-dev_fail{border-color:rgba(255,92,108,.35);background:rgba(255,92,108,.05)}
+.alog-row.k-src_down_bk,.alog-row.k-bsrc_down{border-color:rgba(251,191,36,.35);background:rgba(251,191,36,.05)}
+.alog-row.k-src_up,.alog-row.k-bsrc_up,.alog-row.k-dev_on{border-color:rgba(52,211,153,.35);background:rgba(52,211,153,.05)}
 .audit{display:flex;flex-direction:column;gap:5px;max-height:420px;overflow:auto}
 .audit-row{display:grid;grid-template-columns:118px 1fr auto;gap:10px;align-items:baseline;padding:8px 10px;border-radius:9px;background:var(--surface-2);border:1px solid var(--border);font-size:12.5px}
 .audit-row .at{color:var(--text-dim);font-variant-numeric:tabular-nums;white-space:nowrap}
@@ -369,6 +372,14 @@ code{background:var(--surface-2);border:1px solid var(--border);padding:2px 7px;
 .ph{font-size:11.5px;font-weight:700;padding:2px 8px;border-radius:999px;border:1px solid;white-space:nowrap;flex:none}
 .ph.bad{color:var(--danger);border-color:rgba(255,92,108,.4);background:rgba(255,92,108,.08)}
 .ph.warn{color:var(--gold);border-color:rgba(251,191,36,.4);background:rgba(251,191,36,.08)}
+.ph.bk{color:var(--info);border-color:rgba(96,165,250,.4);background:rgba(96,165,250,.08)}
+/* ── 家用備援卡片 ── */
+.radio-row{display:flex;flex-direction:column;gap:8px}
+.radio{display:flex;gap:11px;align-items:flex-start;margin:0;padding:12px 14px;border:1px solid var(--border);border-radius:12px;background:var(--surface-2);font-weight:500;font-size:13.5px;line-height:1.55;cursor:pointer}
+.radio input{width:19px;height:19px;flex:none;margin:1px 0 0;accent-color:var(--accent);cursor:pointer}
+.radio b{color:var(--text)}
+.radio:has(input:checked){border-color:rgba(45,212,191,.45);background:var(--accent-soft)}
+.sub-v{display:block;font-size:11.5px;font-weight:500;color:var(--text-dim);margin-top:2px}
 .howto{margin:12px 0 4px;border:1px dashed var(--border);border-radius:12px;padding:10px 14px}
 .howto summary{cursor:pointer;font-size:13.5px;font-weight:700;color:var(--accent);list-style:none}
 .howto summary::-webkit-details-marker{display:none}
@@ -445,7 +456,8 @@ export const ADMIN_JS = `
         || (devFilter === 'offline' && card.dataset.online === '0')
         || (devFilter === 'unauth' && card.dataset.authed === '0')
         || (devFilter === 'blocked' && card.dataset.blocked === '1')
-        || (devFilter === 'oldver' && card.dataset.oldver === '1');
+        || (devFilter === 'oldver' && card.dataset.oldver === '1')
+        || (devFilter === 'backup' && card.dataset.backup === '1');
       var show = okText && okFilter; if (show) shown++;
       card.classList.toggle('hide', !show);
     });
@@ -497,7 +509,7 @@ export const ADMIN_JS = `
   window.refreshParts = refreshParts;
   function refreshAll(){
     var b = $('#btnRefresh'); if (b) b.classList.add('spin');
-    refreshParts(['overview','devices','codes','notice','alerts','system'], function(){ if (b) b.classList.remove('spin'); toast('已更新'); });
+    refreshParts(['overview','devices','codes','home','notice','alerts','system'], function(){ if (b) b.classList.remove('spin'); toast('已更新'); });
   }
   window.refreshAll = refreshAll;
 
@@ -564,37 +576,57 @@ export const ADMIN_JS = `
     if (t) { copyText(t.getAttribute('data-copy'), '已複製 ' + t.getAttribute('data-copy')); }
   });
 
-  /* ── 測試來源 ── */
-  function renderBoxesHtml(b){
+  /* ── 家用備援金鑰：顯示 / 複製（提示訊息不回顯金鑰）── */
+  function toggleHomeKey(btn){
+    var k = $('#homeKey'); if (!k) return;
+    var show = k.type === 'password';
+    k.type = show ? 'text' : 'password';
+    if (btn) btn.textContent = show ? '🙈 隱藏' : '👁 顯示';
+  }
+  function copyHomeKey(){ var k = $('#homeKey'); if (k && k.value) copyText(k.value, '已複製金鑰'); }
+  window.toggleHomeKey = toggleHomeKey; window.copyHomeKey = copyHomeKey;
+
+  /* ── 測試來源（主線路 / 備援線路）── */
+  function renderBoxesHtml(b, bk){
     if (!b) return '';
-    if (b.ok > 0) return '<div class="note-box ok">✅ 盒子實測：' + b.ok + ' 台最近成功載入（最多 ' + b.maxCount + ' 台，' + (b.recentRel || '') + '）— 這是真實結果，可放心儲存。</div>';
-    if (b.reported > 0) return '<div class="note-box bad">盒子有回報，但最近未成功載入來源。</div>';
-    return '<div class="note-box mute">尚無盒子回報實測（盒子裝好 App 開過後，這裡會顯示真實載入結果）。</div>';
+    var onBk = b.onBackup > 0 ? '<div class="note-box info">ℹ 目前有 ' + b.onBackup + ' 台線上盒子正走備援線路（主線路連續失敗時自動切過去）。</div>' : '';
+    if (bk) return onBk;
+    if (b.ok > 0) return '<div class="note-box ok">✅ 盒子實測：' + b.ok + ' 台最近成功載入（最多 ' + b.maxCount + ' 台，' + (b.recentRel || '') + '）— 這是真實結果，可放心儲存。</div>' + onBk;
+    if (b.reported > 0) return '<div class="note-box bad">盒子有回報，但最近未成功載入來源。</div>' + onBk;
+    return '<div class="note-box mute">尚無盒子回報實測（盒子裝好 App 開過後，這裡會顯示真實載入結果）。</div>' + onBk;
   }
   function esc(s){ return String(s == null ? '' : s).replace(/[&<>"]/g, function(c){ return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]; }); }
-  function testSource(){
-    var el = $('#testResult'); var url = $('#subscriptionUrl').value.trim();
+  function resultHead(cls, icon, title, sub){
+    return '<div class="result-card' + (cls ? ' ' + cls : '') + '"><div class="result-head"><div class="result-icon">' + icon + '</div><div><div class="result-title">' + title + '</div><div class="result-sub">' + sub + '</div></div></div>';
+  }
+  function testSource(which){
+    var bk = which === 'backup';
+    var el = $(bk ? '#testResultBackup' : '#testResult'); if (!el) return;
+    var input = $(bk ? '#backupSubscriptionUrl' : '#subscriptionUrl');
+    var url = input ? input.value.trim() : '';
+    var label = bk ? '備援線路' : '主線路';
     el.style.display = 'block';
-    el.innerHTML = '<div class="result-card"><div class="result-head"><div class="result-icon">…</div><div><div class="result-title">測試中</div><div class="result-sub">正在連線並解析來源</div></div></div></div>';
+    if (!url) { el.innerHTML = resultHead('', 'i', label + '網址是空的', bk ? '不用備援可以留空；要測試請先貼上網址' : '請先貼上訂閱網址') + '</div>'; return; }
+    el.innerHTML = resultHead('', '…', '測試' + label + '中', '正在連線並解析來源') + '</div>';
     var fd = new FormData(); fd.append('subscriptionUrl', url);
     fetch('/admin/test', { method: 'POST', body: fd, headers: { 'X-Requested-With': 'fetch' }, credentials: 'same-origin' })
       .then(function(r){ return r.json(); })
       .then(function(data){
-        var boxesHtml = renderBoxesHtml(data.boxes);
+        var boxesHtml = renderBoxesHtml(data.boxes, bk);
         if (data.ok) {
           var good = data.httpOk && data.channelCount > 0;
           var hint = good ? '' : '<div class="note-box warn">⚠ 此測試是從 Cloudflare 雲端 IP 去打來源。若你的源只允許台灣／家用 IP，雲端會被擋；但電視盒是從你家網路直接連源，通常仍可正常使用，可直接儲存。</div>';
           var groups = (data.groups || []).map(function(g){ return '<span class="chip-s">' + esc(g.name) + ' <b>' + g.count + '</b></span>'; }).join('');
           var sample = (data.sample || []).length ? '<div class="inline-note">頻道範例：' + esc(data.sample.join('、')) + (data.channelCount > data.sample.length ? '…' : '') + '</div>' : '';
           var epg = data.epgUrl ? '<div class="inline-note">節目表（EPG）：<code>' + esc(data.epgUrl) + '</code></div>' : '<div class="inline-note">此清單未附節目表網址（x-tvg-url）</div>';
-          el.innerHTML = '<div class="result-card ' + (good ? 'ok' : 'bad') + '"><div class="result-head"><div class="result-icon">' + (good ? '✓' : '✕') + '</div><div><div class="result-title">' + (good ? '來源正常' : '雲端測試未通過') + '</div><div class="result-sub">' + (good ? '可以儲存使用' : '雲端連不到，不代表盒子連不到') + '</div></div></div>'
+          el.innerHTML = resultHead(good ? 'ok' : 'bad', good ? '✓' : '✕', label + '：' + (good ? '來源正常' : '雲端測試未通過'), good ? '可以儲存使用' : '雲端連不到，不代表盒子連不到')
             + '<div class="result-stats"><div class="stat"><div class="sk">HTTP 狀態</div><div class="sv">' + data.httpStatus + '</div></div><div class="stat"><div class="sk">M3U 格式</div><div class="sv">' + (data.looksLikeM3u ? '是' : '否') + '</div></div><div class="stat"><div class="sk">頻道數</div><div class="sv">' + data.channelCount + '</div></div><div class="stat"><div class="sk">回應</div><div class="sv">' + Math.round(data.bytes/1024) + ' KB · ' + data.ms + ' ms</div></div></div>'
             + (groups ? '<div class="chips">' + groups + '</div>' : '') + sample + epg + hint + '</div>' + boxesHtml;
         } else {
-          el.innerHTML = '<div class="result-card bad"><div class="result-head"><div class="result-icon">✕</div><div><div class="result-title">測試失敗</div><div class="result-sub">' + esc(data.error || '未知錯誤') + '</div></div></div></div>' + boxesHtml;
+          el.innerHTML = resultHead('bad', '✕', label + '：測試失敗', esc(data.error || '未知錯誤')) + '</div>' + boxesHtml;
         }
       })
-      .catch(function(e){ el.innerHTML = '<div class="result-card bad"><div class="result-head"><div class="result-icon">✕</div><div><div class="result-title">測試請求失敗</div><div class="result-sub">' + esc(e.message) + '</div></div></div></div>'; });
+      .catch(function(e){ el.innerHTML = resultHead('bad', '✕', '測試請求失敗', esc(e.message)) + '</div>'; });
   }
   window.testSource = testSource;
 
