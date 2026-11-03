@@ -79,7 +79,8 @@ export async function getText(url, ms) {
   try {
     const resp = await workerFetch(url, { signal: c.signal });
     const text = await resp.text();
-    return { status: resp.status, ok: resp.ok, text, ms: Date.now() - t0, date: resp.headers.get("Date") || "" };
+    // url = 轉址後的實際網址：清單裡的相對網址要以它為基準（播放器也是這樣解析）
+    return { status: resp.status, ok: resp.ok, text, ms: Date.now() - t0, url: resp.url || url, date: resp.headers.get("Date") || "" };
   } finally {
     clearTimeout(timer);
   }
@@ -164,16 +165,16 @@ export function pickProbeChannel(text, baseUrl, prefer) {
 export async function probeStream(url) {
   const res = { ok: false, step: "m3u8", error: "", m3u8Ms: 0, segMs: 0, bytes: 0, ts: false };
   try {
-    let pl = url;
-    let r = await getText(pl, 10000);
+    let r = await getText(url, 10000);
+    let pl = r.url;
     res.m3u8Ms = r.ms;
     if (!r.ok) return { ...res, error: `頻道播放清單回 HTTP ${r.status}` };
     if (!isM3u(r.text)) return { ...res, error: "頻道網址回的不是播放清單（m3u8）" };
     if (/#EXT-X-STREAM-INF/i.test(r.text)) {
       const sub = uris(r.text)[0];
       if (!sub) return { ...res, error: "多畫質清單裡沒有子清單" };
-      pl = new URL(sub, pl).toString();
-      r = await getText(pl, 10000);
+      r = await getText(new URL(sub, pl).toString(), 10000);
+      pl = r.url;
       res.m3u8Ms += r.ms;
       if (!r.ok || !isM3u(r.text)) return { ...res, error: `子清單回 HTTP ${r.status}` };
     }

@@ -885,9 +885,9 @@ function statusMock(tg, byHost, realFetch) {
   };
 }
 
-await test("2.4：/api/health 回報 build 2.4.0", async () => {
+await test("2.4：/api/health 回報 build 2.4.1", async () => {
   const h = (await call(makeEnv(), "/api/health")).json;
-  assert.equal(h.build, "2.4.0");
+  assert.equal(h.build, "2.4.1");
 });
 
 await test("2.3：備援直播源 — 驗證、儲存、下發條件、舊表單不清掉、操作紀錄與歷史遮罩 token、直播源分頁兩顆測試鈕", async () => {
@@ -1629,6 +1629,30 @@ await test("2.4：/admin/test 抓清單之外真的播一台（IP 改連 sslip.i
     globalThis.fetch = chainMock([], { variant: true }, realFetch);
     r = await call(env, "/admin/test", { method: "POST", body: { subscriptionUrl: MAIN } });
     assert.equal(r.json.stream.ok, true, JSON.stringify(r.json.stream));
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+});
+
+await test("2.4：probe — 頻道網址轉址後，相對切片網址以轉址後的清單網址為基準（跟播放器一樣）", async () => {
+  const pr = await import("../src/probe.js");
+  const realFetch = globalThis.fetch;
+  const seen = [];
+  globalThis.fetch = async (url) => {
+    const u = String(url);
+    seen.push(u);
+    if (u.includes("/flip/ch.m3u8")) {
+      const r = new Response(["#EXTM3U", "#EXTINF:10,", "/ts/x.ts", ""].join("\n"));
+      Object.defineProperty(r, "url", { value: "http://real.example:5050/?id=ch&token=T" });
+      return r;
+    }
+    if (u === "http://real.example:5050/ts/x.ts") return new Response(SEG);
+    return new Response("nf", { status: 404 });
+  };
+  try {
+    const r = await pr.probeStream("http://fake.example:8823/flip/ch.m3u8");
+    assert.equal(r.ok, true, JSON.stringify(r) + " " + seen.join(" "));
+    assert.ok(seen.includes("http://real.example:5050/ts/x.ts"));
   } finally {
     globalThis.fetch = realFetch;
   }
