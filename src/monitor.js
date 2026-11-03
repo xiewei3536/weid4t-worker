@@ -25,12 +25,15 @@ import {
   relativeTime,
 } from "./lib.js";
 import { loadDevices } from "./api.js";
+import { probeLine, probeSummary, probeText, workerFetch } from "./probe.js";
 
 export const HIST_STEP_MS = 15 * 60 * 1000;
 export const HIST_KEEP_MS = 24 * 60 * 60 * 1000;
 /** 看門狗超過這麼久沒更新 status.json 就視為「沒回報」 */
 export const STALE_MS = 20 * 60 * 1000;
 const PERSIST_MS = 15 * 60 * 1000;
+/** 雲端實測連續失敗這麼多次（每 5 分鐘一次）才算這條線異常，偶發一次不算 */
+export const PROBE_FAILS_BAD = 2;
 const LOG_MAX = 40;
 
 export const REASON_TEXT = {
@@ -41,6 +44,7 @@ export const REASON_TEXT = {
   upstream: "上游 4gtv 不通",
   auth: "NordVPN 帳密錯誤或到期（AUTH_FAILED）",
   nginx: "直播源主機的對外入口（nginx）沒回應",
+  probe: "雲端實測播不出來",
 };
 export function reasonText(r) {
   return REASON_TEXT[r] || (r ? String(r) : "上游 4gtv 不通");
@@ -48,7 +52,7 @@ export function reasonText(r) {
 
 /**
  * 直播源伺服器的看門狗狀態（VPS 上 watchdog.sh 每 5 分鐘輸出 /status.json，需 token）。
- * 用訂閱網址同源 + 訂閱網址裡的 token 去讀，3 秒逾時。
+ * 用訂閱網址同源 + 訂閱網址裡的 token 去讀，5 秒逾時。網址是 IP 時改連 sslip.io 對應網域（Worker 不能直連 IP，見 probe.js）。
  *   - 404 / 其他 4xx / 不是看門狗格式 → null（第三方源沒有看門狗，不顯示）
  *   - 連不上 / 逾時 / 5xx → { _unreachable: 原因 }（主機掛了也要算「沒回報」，不能被當成第三方源而默不作聲）
  */
@@ -62,12 +66,11 @@ export async function fetchSourceStatus(subscriptionUrl) {
   } catch (_) {}
   let resp;
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 3000);
+  const timer = setTimeout(() => controller.abort(), 5000);
   try {
-    resp = await fetch(m[1] + "/status.json" + (token ? "?token=" + encodeURIComponent(token) : ""), {
+    resp = await workerFetch(m[1] + "/status.json" + (token ? "?token=" + encodeURIComponent(token) : ""), {
       signal: controller.signal,
-      headers: { "User-Agent": "WeiTV-Admin/2.3", Accept: "application/json" },
-      cf: { cacheTtl: 0 },
+      headers: { "User-Agent": "WeiTV-Admin/2.4", Accept: "application/json" },
     });
   } catch (err) {
     return { _unreachable: err && err.name === "AbortError" ? "逾時" : "連線失敗" };
@@ -100,16 +103,55 @@ export function sourceState(ss, nowMs) {
 export const STATE_CODE = { ok: 1, bad: 0, stale: 2, none: 3 };
 export const CODE_STATE = { 1: "ok", 0: "bad", 2: "stale", 3: "none" };
 
-/** 備援線路狀態：沒設定 → off；有設定 → 同 sourceState */
-export function backupState(config, bss, nowMs) {
-  return String((config && config.backupSubscriptionUrl) || "").trim() ? sourceState(bss, nowMs) : "off";
+/** 備援線路狀態：沒設定 → off；有設定 → 同 sourceState，再併入雲端實測（line = 監控狀態 mon.bsrc） */
+export function backupState(config, bss, nowMs, line) {
+  return String((config && config.backupSubscriptionUrl) || "").trim() ? combineState(sourceState(bss, nowMs), line, nowMs) : "off";
+}
+
+/** 監控狀態裡 20 分鐘內的雲端實測結果（監控停了就不拿舊結果出來講） */
+export function freshProbe(line, nowMs) {
+  const p = line && line.probe;
+  return p && typeof p === "object" && nowMs - (p.at || 0) <= STALE_MS ? p : null;
+}
+
+/**
+ * 看門狗自報 + 雲端實測 → 這條線的狀態（監控、總覽共用；line = 監控狀態 mon.src / mon.bsrc）。
+ *  - 看門狗說異常 → bad（看門狗的原因比較準）
+ *  - 雲端實測連續 PROBE_FAILS_BAD 次播不出來 → bad：看門狗說正常、沒回報、或根本沒有看門狗（第三方源）都算
+ *  - 看門狗沒回報 / 沒有看門狗，但雲端實測播得出來 → ok（第三方源也有監控了；看門狗停了另外提醒）
+ */
+export function combineState(wdState, line, nowMs) {
+  if (wdState === "bad") return "bad";
+  const p = freshProbe(line, nowMs || Date.now());
+  if (!p || p.lan) return wdState;
+  if (!p.ok && (line.probeFails || 0) >= PROBE_FAILS_BAD) return "bad";
+  if (p.ok && (wdState === "stale" || wdState === "none")) return "ok";
+  return wdState;
+}
+
+/** 異常原因的一句話：看門狗的原因，或雲端實測失敗的細節 */
+export function lineReason(line, ss) {
+  if (line && line.reason === "probe") return `${REASON_TEXT.probe}（${(line.probe && line.probe.error) || "原因不明"}）`;
+  return reasonText((line && line.reason) || (ss && ss.reason));
+}
+
+/** 記下這次雲端實測；回傳是否有需要寫回的變化（成敗翻轉、連續失敗次數變了） */
+function recordProbe(line, pr) {
+  if (!pr) return false;
+  const s = probeSummary(pr);
+  const before = line.probe && typeof line.probe === "object" ? line.probe.ok : null;
+  const fails = s.ok || s.lan ? 0 : (line.probeFails || 0) + 1;
+  const changed = before !== s.ok || fails !== (line.probeFails || 0);
+  line.probe = s;
+  line.probeFails = fails;
+  return changed;
 }
 
 const isDown = (s) => s === "bad" || s === "stale";
 
 /** 一條線路目前狀況的短句（警示用） */
-function lineBrief(state, ss) {
-  if (state === "bad") return reasonText(ss && ss.reason);
+function lineBrief(state, ss, line) {
+  if (state === "bad") return lineReason(line, ss);
   if (state === "stale") return ss && ss._unreachable ? `連不上主機（${ss._unreachable}）` : "看門狗沒回報";
   if (state === "ok") return "正常";
   return "沒有看門狗資料";
@@ -126,7 +168,7 @@ export function selfHealText(ss) {
 }
 
 function defaultLineState(state) {
-  return { state, since: 0, downSince: 0, alerted: false, ip: "", reason: "", fails: 0, lastAction: "" };
+  return { state, since: 0, downSince: 0, alerted: false, ip: "", reason: "", fails: 0, lastAction: "", probe: null, probeFails: 0 };
 }
 
 export function defaultMonState() {
@@ -211,18 +253,22 @@ export async function sendTelegram(config, text) {
   }
 }
 
-/** 直播源目前狀態的一句話（總覽 / 警示用） */
-export function describeSource(ss, state, nowMs) {
-  if (state === "none") return "沒有看門狗資料（第三方源或尚未設定）";
-  if (state === "stale" && ss && ss._unreachable) return `連不上主機（${ss._unreachable}）`;
+/** 直播源目前狀態的一句話（總覽 / 警示用；line = 監控狀態，帶雲端實測） */
+export function describeSource(ss, state, nowMs, line) {
+  const p = freshProbe(line, nowMs);
+  const cloud = p && !p.lan ? "；雲端實測" + (p.ok ? "：" : "") + probeText(p) : "";
+  if (state === "none") return "沒有看門狗資料（第三方源或尚未設定）" + cloud;
+  if (state === "stale" && ss && ss._unreachable) return `連不上主機（${ss._unreachable}）` + cloud;
   const when = ss && ss.checked_at_ms ? relativeTime(new Date(ss.checked_at_ms).toISOString(), nowMs) : "-";
-  if (state === "stale") return `看門狗 ${when === "-" ? "沒有回報" : when + "後就沒再回報"}`;
-  if (state === "bad") return `異常：${reasonText(ss.reason)}（連續 ${ss.consecutive_failures || 0} 次，${when}）`;
-  return `正常（${when}實測）`;
+  if (state === "stale") return `看門狗 ${when === "-" ? "沒有回報" : when + "後就沒再回報"}` + cloud;
+  if (state === "bad" && line && line.reason === "probe") return `異常：${lineReason(line, ss)}（看門狗自報${ss && ss.healthy ? "正常" : "沒資料"}）`;
+  if (state === "bad") return `異常：${reasonText(ss && ss.reason)}（連續 ${(ss && ss.consecutive_failures) || 0} 次，${when}）` + cloud;
+  if (!ss || ss._unreachable || !ss.checked_at_ms) return "正常" + cloud;
+  return `正常（看門狗 ${when}實測）` + cloud;
 }
 
-/** 更新一條線路狀態機的欄位（狀態轉換、出口 IP、原因…）；回傳是否有需要寫回的變化 */
-function trackLine(line, state, ss, nowMs) {
+/** 更新一條線路狀態機的欄位（狀態轉換、出口 IP、原因…）；回傳是否有需要寫回的變化。wdState = 看門狗自己的狀態 */
+function trackLine(line, state, ss, nowMs, wdState) {
   let changed = false;
   if (state !== line.state) {
     line.state = state;
@@ -235,6 +281,8 @@ function trackLine(line, state, ss, nowMs) {
     line.fails = ss.consecutive_failures || 0;
     line.lastAction = ss.last_action || "";
   }
+  // 看門狗沒說壞、是雲端實測判定的 → 原因記成 probe（細節在 line.probe.error）
+  if (state === "bad" && wdState !== "bad") line.reason = "probe";
   return changed;
 }
 
@@ -248,27 +296,36 @@ export async function runMonitorTick(env, nowMs, opts) {
   const config = await loadConfig(env);
   const st = await loadMonState(env);
   const hasBackup = !!String(config.backupSubscriptionUrl || "").trim();
-  const [ss, bss, hp] = await Promise.all([
+  // 雲端實測（照盒子的走法真的播一台）；env.STREAM_PROBE = "off" 可關（測試用）
+  const probeOn = env.STREAM_PROBE !== "off";
+  const noProbe = Promise.resolve(null);
+  const [ss, bss, hp, pr, bpr] = await Promise.all([
     fetchSourceStatus(config.subscriptionUrl),
     hasBackup ? fetchSourceStatus(config.backupSubscriptionUrl) : Promise.resolve(null),
     loadHomeProxy(env),
+    probeOn && config.subscriptionUrl ? probeLine(config.subscriptionUrl, nowMs).catch(() => null) : noProbe,
+    probeOn && hasBackup ? probeLine(config.backupSubscriptionUrl, nowMs).catch(() => null) : noProbe,
   ]);
-  const state = sourceState(ss, nowMs);
-  const bstate = hasBackup ? sourceState(bss, nowMs) : "off";
+  let changed = false;
+  if (recordProbe(st.src, pr)) changed = true;
+  if (hasBackup && recordProbe(st.bsrc, bpr)) changed = true;
+  const wdState = sourceState(ss, nowMs);
+  const bwdState = hasBackup ? sourceState(bss, nowMs) : "off";
+  const state = combineState(wdState, st.src, nowMs);
+  const bstate = hasBackup ? combineState(bwdState, st.bsrc, nowMs) : "off";
   // 家用備援在線、自報健康、且真的會下發給盒子（見 lib.effectiveLines）→ 主線路壞了同一個家的盒子還有得看
   const homeUsable = !!hp && hp.healthy !== false && homeProxyState(hp, nowMs) === "online" && needsHomeProxy(config);
   const homePrimary = config.homeProxyRole === "primary";
   const events = [];
-  let changed = false;
   const thresholdMs = Math.max(5, parseIntOr(config.alertSourceMin, 10)) * 60000;
   // 排程有秒級抖動，門檻放 1 分鐘容忍
   const overThreshold = (line) => nowMs - line.downSince >= thresholdMs - 60000;
   const minsSince = (t) => Math.max(1, Math.round((nowMs - t) / 60000));
 
   const src = st.src;
-  if (trackLine(src, state, ss, nowMs)) changed = true;
+  if (trackLine(src, state, ss, nowMs, wdState)) changed = true;
   if (hasBackup) {
-    if (trackLine(st.bsrc, bstate, bss, nowMs)) changed = true;
+    if (trackLine(st.bsrc, bstate, bss, nowMs, bwdState)) changed = true;
   } else if (st.bsrc.state !== "off" || st.bsrc.downSince || st.bsrc.alerted) {
     st.bsrc = defaultLineState("off");   // 備援線路拿掉了 → 狀態歸零
     changed = true;
@@ -276,7 +333,7 @@ export async function runMonitorTick(env, nowMs, opts) {
   const bsrc = st.bsrc;
   const bothDownEvent = () => ({
     kind: "both_down",
-    text: `🔴 <b>主線路與備援線路都異常</b>（緊急）\n主線路：${lineBrief(state, ss)}${src.ip ? " · 出口 IP " + src.ip : ""}\n備援線路：${lineBrief(bstate, bss)}${bsrc.ip ? " · 出口 IP " + bsrc.ip : ""}\n盒子可能沒有畫面，請盡快登入 VPS 執行 4gtv doctor。`,
+    text: `🔴 <b>主線路與備援線路都異常</b>（緊急）\n主線路：${lineBrief(state, ss, src)}${src.ip ? " · 出口 IP " + src.ip : ""}\n備援線路：${lineBrief(bstate, bss, bsrc)}${bsrc.ip ? " · 出口 IP " + bsrc.ip : ""}\n盒子可能沒有畫面，請盡快登入 VPS 執行 4gtv doctor。`,
   });
   const backupHint = hasBackup ? "\n已設備援線路（沒有看門狗資料），盒子會自動嘗試改用它。" : "";
 
@@ -295,17 +352,22 @@ export async function runMonitorTick(env, nowMs, opts) {
       } else if (bstate === "ok") {
         events.push({
           kind: "src_down_bk",
-          text: `🟡 <b>主線路異常</b>（已 ${mins} 分鐘，較不緊急）\n原因：${lineBrief(state, ss)}\n備援線路正常 → 盒子會自動改用備援線路，暫時不影響觀看。\n看門狗會自動處理主線路${actionText(src.lastAction) ? "（最近處置：" + actionText(src.lastAction) + "）" : ""}；30 分鐘內沒恢復再登入 VPS 查看。`,
+          text: `🟡 <b>主線路異常</b>（已 ${mins} 分鐘，較不緊急）\n原因：${lineBrief(state, ss, src)}\n備援線路正常 → 盒子會自動改用備援線路，暫時不影響觀看。\n看門狗會自動處理主線路${actionText(src.lastAction) ? "（最近處置：" + actionText(src.lastAction) + "）" : ""}；30 分鐘內沒恢復再登入 VPS 查看。`,
         });
       } else if (homeUsable) {
         events.push({
           kind: "src_down_bk",
-          text: `🟡 <b>主線路異常</b>（已 ${mins} 分鐘，較不緊急）\n原因：${lineBrief(state, ss)}\n家用備援在線 → ${homePrimary ? "同一個家的盒子本來就以家用代理為主線路，不受影響" : "同一個家的盒子會自動改用家用代理（區網直連），不影響觀看"}；其他地點的盒子仍會受影響。\n看門狗會自動處理主線路${actionText(src.lastAction) ? "（最近處置：" + actionText(src.lastAction) + "）" : ""}；30 分鐘內沒恢復再登入 VPS 查看。`,
+          text: `🟡 <b>主線路異常</b>（已 ${mins} 分鐘，較不緊急）\n原因：${lineBrief(state, ss, src)}\n家用備援在線 → ${homePrimary ? "同一個家的盒子本來就以家用代理為主線路，不受影響" : "同一個家的盒子會自動改用家用代理（區網直連），不影響觀看"}；其他地點的盒子仍會受影響。\n看門狗會自動處理主線路${actionText(src.lastAction) ? "（最近處置：" + actionText(src.lastAction) + "）" : ""}；30 分鐘內沒恢復再登入 VPS 查看。`,
         });
       } else if (state === "stale") {
         events.push({
           kind: "src_stale",
           text: `⚠️ <b>直播源伺服器沒回報</b>\n看門狗已 ${mins} 分鐘沒更新狀態${ss && ss._unreachable ? "（連不上主機：" + ss._unreachable + "）" : ""}，VPS 可能離線、關機或排程停了。\n請確認 VPS 是否開著（盒子若還能播，是舊快取撐著）。${backupHint}`,
+        });
+      } else if (src.reason === "probe") {
+        events.push({
+          kind: "src_down",
+          text: `🔴 <b>直播源播不出來</b>（已 ${mins} 分鐘）\n${lineReason(src, ss)}\nVPS 看門狗自報${wdState === "ok" ? "正常（它看不出來，不會自動處理）" : "沒資料"}：多半是對外入口（nginx、5050 埠、防火牆）或主機網路出問題。請登入 VPS 執行 4gtv doctor。${backupHint}`,
         });
       } else {
         events.push({
@@ -338,7 +400,7 @@ export async function runMonitorTick(env, nowMs, opts) {
         } else {
           events.push({
             kind: "bsrc_down",
-            text: `🟡 <b>備援線路異常</b>（已 ${minsSince(bsrc.downSince)} 分鐘，不影響觀看）\n原因：${lineBrief(bstate, bss)}${bsrc.ip ? " · 出口 IP " + bsrc.ip : ""}\n主線路正常，盒子不受影響；但主線路再出問題時就沒有備援可切，有空再處理。`,
+            text: `🟡 <b>備援線路異常</b>（已 ${minsSince(bsrc.downSince)} 分鐘，不影響觀看）\n原因：${lineBrief(bstate, bss, bsrc)}${bsrc.ip ? " · 出口 IP " + bsrc.ip : ""}\n主線路正常，盒子不受影響；但主線路再出問題時就沒有備援可切，有空再處理。`,
           });
         }
       }

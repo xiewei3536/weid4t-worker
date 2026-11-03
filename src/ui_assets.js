@@ -599,6 +599,28 @@ export const ADMIN_JS = `
   function resultHead(cls, icon, title, sub){
     return '<div class="result-card' + (cls ? ' ' + cls : '') + '"><div class="result-head"><div class="result-icon">' + icon + '</div><div><div class="result-title">' + title + '</div><div class="result-sub">' + sub + '</div></div></div>';
   }
+  function secTxt(ms){ return (Math.max(0, ms || 0) / 1000).toFixed(1) + ' 秒'; }
+  /* 家用代理（區網）：雲端連不到，顯示它自己每 5 分鐘的播放實測 */
+  function homeResultHtml(home, label){
+    if (!home) return resultHead('bad', '✕', label + '：沒有家用代理', '還沒有家用代理登記過（在家裡電腦執行安裝指令）') + '</div>';
+    var p = home.probe;
+    var online = home.state === 'online';
+    var good = online && home.healthy && (!p || p.ok);
+    var title = !online ? '家用代理離線' : !home.healthy ? '家用代理自己實測播不出來' : p ? '家用代理實測正常' : '家用代理在線（舊版，沒有播放實測）';
+    var sub = '區網網址雲端連不到，這裡顯示代理自己每 5 分鐘的實測（最後回報 ' + esc(home.seenText || '-') + '）';
+    var line = p ? (p.ok ? '✅ ' + esc((p.channel || '測試台') + ' 播放正常（播放清單 ' + secTxt(p.m3u8Ms) + '、切片 ' + secTxt(p.segMs) + '）') : '❌ ' + esc(p.error || '播不出來')) : '—';
+    return resultHead(good ? 'ok' : 'bad', good ? '✓' : '✕', label + '：' + title, sub)
+      + '<div class="result-stats"><div class="stat"><div class="sk">區網網址</div><div class="sv" style="font-size:15px">' + esc(home.lanUrl || '-') + '</div></div><div class="stat"><div class="sk">版本</div><div class="sv">' + esc(home.version || '-') + '</div></div><div class="stat"><div class="sk">頻道數</div><div class="sv">' + esc(home.channels == null ? '-' : home.channels) + '</div></div></div>'
+      + '<div class="inline-note">播放實測：' + line + '</div></div>';
+  }
+  /* 實際播放測試（清單之外真的播一台：m3u8 → 切片） */
+  function streamHtml(data){
+    var st = data.stream;
+    if (!st) return '';
+    var head = '實際播放測試（' + esc(data.channel || '測試台') + '）：';
+    if (st.ok) return '<div class="note-box ok">✅ ' + head + '播放清單 ' + secTxt(st.m3u8Ms) + '、切片 ' + secTxt(st.segMs) + '（讀了 ' + Math.round(st.bytes / 1024) + ' KB' + (st.ts ? '，MPEG-TS 正常' : '') + '）——盒子現在播得出來</div>';
+    return '<div class="note-box bad">❌ ' + head + esc(st.error || '播不出來') + '——清單抓得到，但實際播放失敗，盒子這條線會黑畫面</div>';
+  }
   function testSource(which){
     var bk = which === 'backup';
     var el = $(bk ? '#testResultBackup' : '#testResult'); if (!el) return;
@@ -606,22 +628,25 @@ export const ADMIN_JS = `
     var url = input ? input.value.trim() : '';
     var label = bk ? '備援線路' : '主線路';
     el.style.display = 'block';
-    if (!url) { el.innerHTML = resultHead('', 'i', label + '網址是空的', bk ? '不用備援可以留空；要測試請先貼上網址' : '請先貼上訂閱網址') + '</div>'; return; }
-    el.innerHTML = resultHead('', '…', '測試' + label + '中', '正在連線並解析來源') + '</div>';
-    var fd = new FormData(); fd.append('subscriptionUrl', url);
+    if (!url && !bk) { el.innerHTML = resultHead('', 'i', label + '網址是空的', '請先貼上訂閱網址') + '</div>'; return; }
+    el.innerHTML = resultHead('', '…', '測試' + label + '中', url ? '正在連線、抓清單並實際播一台（約 2～10 秒）' : '備援欄空白 → 讀取家用代理的實測結果') + '</div>';
+    var fd = new FormData(); fd.append('subscriptionUrl', url); if (!url) fd.append('which', 'home');
     fetch('/admin/test', { method: 'POST', body: fd, headers: { 'X-Requested-With': 'fetch' }, credentials: 'same-origin' })
       .then(function(r){ return r.json(); })
       .then(function(data){
         var boxesHtml = renderBoxesHtml(data.boxes, bk);
-        if (data.ok) {
-          var good = data.httpOk && data.channelCount > 0;
-          var hint = good ? '' : '<div class="note-box warn">⚠ 此測試是從 Cloudflare 雲端 IP 去打來源。若你的源只允許台灣／家用 IP，雲端會被擋；但電視盒是從你家網路直接連源，通常仍可正常使用，可直接儲存。</div>';
+        if (data.ok && data.lan) {
+          el.innerHTML = homeResultHtml(data.home, label) + boxesHtml;
+        } else if (data.ok) {
+          var listOk = data.httpOk && data.channelCount > 0;
+          var good = listOk && (!data.stream || data.stream.ok);
+          var hint = listOk ? '' : '<div class="note-box warn">⚠ 此測試從 Cloudflare 雲端連線（IP 網址已自動改用對應網域連過去）。若你的源只允許台灣／家用 IP，雲端會被擋；但電視盒是從你家網路直接連源，通常仍可正常使用。</div>';
           var groups = (data.groups || []).map(function(g){ return '<span class="chip-s">' + esc(g.name) + ' <b>' + g.count + '</b></span>'; }).join('');
           var sample = (data.sample || []).length ? '<div class="inline-note">頻道範例：' + esc(data.sample.join('、')) + (data.channelCount > data.sample.length ? '…' : '') + '</div>' : '';
           var epg = data.epgUrl ? '<div class="inline-note">節目表（EPG）：<code>' + esc(data.epgUrl) + '</code></div>' : '<div class="inline-note">此清單未附節目表網址（x-tvg-url）</div>';
-          el.innerHTML = resultHead(good ? 'ok' : 'bad', good ? '✓' : '✕', label + '：' + (good ? '來源正常' : '雲端測試未通過'), good ? '可以儲存使用' : '雲端連不到，不代表盒子連不到')
+          el.innerHTML = resultHead(good ? 'ok' : 'bad', good ? '✓' : '✕', label + '：' + (good ? '來源正常' : listOk ? '清單正常、但播不出來' : '雲端測試未通過'), good ? '清單與實際播放都通過，可以儲存使用' : listOk ? '看下面「實際播放測試」的原因' : '雲端連不到，不代表盒子連不到')
             + '<div class="result-stats"><div class="stat"><div class="sk">HTTP 狀態</div><div class="sv">' + data.httpStatus + '</div></div><div class="stat"><div class="sk">M3U 格式</div><div class="sv">' + (data.looksLikeM3u ? '是' : '否') + '</div></div><div class="stat"><div class="sk">頻道數</div><div class="sv">' + data.channelCount + '</div></div><div class="stat"><div class="sk">回應</div><div class="sv">' + Math.round(data.bytes/1024) + ' KB · ' + data.ms + ' ms</div></div></div>'
-            + (groups ? '<div class="chips">' + groups + '</div>' : '') + sample + epg + hint + '</div>' + boxesHtml;
+            + streamHtml(data) + (groups ? '<div class="chips">' + groups + '</div>' : '') + sample + epg + hint + '</div>' + boxesHtml;
         } else {
           el.innerHTML = resultHead('bad', '✕', label + '：測試失敗', esc(data.error || '未知錯誤')) + '</div>' + boxesHtml;
         }

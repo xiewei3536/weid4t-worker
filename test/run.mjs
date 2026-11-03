@@ -12,7 +12,14 @@ let passed = 0;
 const failures = [];
 
 function makeEnv(seed, opts) {
-  return { CONFIG_KV: new MockKV(seed), ADMIN_PASSWORD: PASS, ...(opts || {}) };
+  return { CONFIG_KV: new MockKV(seed), ADMIN_PASSWORD: PASS, STREAM_PROBE: "off", ...(opts || {}) };
+}
+
+/** Worker 連 IP 網址時會改連 sslip.io / nip.io 的對應網域（Cloudflare 不准 Worker 直連 IP）；mock 一律還原成 IP 寫法比對 */
+function unIp(url) {
+  return String(url)
+    .replace(/\/\/(\d{1,3})-(\d{1,3})-(\d{1,3})-(\d{1,3})\.sslip\.io/, "//$1.$2.$3.$4")
+    .replace(/\/\/(\d{1,3}(?:\.\d{1,3}){3})\.nip\.io/, "//$1");
 }
 const basic = "Basic " + Buffer.from("admin:" + PASS).toString("base64");
 
@@ -395,7 +402,7 @@ await test("總覽顯示直播源伺服器看門狗狀態（status.json）", asy
   const realFetch = globalThis.fetch;
   let hit = 0;
   globalThis.fetch = async (url, init) => {
-    if (String(url) === "http://1.2.3.4:5050/status.json?token=x") {
+    if (unIp(url) === "http://1.2.3.4:5050/status.json?token=x") {
       hit++;
       return new Response(JSON.stringify({ healthy: false, consecutive_failures: 3, reason: "upstream", public_ip: "187.15.1.1", checked_at_ms: Date.now() - 60000, last_action: "restart_gluetun_hop", last_action_at: new Date(Date.now() - 30000).toISOString(), epg_updated: "2026-09-09 06:17:46 +08:00" }), { headers: { "Content-Type": "application/json" } });
     }
@@ -425,7 +432,7 @@ await test("總覽顯示直播源伺服器看門狗狀態（status.json）", asy
 const TOK = "123456789:AAxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx";
 function tgMock(tg, statusFn, realFetch) {
   return async (url, init) => {
-    const u = String(url);
+    const u = unIp(url);
     if (u.startsWith("https://api.telegram.org/bot")) {
       tg.push(JSON.parse(init.body).text);
       return new Response(JSON.stringify({ ok: true }), { headers: { "Content-Type": "application/json" } });
@@ -861,7 +868,7 @@ async function homeBox(env, id, ip, authorize) {
 /** 依主機回 status.json：函式回物件 = 看門狗 JSON、null = 404、數字 = 該 HTTP 狀態、"throw" = 連線失敗；Telegram 一併 mock */
 function statusMock(tg, byHost, realFetch) {
   return async (url, init) => {
-    const u = String(url);
+    const u = unIp(url);
     if (u.startsWith("https://api.telegram.org/bot")) {
       tg.push(JSON.parse(init.body).text);
       return new Response(JSON.stringify({ ok: true }), { headers: { "Content-Type": "application/json" } });
@@ -878,9 +885,9 @@ function statusMock(tg, byHost, realFetch) {
   };
 }
 
-await test("2.3：/api/health 回報 build 2.3.0", async () => {
+await test("2.4：/api/health 回報 build 2.4.0", async () => {
   const h = (await call(makeEnv(), "/api/health")).json;
-  assert.equal(h.build, "2.3.0");
+  assert.equal(h.build, "2.4.0");
 });
 
 await test("2.3：備援直播源 — 驗證、儲存、下發條件、舊表單不清掉、操作紀錄與歷史遮罩 token、直播源分頁兩顆測試鈕", async () => {
@@ -1529,6 +1536,208 @@ await test("2.3：總覽 / 裝置 — 沒設備援、主線路壞：家用備援
   } finally {
     globalThis.fetch = realFetch;
   }
+});
+
+
+/* ---------------------------------------------------------------
+ *  2.4：雲端實測（測活）——Worker 不能直連 IP、照盒子的走法真的播一台
+ * --------------------------------------------------------------- */
+
+const SEG = new Uint8Array(70000).fill(0x47);
+/**
+ * 模擬整條播放鏈：清單 → 頻道 m3u8 → 切片。opts：
+ *   seg: 切片 HTTP 狀態（預設 200）；m3u8: 頻道 m3u8 HTTP 狀態（預設 200）；variant: m3u8 是多畫質主清單
+ *   status: status.json 內容（物件 / null = 404）；seen: 收集實際連過的網址（原樣，不還原）
+ */
+function chainMock(tg, opts, realFetch) {
+  opts = opts || {};
+  return async (url, init) => {
+    const raw = String(url);
+    if (opts.seen) opts.seen.push(raw);
+    const u = unIp(raw);
+    if (u.startsWith("https://api.telegram.org/bot")) {
+      tg.push(JSON.parse(init.body).text);
+      return new Response(JSON.stringify({ ok: true }), { headers: { "Content-Type": "application/json" } });
+    }
+    if (/^http:\/\/\d+\.\d+\.\d+\.\d+(:\d+)?\//.test(raw)) return new Response("error code: 1003", { status: 403 });   // Cloudflare：不准直連 IP
+    if (u.includes("/status.json")) {
+      const s = typeof opts.status === "function" ? opts.status() : opts.status;
+      return s ? new Response(JSON.stringify(s), { headers: { "Content-Type": "application/json" } }) : new Response("nf", { status: 404 });
+    }
+    if (u.includes("/channel?type=m3u")) {
+      return new Response('#EXTM3U x-tvg-url="http://1.2.3.4:5050/epg.xml.gz"\n#EXTINF:-1 tvg-id="4gtv-4gtv040" group-title="新聞",中視\nhttp://1.2.3.4:5050/?id=4gtv-4gtv040&token=T\n#EXTINF:-1 tvg-id="4gtv-4gtv003" group-title="綜合",民視第一台\nhttp://1.2.3.4:5050/?id=4gtv-4gtv003&token=T\n');
+    }
+    if (u.includes("/?id=4gtv-4gtv003")) {
+      const st = typeof opts.m3u8 === "function" ? opts.m3u8() : opts.m3u8 || 200;
+      if (st !== 200) return new Response("Failed to get final m3u8 content", { status: st });
+      if (opts.variant) return new Response("#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=2000000\nhttp://1.2.3.4:5050/sub.m3u8?token=T\n");
+      return new Response("#EXTM3U\n#EXT-X-TARGETDURATION:10\n#EXTINF:10,\nhttp://1.2.3.4:5050/ts/a1.ts\n#EXTINF:10,\nhttp://1.2.3.4:5050/ts/a2.ts\n");
+    }
+    if (u.includes("/sub.m3u8")) return new Response("#EXTM3U\n#EXTINF:10,\n/ts/v1.ts\n");
+    if (u.includes("/ts/")) {
+      const st = typeof opts.seg === "function" ? opts.seg() : opts.seg || 200;
+      return st === 200 ? new Response(SEG) : new Response("upstream ts error", { status: st });
+    }
+    if (u.includes("192.168.")) throw new TypeError("private network not reachable");
+    return realFetch(url, init);
+  };
+}
+
+await test("2.4：probe — IP 網址改 sslip.io / nip.io、區網與網域不動；挑台優先民視第一台", async () => {
+  const pr = await import("../src/probe.js");
+  assert.equal(pr.workerFetchUrl("http://161.33.196.222:5050/channel?type=m3u&token=x"), "http://161-33-196-222.sslip.io:5050/channel?type=m3u&token=x");
+  assert.equal(pr.workerFetchUrl("http://161.33.196.222:5050/a", true), "http://161.33.196.222.nip.io:5050/a");
+  assert.equal(pr.workerFetchUrl("https://tv.example.com/a"), "https://tv.example.com/a");
+  assert.equal(pr.workerFetchUrl("http://192.168.31.73:9010/playlist.m3u"), "http://192.168.31.73:9010/playlist.m3u");
+  for (const u of ["http://192.168.1.2:9010/x", "http://10.0.0.5/x", "http://172.20.0.1/x", "http://127.0.0.1:9010/x", "http://nas.local/x"]) assert.equal(pr.isLanUrl(u), true, u);
+  for (const u of ["http://161.33.196.222:5050/x", "https://tv.example.com/x", "http://172.32.0.1/x", "nope"]) assert.equal(pr.isLanUrl(u), false, u);
+  const ch = pr.pickProbeChannel("#EXTM3U\n#EXTINF:-1,中視\nhttp://h/1\n#EXTINF:-1,民視第一台\n/rel?id=3\n", "http://h:5050/channel?type=m3u");
+  assert.deepEqual(ch, { name: "民視第一台", url: "http://h:5050/rel?id=3", total: 2 });
+  assert.equal(pr.pickProbeChannel("#EXTM3U\n#EXTINF:-1,Only\nhttp://h/1\n", "http://h/").name, "Only");
+  assert.equal(pr.pickProbeChannel("#EXTM3U\n", "http://h/"), null);
+});
+
+await test("2.4：/admin/test 抓清單之外真的播一台（IP 改連 sslip.io）；切片壞了 → 清單正常但播不出來", async () => {
+  const env = makeEnv({ config: { version: 1, subscriptionUrl: MAIN } });
+  const realFetch = globalThis.fetch;
+  const seen = [];
+  globalThis.fetch = chainMock([], { seen }, realFetch);
+  try {
+    let r = await call(env, "/admin/test", { method: "POST", body: { subscriptionUrl: MAIN } });
+    assert.equal(r.json.ok, true, r.text);
+    assert.equal(r.json.httpStatus, 200);
+    assert.equal(r.json.channelCount, 2);
+    assert.equal(r.json.channel, "民視第一台");
+    assert.equal(r.json.stream.ok, true, JSON.stringify(r.json.stream));
+    assert.equal(r.json.stream.ts, true);
+    assert.ok(r.json.stream.bytes >= 16384);
+    assert.ok(seen.length >= 3 && seen.every((u) => !/^http:\/\/\d+\.\d+\.\d+\.\d+[:/]/.test(u)), "全部改連網域，不直連 IP：" + seen.join(" "));
+    assert.ok(seen.some((u) => u.includes("1-2-3-4.sslip.io:5050/ts/a2.ts")), "抓最新一片切片");
+    // 切片 502
+    globalThis.fetch = chainMock([], { seg: 502 }, realFetch);
+    r = await call(env, "/admin/test", { method: "POST", body: { subscriptionUrl: MAIN } });
+    assert.equal(r.json.httpOk, true);
+    assert.equal(r.json.stream.ok, false);
+    assert.equal(r.json.stream.step, "segment");
+    assert.match(r.json.stream.error, /切片回 HTTP 502/);
+    // 頻道 m3u8 500
+    globalThis.fetch = chainMock([], { m3u8: 500 }, realFetch);
+    r = await call(env, "/admin/test", { method: "POST", body: { subscriptionUrl: MAIN } });
+    assert.equal(r.json.stream.ok, false);
+    assert.match(r.json.stream.error, /頻道播放清單回 HTTP 500/);
+    // 多畫質主清單 → 抓子清單、相對路徑切片
+    globalThis.fetch = chainMock([], { variant: true }, realFetch);
+    r = await call(env, "/admin/test", { method: "POST", body: { subscriptionUrl: MAIN } });
+    assert.equal(r.json.stream.ok, true, JSON.stringify(r.json.stream));
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+});
+
+await test("2.4：/admin/test 區網網址 / 備援欄空白 → 回家用代理自己的播放實測（雲端連不到區網）", async () => {
+  const env = makeEnv({ config: { version: 1, subscriptionUrl: MAIN } });
+  let r = await call(env, "/admin/test", { method: "POST", body: { subscriptionUrl: "", which: "home" } });
+  assert.equal(r.json.ok, true);
+  assert.equal(r.json.lan, true);
+  assert.equal(r.json.home, null);
+  await env.CONFIG_KV.put("homeproxy", JSON.stringify({ lanUrl: "http://192.168.31.73:9010", publicIp: "88.0.0.1", version: "2.4.0", channels: 118, healthy: true, lastSeen: new Date().toISOString(), via: "box", boxId: "tv-h", probe: { at: Date.now(), ok: true, channel: "民視第一台", m3u8Ms: 900, segMs: 1200, bytes: 65536, error: "" } }));
+  r = await call(env, "/admin/test", { method: "POST", body: { subscriptionUrl: "http://192.168.31.73:9010/playlist.m3u" } });
+  assert.equal(r.json.lan, true);
+  assert.equal(r.json.home.state, "online");
+  assert.equal(r.json.home.probe.ok, true);
+  assert.equal(r.json.home.probe.channel, "民視第一台");
+  r = await call(env, "/admin/test", { method: "POST", body: { subscriptionUrl: "ftp://x" } });
+  assert.equal(r.status, 400);
+});
+
+await test("2.4：監控 — 看門狗自報正常但雲端實測連續 2 次播不出來 → 異常＋Telegram；恢復後通知；status.json 改連網域", async () => {
+  let T = Date.parse("2026-11-03T12:00:00Z");
+  const env = makeEnv({ config: { version: 1, subscriptionUrl: MAIN, alertsEnabled: true, tgBotToken: TOK, tgChatId: "99", alertSourceMin: 10, alertQuiet: "" } }, { STREAM_PROBE: "on" });
+  const { runMonitorTick } = await import("../src/monitor.js");
+  const realFetch = globalThis.fetch;
+  const tg = [];
+  const seen = [];
+  let seg = 200;
+  globalThis.fetch = chainMock(tg, { seen, seg: () => seg, status: () => ({ healthy: true, consecutive_failures: 0, public_ip: "187.15.1.1", checked_at_ms: T - 60000 }) }, realFetch);
+  try {
+    let r = await runMonitorTick(env, T);
+    assert.equal(r.state, "ok");
+    assert.equal(r.st.src.probe.ok, true);
+    assert.equal(r.st.src.probe.channel, "民視第一台");
+    assert.ok(seen.some((u) => u.startsWith("http://1-2-3-4.sslip.io:5050/status.json")), "status.json 改連網域");
+    seg = 502;
+    T += 5 * 60000; r = await runMonitorTick(env, T);
+    assert.equal(r.state, "ok", "失敗一次不算");
+    assert.equal(r.st.src.probeFails, 1);
+    T += 5 * 60000; r = await runMonitorTick(env, T);
+    assert.equal(r.state, "bad");
+    assert.equal(r.st.src.reason, "probe");
+    T += 5 * 60000; r = await runMonitorTick(env, T);
+    T += 5 * 60000; r = await runMonitorTick(env, T);
+    assert.equal(tg.length, 1, tg.join("\n---\n"));
+    assert.match(tg[0], /直播源播不出來/);
+    assert.match(tg[0], /切片回 HTTP 502/);
+    assert.match(tg[0], /看門狗自報正常/);
+    // 總覽也要講真話：紅燈＋雲端實測原因
+    const o = await call(env, "/admin/partial?name=overview");
+    assert.match(o.text, /head-card red/);
+    assert.match(o.text, /雲端實測播不出來/);
+    seg = 200;
+    T += 5 * 60000; r = await runMonitorTick(env, T);
+    assert.equal(r.state, "ok");
+    assert.equal(tg.length, 2);
+    assert.match(tg[1], /直播源已恢復/);
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+});
+
+await test("2.4：監控 — 沒有看門狗的源（status.json 404）靠雲端實測也有監控；看門狗沒回報但播得出來 → 正常＋黃燈提醒", async () => {
+  let T = Date.now();
+  const env = makeEnv({ config: { version: 1, subscriptionUrl: MAIN } }, { STREAM_PROBE: "on" });
+  const { runMonitorTick } = await import("../src/monitor.js");
+  const realFetch = globalThis.fetch;
+  let status = null;
+  globalThis.fetch = chainMock([], { status: () => status }, realFetch);
+  try {
+    let r = await runMonitorTick(env, T);
+    assert.equal(r.state, "ok", "第三方源：實測播得出來就是正常");
+    let o = await call(env, "/admin/partial?name=overview");
+    assert.match(o.text, /雲端實測：民視第一台 播放正常/);
+    status = { healthy: true, consecutive_failures: 0, checked_at_ms: T - 3 * 3600000 };
+    T += 5 * 60000; r = await runMonitorTick(env, T);
+    assert.equal(r.state, "ok");
+    o = await call(env, "/admin/partial?name=overview");
+    assert.match(o.text, /出事時不會自動修復/);
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+});
+
+await test("2.4：家用代理回報播放實測 — 存下精簡結果、失敗立刻記、直播源分頁顯示", async () => {
+  const env = makeEnv({ config: { version: 1, subscriptionUrl: MAIN, homeProxyKey: "K".repeat(40) } });
+  const post = async (body) => {
+    const req = new Request(ORIGIN + "/api/home-proxy", { method: "POST", headers: { "Content-Type": "application/json", "X-Home-Key": "K".repeat(40), "cf-connecting-ip": "89.0.0.1" }, body: JSON.stringify(body) });
+    const res = await worker.fetch(req, env, {});
+    return { status: res.status, json: await res.json() };
+  };
+  let r = await post({ ...HP_BODY, probe: { ok: true, channel: "民視第一台", m3u8Ms: 800, segMs: 1100, bytes: 65536, error: "", junk: "x" } });
+  assert.equal(r.status, 200, JSON.stringify(r.json));
+  let rec = await env.CONFIG_KV.get("homeproxy", { type: "json" });
+  assert.equal(rec.probe.ok, true);
+  assert.equal(rec.probe.channel, "民視第一台");
+  assert.ok(!("junk" in rec.probe));
+  // 同樣成功、秒數不同 → 不重寫（省 KV）；失敗 → 立刻寫
+  r = await post({ ...HP_BODY, probe: { ok: true, channel: "民視第一台", m3u8Ms: 900, segMs: 1300, bytes: 65536 } });
+  assert.equal(r.json.stored, false);
+  r = await post({ ...HP_BODY, healthy: false, probe: { ok: false, channel: "民視第一台", error: "切片回 HTTP 502" } });
+  assert.equal(r.json.stored, true);
+  rec = await env.CONFIG_KV.get("homeproxy", { type: "json" });
+  assert.equal(rec.healthy, false);
+  assert.equal(rec.probe.error, "切片回 HTTP 502");
+  const page = await call(env, "/admin/partial?name=home");
+  assert.match(page.text, /家用代理自己實測播不出來（切片回 HTTP 502）/);
+  assert.match(page.text, /播放實測（代理每 5 分鐘自己播一台/);
 });
 
 console.log(`\n${passed} passed, ${failures.length} failed`);

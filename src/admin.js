@@ -32,6 +32,7 @@ import {
   loadAudit,
   loadConfig,
   loadConfigHistory,
+  homeProxyState,
   loadHomeProxy,
   maskToken,
   nowIso,
@@ -47,6 +48,7 @@ import {
 import { authorizeDevice, genCodeString, getLatestRelease, loadCodes, loadDevice, loadDevices, saveDeviceAdmin } from "./api.js";
 import { fetchSourceStatus, isValidTgToken, loadMonState, runMonitorTick, saveMonState, sendTelegram } from "./monitor.js";
 import { renderAdminHtml, renderCodesResultPage, renderPartial, renderResultPage, setupPasswordHtml } from "./ui.js";
+import { getText, isLanUrl, pickProbeChannel, probeStream } from "./probe.js";
 
 /* ================================================================
  *  驗證與安全
@@ -383,15 +385,43 @@ export async function handleAdminSave(request, env) {
 
 /* ================================================================
  *  POST /admin/test — 測試來源（回 JSON）
+ *  抓清單之外，再照盒子的走法真的播一台（m3u8 → 切片），通過才算「來源正常」。
+ *  IP 網址自動改連 sslip.io 對應網域（Cloudflare Worker 不能直連 IP，見 probe.js）。
+ *  區網網址（家用代理）雲端連不到 → 回家用代理自己每 5 分鐘的實測結果；which=home（備援欄空白）同。
  * ================================================================ */
+
+/** 家用代理登記紀錄裡給管理頁看的部分（含它自己的播放實測） */
+function homeSummary(hp, nowMs) {
+  if (!hp) return null;
+  const st = homeProxyState(hp, nowMs);
+  return {
+    state: st,
+    lanUrl: hp.lanUrl,
+    version: hp.version || "",
+    channels: hp.channels,
+    healthy: hp.healthy !== false,
+    lastSeen: hp.lastSeen,
+    seenText: relativeTime(hp.lastSeen, nowMs),
+    probe: hp.probe && typeof hp.probe === "object" ? hp.probe : null,
+  };
+}
 
 export async function handleAdminTest(request, env) {
   const blocked = await guard(request, env);
   if (blocked) return blocked;
 
   let targetUrl = "";
+  let which = "";
   const form = await readForm(request);
-  if (form) targetUrl = str(form, "subscriptionUrl");
+  if (form) {
+    targetUrl = str(form, "subscriptionUrl");
+    which = str(form, "which");
+  }
+  const nowMs = Date.now();
+  if ((!targetUrl && which === "home") || (targetUrl && isLanUrl(targetUrl))) {
+    const [boxes, hp] = await Promise.all([summarizeBoxes(env), loadHomeProxy(env)]);
+    return jsonResponse({ ok: true, lan: true, home: homeSummary(hp, nowMs), boxes });
+  }
   if (!targetUrl || !/^https?:\/\//i.test(targetUrl)) {
     return jsonResponse({ ok: false, error: "網址格式不正確" }, 400);
   }
@@ -399,29 +429,32 @@ export async function handleAdminTest(request, env) {
   const boxes = await summarizeBoxes(env);
 
   try {
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 10000);
-    const started = Date.now();
-    const resp = await fetch(targetUrl, {
-      method: "GET",
-      headers: { "User-Agent": "WeiTV-Admin-Test/2.0" },
-      signal: controller.signal,
-    });
-    clearTimeout(timer);
-    const text = await resp.text();
-    const ms = Date.now() - started;
+    const p = await getText(targetUrl, 10000);
+    const text = p.text;
     const preview = parsePlaylistPreview(text);
+    // 清單抓得到只代表 nginx 活著；再真的播一台（預設民視第一台）才知道 VPN / 代理 / 切片通不通
+    let channel = "";
+    let stream = null;
+    if (p.ok && preview.count > 0) {
+      const ch = pickProbeChannel(text, targetUrl);
+      if (ch) {
+        channel = ch.name;
+        stream = await probeStream(ch.url);
+      }
+    }
     return jsonResponse({
       ok: true,
-      httpStatus: resp.status,
-      httpOk: resp.ok,
+      httpStatus: p.status,
+      httpOk: p.ok,
       channelCount: preview.count,
       bytes: text.length,
-      ms,
+      ms: p.ms,
       looksLikeM3u: /#EXTM3U/i.test(text),
       epgUrl: preview.epgUrl,
       groups: preview.groups,
       sample: preview.sample,
+      channel,
+      stream,
       boxes,
     });
   } catch (err) {

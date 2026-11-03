@@ -26,7 +26,8 @@ import {
   relativeTime,
   sameHomeIp,
 } from "./lib.js";
-import { backupState, describeSource, historySlots, isValidTgToken, reasonText, selfHealText, sourceState, telegramReady, uptime24h } from "./monitor.js";
+import { backupState, combineState, describeSource, freshProbe, historySlots, isValidTgToken, lineReason, reasonText, selfHealText, sourceState, telegramReady, uptime24h } from "./monitor.js";
+import { probeText } from "./probe.js";
 import { ADMIN_CSS, ADMIN_JS } from "./ui_assets.js";
 
 const DAY = 86400000;
@@ -193,9 +194,11 @@ function renderHeadline(ctx, stat, nowMs) {
   const { config, devices, mon } = ctx;
   const devList = Array.isArray(devices) ? devices : [];
   const ss = ctx.sourceStatus;
-  const state = sourceState(ss, nowMs);
+  // 看門狗自報 + 監控每 5 分鐘的雲端實測（真的播一台）合起來判斷
+  const wd = sourceState(ss, nowMs);
+  const state = combineState(wd, mon && mon.src, nowMs);
   const bss = ctx.backupStatus;
-  const bstate = backupState(config, bss, nowMs);
+  const bstate = backupState(config, bss, nowMs, mon && mon.bsrc);
   const hasBackup = bstate !== "off";
   const hp = ctx.homeProxy;
   const hpState = homeProxyState(hp, nowMs);
@@ -207,7 +210,9 @@ function renderHeadline(ctx, stat, nowMs) {
   const down = (s) => s === "bad" || s === "stale";
   const issues = [];
   if (down(state)) {
-    const why = state === "bad" ? reasonText(ss.reason) : ss && ss._unreachable ? `連不上主機（${ss._unreachable}）` : "看門狗沒回報，VPS 可能離線";
+    const why = state === "bad"
+      ? wd === "bad" ? reasonText(ss.reason) : lineReason({ reason: "probe", probe: freshProbe(mon && mon.src, nowMs) })
+      : ss && ss._unreachable ? `連不上主機（${ss._unreachable}）` : "看門狗沒回報，VPS 可能離線";
     const away = onlineDevs.length - homeBoxes;
     if (down(bstate)) issues.push(["red", `主線路與備援線路都異常（主線路：${why}），盒子可能沒有畫面`]);
     else if (bstate === "ok") issues.push(["yellow", `主線路異常（${why}）→ 盒子已自動改用備援線路`]);
@@ -216,8 +221,10 @@ function renderHeadline(ctx, stat, nowMs) {
     else if (state === "bad") issues.push(["red", `直播源異常：${why}，看門狗處理中${bstate === "none" ? "（備援線路沒有監測資料，盒子會自動嘗試改用）" : ""}`]);
     else issues.push(["red", (ss && ss._unreachable ? `連不上直播源主機（${ss._unreachable}），VPS 可能離線` : "直播源伺服器的看門狗沒回報，VPS 可能離線") + (bstate === "none" ? "（盒子會自動嘗試備援線路）" : "")]);
   } else if (down(bstate)) {
-    issues.push(["yellow", `備援線路異常（${bstate === "bad" ? reasonText(bss.reason) : bss && bss._unreachable ? "連不上主機" : "看門狗沒回報"}），主線路正常、不影響觀看`]);
+    issues.push(["yellow", `備援線路異常（${bstate === "bad" ? lineReason(mon && mon.bsrc, bss) : bss && bss._unreachable ? "連不上主機" : "看門狗沒回報"}），主線路正常、不影響觀看`]);
   }
+  // 雲端實測播得出來、但看門狗讀不到 / 沒回報：現在能看，可是出事時沒人自動修
+  if (wd === "stale" && state === "ok") issues.push(["yellow", `直播源看門狗${ss && ss._unreachable ? "狀態讀不到（" + ss._unreachable + "）" : "沒回報"}（雲端實測仍播得出來）：出事時不會自動修復，請查 VPS 的排程`]);
   if (onBackup && !down(state)) issues.push(["yellow", `${onBackup} 台盒子還在走備援線路`]);
   const failing = devList.filter((d) => onlineState(d, nowMs) === "online" && d.lastOk === false && nowMs - (Date.parse(d.lastResultAt) || 0) < 3600000).length;
   if (failing) issues.push(["red", `${failing} 台線上盒子最近載入頻道失敗`]);
@@ -234,8 +241,8 @@ function renderHeadline(ctx, stat, nowMs) {
 
   const parts = [];
   parts.push(`${stat.online} 台線上` + (stat.total ? `（共 ${stat.total} 台）` : ""));
-  if (state !== "none") parts.push((hasBackup ? "主線路" : "直播源") + describeSource(ss, state, nowMs));
-  if (hasBackup) parts.push("備援線路" + describeSource(bss, bstate, nowMs));
+  if (state !== "none") parts.push((hasBackup ? "主線路" : "直播源") + describeSource(ss, state, nowMs, mon && mon.src));
+  if (hasBackup) parts.push("備援線路" + describeSource(bss, bstate, nowMs, mon && mon.bsrc));
   if (onBackup && down(state)) parts.push(`${onBackup} 台走備援線路`);
   if (hp) parts.push(homeProxyLine(hp, hpState, homeBoxes, config, nowMs));
   if (ss && ss.epg_updated) parts.push("節目表 " + esc(String(ss.epg_updated).slice(5, 16)) + " 更新");
@@ -265,10 +272,28 @@ function homeProxyLine(hp, hpState, homeBoxes, config, nowMs) {
   return `家用備援在線（${extra.join("，")}）`;
 }
 
-/** 一條線路的看門狗狀態橫幅（主線路 / 備援線路共用） */
-function sourceBanner(ss, label, nowMs, isBackup) {
+/** 雲端實測的一行（橫幅尾巴）：每 5 分鐘從 Cloudflare 照盒子的走法真的播一台 */
+function probeLineHtml(p, nowMs) {
+  if (!p || p.lan) return "";
+  const when = relativeTime(new Date(p.at).toISOString(), nowMs);
+  return `<br>${p.ok ? "☁️" : "❌"} 雲端實測（${esc(when || "剛剛")}）：${esc(probeText(p))}`;
+}
+
+/** 一條線路的看門狗狀態橫幅（主線路 / 備援線路共用）；line = 監控狀態（帶雲端實測） */
+function sourceBanner(ss, label, nowMs, isBackup, line) {
+  const p = freshProbe(line, nowMs);
+  const probeHtml = probeLineHtml(p, nowMs);
+  if (!ss) {
+    // 沒有看門狗（第三方源，或 status.json 讀不到）：只靠雲端實測
+    if (!p || p.lan) return "";
+    const bad = !p.ok && (line.probeFails || 0) >= 2;
+    return `<div class="banner ${p.ok ? "off" : "warn"}"><span class="bi">${p.ok ? "🟢" : bad ? (isBackup ? "🟡" : "🔴") : "⚠️"}</span><div>${label} <b>${p.ok ? "播得出來" : bad ? "播不出來" : "實測失敗一次"}</b>（沒有看門狗資料，靠雲端實測）。${probeHtml}</div></div>`;
+  }
   if (ss._unreachable) {
-    return `<div class="banner warn"><span class="bi">⚠️</span><div>${label} <b>連不上</b>（${esc(ss._unreachable)}），VPS 可能離線、關機或網路斷了。${isBackup ? "主線路正常時不影響觀看。" : ""}</div></div>`;
+    if (p && p.ok) {
+      return `<div class="banner warn"><span class="bi">⚠️</span><div>${label}的看門狗狀態 <b>讀不到</b>（${esc(ss._unreachable)}），但雲端實測還播得出來：出事時不會自動修復，請查 VPS。${probeHtml}</div></div>`;
+    }
+    return `<div class="banner warn"><span class="bi">⚠️</span><div>${label} <b>連不上</b>（${esc(ss._unreachable)}），VPS 可能離線、關機或網路斷了。${isBackup ? "主線路正常時不影響觀看。" : ""}${probeHtml}</div></div>`;
   }
   const ageMs = ss.checked_at_ms ? nowMs - ss.checked_at_ms : NaN;
   const stale = !Number.isFinite(ageMs) || ageMs > 20 * 60 * 1000;
@@ -280,12 +305,15 @@ function sourceBanner(ss, label, nowMs, isBackup) {
     : "";
   const heal = selfHealText(ss);
   if (stale) {
-    return `<div class="banner warn"><span class="bi">⚠️</span><div>${label}的看門狗 <b>${when === "-" ? "沒有回報" : when + "後就沒再回報"}</b>，VPS 可能離線或排程停了。</div></div>`;
+    return `<div class="banner warn"><span class="bi">⚠️</span><div>${label}的看門狗 <b>${when === "-" ? "沒有回報" : when + "後就沒再回報"}</b>，VPS 可能離線或排程停了。${probeHtml}</div></div>`;
+  }
+  if (ss.healthy && p && !p.ok && (line.probeFails || 0) >= 2) {
+    return `<div class="banner warn"><span class="bi">${isBackup ? "🟡" : "🔴"}</span><div>${label} <b>播不出來</b>：看門狗自報正常（${when}），但從雲端照盒子的走法實測連續失敗——多半是對外入口（nginx、埠、防火牆）或主機網路，看門狗看不出來也不會自動處理，請登入 VPS 執行 4gtv doctor。${probeHtml}</div></div>`;
   }
   if (ss.healthy) {
-    return `<div class="banner off"><span class="bi">🟢</span><div>${label} <b>正常</b>（實測熱門台切片與冷門台 API 解析，${when}）。${ipTxt}。${epgTxt}${actTxt ? " " + actTxt : ""}${heal ? `<br>🛠️ ${esc(heal)}` : ""}</div></div>`;
+    return `<div class="banner off"><span class="bi">🟢</span><div>${label} <b>正常</b>（看門狗實測熱門台切片與冷門台 API 解析，${when}）。${ipTxt}。${epgTxt}${actTxt ? " " + actTxt : ""}${heal ? `<br>🛠️ ${esc(heal)}` : ""}${probeHtml}</div></div>`;
   }
-  return `<div class="banner warn"><span class="bi">${isBackup ? "🟡" : "🔴"}</span><div>${label} <b>異常</b>：連續 <b>${esc(ss.consecutive_failures)}</b> 次實測失敗（${esc(reasonText(ss.reason))}，${when}，${ipTxt}）。看門狗會自動清快取、重啟與更換出口節點${actTxt ? "；" + actTxt : ""}。${isBackup ? "主線路正常時不影響觀看，有空再處理。" : "若 30 分鐘內未恢復請通知維護人員。"}${heal ? `<br>🛠️ ${esc(heal)}` : ""}</div></div>`;
+  return `<div class="banner warn"><span class="bi">${isBackup ? "🟡" : "🔴"}</span><div>${label} <b>異常</b>：連續 <b>${esc(ss.consecutive_failures)}</b> 次實測失敗（${esc(reasonText(ss.reason))}，${when}，${ipTxt}）。看門狗會自動清快取、重啟與更換出口節點${actTxt ? "；" + actTxt : ""}。${isBackup ? "主線路正常時不影響觀看，有空再處理。" : "若 30 分鐘內未恢復請通知維護人員。"}${heal ? `<br>🛠️ ${esc(heal)}` : ""}${probeHtml}</div></div>`;
 }
 
 /** 24 小時健康色條（96 格 × 15 分鐘） */
@@ -368,11 +396,12 @@ export function renderOverview(ctx) {
   const ss = ctx.sourceStatus;
   const bss = ctx.backupStatus;
   const hasBackup = !!String(config.backupSubscriptionUrl || "").trim();
-  if (ss) banners.push(sourceBanner(ss, hasBackup ? "直播源伺服器（主線路）" : "直播源伺服器", nowMs, false));
+  const mainBanner = sourceBanner(ss, hasBackup ? "直播源伺服器（主線路）" : "直播源伺服器", nowMs, false, mon && mon.src);
+  if (mainBanner) banners.push(mainBanner);
   if (hasBackup) {
-    banners.push(bss
-      ? sourceBanner(bss, "備援線路", nowMs, true)
-      : `<div class="banner off"><span class="bi">🛟</span><div>備援線路 <b>已設定</b>（沒有看門狗資料，無法監測健康）。主線路連續失敗時盒子會自動改用它。</div></div>`);
+    const bkBanner = sourceBanner(bss, "備援線路", nowMs, true, mon && mon.bsrc);
+    banners.push(bkBanner ||
+      `<div class="banner off"><span class="bi">🛟</span><div>備援線路 <b>已設定</b>（沒有看門狗資料${freshProbe(mon && mon.bsrc, nowMs) && freshProbe(mon && mon.bsrc, nowMs).lan ? "，是區網網址、雲端無法實測" : "，雲端實測還沒跑"}）。主線路連續失敗時盒子會自動改用它。</div></div>`);
   }
   banners.push(
     config.requireActivation
@@ -516,7 +545,9 @@ export function renderHomeProxyCard(ctx) {
     : st === "offline" ? `<span class="badge danger-b">離線</span>` : `<span class="badge off">尚未登記</span>`;
 
   const notes = [];
-  if (hp && hp.healthy === false) notes.push(["warn", "家用代理自報異常（抓不到頻道）→ 暫時不下發給盒子，恢復後自動繼續。"]);
+  const hpProbe = hp && hp.probe && typeof hp.probe === "object" ? hp.probe : null;
+  if (hp && hp.healthy === false) notes.push(["warn", `家用代理自己實測播不出來${hpProbe && hpProbe.error ? "（" + hpProbe.error + "）" : "（或抓不到頻道）"} → 暫時不下發給盒子，恢復後自動繼續。`]);
+  if (hp && !hpProbe && st === "online") notes.push(["mute", "這台家用代理版本較舊，只回報頻道數、沒有回報播放實測；在家裡電腦重跑一次安裝指令就會升級。"]);
   if (hp && nowMs - (Date.parse(hp.lastSeen) || 0) > HOME_FRESH_MS) notes.push(["warn", "超過 2 小時沒有登記 → 暫時不下發給盒子（電腦關機、睡眠或代理沒在跑）。"]);
   if (manual && role === "backup") notes.push(["mute", "上面已手動填「備援訂閱網址」→ 盒子用手動那條，家用代理只顯示狀態、不下發。想讓家裡的盒子用家用代理，就清空手動備援，或把角色改成「優先」。"]);
 
@@ -526,6 +557,7 @@ export function renderHomeProxyCard(ctx) {
         <div class="item"><div class="k">家裡的公網 IP</div><div class="v mono">${esc(hp.publicIp || "-")}</div></div>
         <div class="item"><div class="k">代理版本</div><div class="v">${esc(hp.version || "-")}</div></div>
         <div class="item"><div class="k">頻道數</div><div class="v">${esc(hp.channels != null ? hp.channels : "-")} 台</div></div>
+        <div class="item full"><div class="k">播放實測（代理每 5 分鐘自己播一台；雲端連不到區網，只能靠它回報）</div><div class="v">${hpProbe ? (hpProbe.ok ? "✅ " : "❌ ") + esc(probeText(hpProbe)) : "—（舊版代理沒有回報）"}</div></div>
         <div class="item"><div class="k">最後回報</div><div class="v">${esc(relativeTime(hp.lastSeen, nowMs) || "-")}<span class="sub-v">${esc(formatTaipeiFull(hp.lastSeen))}（沒變化時每 30 分鐘記一次）</span></div></div>
         <div class="item"><div class="k">登記方式</div><div class="v">${hp.via === "box" ? "免金鑰" + (hp.boxId ? `<span class="sub-v">同一個家的已授權盒子 ${esc(hp.boxId)} 擔保</span>` : "") : "金鑰"}</div></div>
       </div>`

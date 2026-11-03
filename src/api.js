@@ -554,7 +554,9 @@ async function findHomeBox(env, ip, hintId, nowMs, maxAgeMs, memo) {
 }
 
 /**
- * POST /api/home-proxy — 家裡電腦的家用備援代理定時回報（建議每 5 分鐘）。本文 JSON {lanUrl, version, channels, healthy}。
+ * POST /api/home-proxy — 家裡電腦的家用備援代理定時回報（建議每 5 分鐘）。本文 JSON {lanUrl, version, channels, healthy, probe}。
+ * probe（2.4 起，選用）= 代理自己照盒子的走法播一台的結果 {ok, channel, m3u8Ms, segMs, bytes, error}；healthy 由代理依實測決定
+ * （連續兩次播不出來才報 false），管理中心只把 healthy 的家用代理下發給盒子。
  * 身分驗證（二選一）：
  *   • 標頭 X-Home-Key（選用）：帶了就必須正確，錯的回 401 並計入防暴力限速
  *   • 沒帶金鑰：這個公網 IP（CF-Connecting-IP）24 小時內要有已授權（未封鎖、未到期）盒子的心跳 = 同一個家，否則 403。
@@ -564,6 +566,23 @@ async function findHomeBox(env, ip, hintId, nowMs, maxAgeMs, memo) {
  * 回應：200 {ok, stored, via, role, publicIp, playlist, lastSeen}｜400 內容不對｜401 金鑰錯｜403 不是同一個家 / 另一個家使用中
  *       ｜429 太頻繁 / 金鑰錯太多次｜503 KV 故障。錯誤一律 {ok:false, reason, error}（reason 給程式判斷，error 給人看）。
  */
+/** 家用代理回報的播放實測：只收認得的欄位、長度與數值都設上限；格式不對回 null */
+function homeProbe(p, nowMs) {
+  if (!p || typeof p !== "object" || Array.isArray(p)) return null;
+  const num = (v) => Math.max(0, Math.min(600000, parseIntOr(v, 0)));
+  return {
+    at: nowMs,
+    ok: p.ok === true,
+    lan: false,
+    channel: String(p.channel == null ? "" : p.channel).slice(0, 40),
+    error: String(p.error == null ? "" : p.error).slice(0, 160),
+    listMs: 0,
+    m3u8Ms: num(p.m3u8Ms),
+    segMs: num(p.segMs),
+    bytes: Math.max(0, Math.min(100000000, parseIntOr(p.bytes, 0))),
+  };
+}
+
 export async function handleHomeProxy(request, env) {
   const nowMs = Date.now();
   const ip = clientIp(request);
@@ -640,8 +659,12 @@ export async function handleHomeProxy(request, env) {
     via,
     boxId,
   };
+  const probe = homeProbe(body.probe, nowMs);
+  if (probe) rec.probe = probe;
+  // 實測細節（秒數）每次都不一樣，不算變化；成敗翻轉才算（失敗要馬上記下來，成功的細節最多舊 30 分鐘）
   const same = !!prev && prev.lanUrl === rec.lanUrl && prev.publicIp === rec.publicIp && prev.version === rec.version &&
-    prev.channels === rec.channels && prev.healthy === rec.healthy && (prev.via || "key") === rec.via && (prev.boxId || "") === rec.boxId;
+    prev.channels === rec.channels && prev.healthy === rec.healthy && (prev.via || "key") === rec.via && (prev.boxId || "") === rec.boxId &&
+    !!(prev.probe && prev.probe.ok) === !!(probe && probe.ok) && !!prev.probe === !!probe;
   const recent = !!prev && nowMs - (Date.parse(prev.lastSeen) || 0) < HOME_WRITE_MIN_MS;
   let stored = false;
   if (!(same && recent)) {
