@@ -57,6 +57,7 @@ import {
   rateLimited,
   sameHomeIp,
   splitAdminFields,
+  stallLevel,
   stripAdminFields,
   timingSafeEqual,
 } from "./lib.js";
@@ -196,6 +197,8 @@ export async function saveDeviceAdmin(env, id, adm) {
  *   ack 已執行的遠端指令 id
  *   pe  近 10 分鐘播放重連次數  le 最近一次播放錯誤（短文字）  up App 已運行分鐘數
  *   ln  目前播放所用線路（0 = 主線路、1 = 備援線路）
+ *   rb  近 10 分鐘卡頓次數  rs 卡頓合計毫秒  zt 換台到出畫面毫秒（中位數）
+ *   bf  目前緩衝秒數  bw 下載速度估計 kbps（App 1.0.0.29+）
  */
 export async function touchDevice(request, env, ctx) {
   const url = new URL(request.url);
@@ -295,6 +298,34 @@ export async function touchDevice(request, env, ctx) {
         if (sinceWrite >= 3 * 60 * 1000 || now.getTime() - lastSwitchMs >= 10 * 60 * 1000) mustWrite = true;
       }
     }
+  }
+
+  if (q.has("rb")) {
+    // 流暢度：卡頓次數 / 毫秒。變成「常卡」或從常卡恢復 → 立刻寫（管理員看到的是即時狀態）；其餘照 3 分鐘節流
+    const rb = Math.max(0, Math.min(999, parseIntOr(q.get("rb"), 0)));
+    const rs = rb > 0 ? Math.max(0, Math.min(600000, parseIntOr(q.get("rs"), 0))) : 0;
+    const wasBad = stallLevel(dev.rb, dev.rs) === "bad";
+    const isBad = stallLevel(rb, rs) === "bad";
+    if (rb !== dev.rb || rs !== dev.rs) {
+      if (sinceWrite >= 3 * 60 * 1000 || isBad !== wasBad) mustWrite = true;
+      dev.rb = rb;
+      dev.rs = rs;
+      dev.rbAt = iso;
+    } else if (rb > 0) {
+      dev.rbAt = iso;   // 還在卡：時間跟著更新（下次寫入一起存），不會因為數字剛好沒變就被當成舊資料
+    }
+  }
+  if (q.has("zt")) {
+    const zt = parseIntOr(q.get("zt"), -1);
+    if (zt >= 0) dev.zt = Math.min(zt, 120000);
+  }
+  if (q.has("bf")) {
+    const bf = parseIntOr(q.get("bf"), -1);
+    if (bf >= 0) dev.bf = Math.min(bf, 600);
+  }
+  if (q.has("bw")) {
+    const bw = parseIntOr(q.get("bw"), -1);
+    if (bw > 0) dev.bw = Math.min(bw, 10000000);
   }
 
   // 指令回條：清掉 devadm 的待送指令並記回條（這是心跳唯一會碰 devadm 的時機，且只在有 ack 時）

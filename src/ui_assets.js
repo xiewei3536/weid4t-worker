@@ -123,6 +123,8 @@ a{color:var(--accent)}
 .now-row .nm{font-weight:700;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:0 1 38%}
 .now-row .ch{color:var(--accent);font-weight:700;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1}
 .now-row .tm{color:var(--text-faint);font-size:12px;flex:none}
+/* 手機:名稱、頻道、時間排第一行,狀態標籤(備援線路 / 順 / 卡幾次)換到第二行,頻道名稱才不會被擠到看不見 */
+@media(max-width:560px){.now-row{flex-wrap:wrap;row-gap:6px}.now-row .nm{flex:0 1 30%}.now-row .ch{flex:1 1 0;min-width:36%}.now-row .ph{order:9}}
 .ver-bars{display:flex;flex-direction:column;gap:7px}
 .ver-bar{display:grid;grid-template-columns:110px 1fr 40px;align-items:center;gap:10px;font-size:13px}
 .ver-bar .vb{height:9px;border-radius:999px;background:var(--surface-3);overflow:hidden}
@@ -373,6 +375,17 @@ code{background:var(--surface-2);border:1px solid var(--border);padding:2px 7px;
 .ph.bad{color:var(--danger);border-color:rgba(255,92,108,.4);background:rgba(255,92,108,.08)}
 .ph.warn{color:var(--gold);border-color:rgba(251,191,36,.4);background:rgba(251,191,36,.08)}
 .ph.bk{color:var(--info);border-color:rgba(96,165,250,.4);background:rgba(96,165,250,.08)}
+.ph.ok{color:var(--ok);border-color:rgba(52,211,153,.35);background:rgba(52,211,153,.07)}
+/* ── 播放品質（總覽）── */
+.q-grid{display:grid;grid-template-columns:repeat(2,1fr);gap:9px}
+@media(min-width:720px){.q-grid{grid-template-columns:repeat(4,1fr)}}
+.q-tile{background:var(--surface-2);border:1px solid var(--border);border-radius:13px;padding:12px 14px;min-width:0}
+.q-lab{font-size:11.5px;color:var(--text-dim);letter-spacing:.02em}
+.q-val{font-size:22px;font-weight:800;line-height:1.25;margin-top:3px;font-variant-numeric:tabular-nums;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.q-val.ok{color:var(--ok)}.q-val.warn{color:var(--gold)}.q-val.bad{color:var(--danger)}.q-val.mute{color:var(--text-dim)}
+.q-sub{font-size:11.5px;color:var(--text-faint);margin-top:4px;line-height:1.5}
+.q-note{margin-top:11px;font-size:12.5px;color:var(--text-dim);line-height:1.6}
+.fact.wide{grid-column:1/-1}
 /* ── 家用備援卡片 ── */
 .radio-row{display:flex;flex-direction:column;gap:8px}
 .radio{display:flex;gap:11px;align-items:flex-start;margin:0;padding:12px 14px;border:1px solid var(--border);border-radius:12px;background:var(--surface-2);font-weight:500;font-size:13.5px;line-height:1.55;cursor:pointer}
@@ -457,7 +470,8 @@ export const ADMIN_JS = `
         || (devFilter === 'unauth' && card.dataset.authed === '0')
         || (devFilter === 'blocked' && card.dataset.blocked === '1')
         || (devFilter === 'oldver' && card.dataset.oldver === '1')
-        || (devFilter === 'backup' && card.dataset.backup === '1');
+        || (devFilter === 'backup' && card.dataset.backup === '1')
+        || (devFilter === 'stall' && card.dataset.stall === '1');
       var show = okText && okFilter; if (show) shown++;
       card.classList.toggle('hide', !show);
     });
@@ -618,7 +632,8 @@ export const ADMIN_JS = `
     var st = data.stream;
     if (!st) return '';
     var head = '實際播放測試（' + esc(data.channel || '測試台') + '）：';
-    if (st.ok) return '<div class="note-box ok">✅ ' + head + '播放清單 ' + secTxt(st.m3u8Ms) + '、切片 ' + secTxt(st.segMs) + '（讀了 ' + Math.round(st.bytes / 1024) + ' KB' + (st.ts ? '，MPEG-TS 正常' : '') + '）——盒子現在播得出來</div>';
+    if (st.ok) return '<div class="note-box ok">✅ ' + head + '播放清單 ' + secTxt(st.m3u8Ms) + '、切片 ' + secTxt(st.segMs) + '（讀了 ' + Math.round(st.bytes / 1024) + ' KB' + (st.ts ? '，MPEG-TS 正常' : '') + '）——盒子現在播得出來</div>'
+      + (st.viaProxy ? '<div class="note-box mute">ℹ 雲端機房直接連 CDN 抓不到切片（' + esc(st.cdnError || '原因不明') + '），這次測的是主機代抓。盒子在台灣是直接向 CDN 下載，通常不受影響；盒子真的抓不到時主機也會自動代抓。</div>' : '');
     return '<div class="note-box bad">❌ ' + head + esc(st.error || '播不出來') + '——清單抓得到，但實際播放失敗，盒子這條線會黑畫面</div>';
   }
   function testSource(which){
@@ -643,6 +658,7 @@ export const ADMIN_JS = `
           var hint = listOk ? '' : '<div class="note-box warn">⚠ 此測試從 Cloudflare 雲端連線（IP 網址已自動改用對應網域連過去）。若你的源只允許台灣／家用 IP，雲端會被擋；但電視盒是從你家網路直接連源，通常仍可正常使用。</div>';
           var groups = (data.groups || []).map(function(g){ return '<span class="chip-s">' + esc(g.name) + ' <b>' + g.count + '</b></span>'; }).join('');
           var sample = (data.sample || []).length ? '<div class="inline-note">頻道範例：' + esc(data.sample.join('、')) + (data.channelCount > data.sample.length ? '…' : '') + '</div>' : '';
+          if ((data.paused || []).length) sample += '<div class="inline-note">⏸ 另有 ' + data.paused.length + ' 台暫停播出（4gtv 官網下架或改成會員限定，恢復後自動放回）：' + esc(data.paused.slice(0, 8).join('、')) + (data.paused.length > 8 ? ' 等' : '') + '</div>';
           var epg = data.epgUrl ? '<div class="inline-note">節目表（EPG）：<code>' + esc(data.epgUrl) + '</code></div>' : '<div class="inline-note">此清單未附節目表網址（x-tvg-url）</div>';
           el.innerHTML = resultHead(good ? 'ok' : 'bad', good ? '✓' : '✕', label + '：' + (good ? '來源正常' : listOk ? '清單正常、但播不出來' : '雲端測試未通過'), good ? '清單與實際播放都通過，可以儲存使用' : listOk ? '看下面「實際播放測試」的原因' : '雲端連不到，不代表盒子連不到')
             + '<div class="result-stats"><div class="stat"><div class="sk">HTTP 狀態</div><div class="sv">' + data.httpStatus + '</div></div><div class="stat"><div class="sk">M3U 格式</div><div class="sv">' + (data.looksLikeM3u ? '是' : '否') + '</div></div><div class="stat"><div class="sk">頻道數</div><div class="sv">' + data.channelCount + '</div></div><div class="stat"><div class="sk">回應</div><div class="sv">' + Math.round(data.bytes/1024) + ' KB · ' + data.ms + ' ms</div></div></div>'

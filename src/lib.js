@@ -35,7 +35,7 @@ export const HOME_FRESH_MS = 2 * 60 * 60 * 1000;
 export const HOME_BOX_WINDOW_MS = 24 * 60 * 60 * 1000;
 
 /** 程式版本（/api/health 回傳，部署後用來確認新版已生效） */
-export const BUILD = "2.4.1";
+export const BUILD = "2.5.0";
 
 /** 管理密碼猜錯限速：同一 IP 每 10 分鐘最多幾次 */
 export const ADMIN_RL_MAX = 20;
@@ -113,6 +113,8 @@ export const DEFAULT_CONFIG = {
   alertQuiet: "",
   // 盒子回報載入頻道失敗時通知
   alertBoxFail: true,
+  // 盒子回報播放常卡（連續兩輪監控都常卡）時通知
+  alertStall: true,
   // ── 家用備援代理（家裡電腦跑的代理，POST /api/home-proxy 自動登記；只給同一個家的盒子） ──
   // backup：當備援線路（預設）｜primary：同一個家的盒子以家用清單為主、原本的主網址改當備援
   homeProxyRole: "backup",
@@ -122,7 +124,7 @@ export const DEFAULT_CONFIG = {
 };
 
 /** 這些欄位只屬於管理員，/api/config 一律不下發（含 Telegram token、家用代理金鑰） */
-export const ADMIN_ONLY_KEYS = ["alertsEnabled", "tgBotToken", "tgChatId", "alertSourceMin", "alertDeviceOfflineMin", "alertQuiet", "alertBoxFail", "homeProxyRole", "homeProxyKey"];
+export const ADMIN_ONLY_KEYS = ["alertsEnabled", "tgBotToken", "tgChatId", "alertSourceMin", "alertDeviceOfflineMin", "alertQuiet", "alertBoxFail", "alertStall", "homeProxyRole", "homeProxyKey"];
 
 /** 去掉管理員專用欄位後的設定（給盒子看的版本） */
 export function publicConfig(config) {
@@ -236,7 +238,7 @@ export const CONFIG_LABELS = {
   requireActivation: "授權機制", activationTitle: "啟動頁標題", activationText: "啟動頁說明", codeDigits: "啟動碼位數",
   fontScale: "全域字體", showClock: "時鐘", otaEnabled: "OTA 提示",
   alertsEnabled: "警示開關", tgBotToken: "Telegram Token", tgChatId: "Telegram Chat", alertSourceMin: "直播源異常門檻",
-  alertDeviceOfflineMin: "盒子離線門檻", alertQuiet: "靜音時段", alertBoxFail: "載入失敗通知",
+  alertDeviceOfflineMin: "盒子離線門檻", alertQuiet: "靜音時段", alertBoxFail: "載入失敗通知", alertStall: "播放卡頓通知",
   homeProxyRole: "家用備援角色", homeProxyKey: "家用備援金鑰",
 };
 export function configLabel(k) {
@@ -317,12 +319,68 @@ export const ACTION_TEXT = {
   restart_4gtv: "清快取重啟",
   restart_4gtv_ipchange: "出口 IP 變動，清快取重啟",
   restart_4gtv_reconnect: "VPN 重連，清快取重啟",
+  // 代理 2.4 起：不重啟容器，只丟掉快取的播放網址與上游連線（正在播的台不斷）
+  flush_stale: "播放網址失效，已重新解析（不中斷播放）",
+  flush_ipchange: "出口 IP 變動，已更新播放網址（不中斷播放）",
+  flush_reconnect: "VPN 重連，已更新播放網址（不中斷播放）",
   renew_nord_credentials: "Nord 憑證失效，已自動換新",
   restart_nginx: "重啟對外入口 nginx",
 };
 export function actionText(a) {
   if (!a || a === "none") return "";
   return ACTION_TEXT[a] || String(a);
+}
+
+/* ────────────────────────── 盒子播放流暢度（App 1.0.0.29+ 心跳 rb / rs / zt / bf / bw） ────────────────────────── */
+
+/** 近 10 分鐘卡這麼多次、或合計停住這麼久（毫秒）= 常卡 */
+export const STALL_BAD_COUNT = 3;
+export const STALL_BAD_MS = 10000;
+/** 流暢度回報多久內算新鮮（盒子 90 秒心跳一次；數字沒變時最久 10 分鐘才寫一次） */
+export const SMOOTH_FRESH_MS = 20 * 60 * 1000;
+
+/** 卡頓次數 / 毫秒 → ok（順）/ warn（偶爾卡）/ bad（常卡） */
+export function stallLevel(rb, rs) {
+  const n = typeof rb === "number" ? rb : 0;
+  const ms = typeof rs === "number" ? rs : 0;
+  if (n >= STALL_BAD_COUNT || ms >= STALL_BAD_MS) return "bad";
+  return n > 0 ? "warn" : "ok";
+}
+
+function secText(ms) {
+  const s = Math.round((ms || 0) / 100) / 10;
+  return (s >= 10 ? Math.round(s) : s) + " 秒";
+}
+
+/**
+ * 盒子播放流暢度。回 { level, text, short }：
+ *   level  unknown（舊版 App 沒回報）/ ok / warn / bad
+ *   text   完整一句話（裝置卡）；short 短標籤（總覽「正在觀看」）
+ */
+export function smoothness(d, nowMs) {
+  if (!d || typeof d.rb !== "number") return { level: "unknown", text: "未回報（舊版 App）", short: "" };
+  const at = Date.parse(d.rbAt || "") || 0;
+  const fresh = at > 0 && (nowMs || Date.now()) - at < SMOOTH_FRESH_MS;
+  const level = fresh ? stallLevel(d.rb, d.rs) : "ok";
+  if (level === "bad") return { level, text: `常卡：近 10 分鐘卡 ${d.rb} 次、共停 ${secText(d.rs)}`, short: `常卡 ${d.rb} 次` };
+  if (level === "warn") return { level, text: `偶爾卡：近 10 分鐘卡 ${d.rb} 次、共停 ${secText(d.rs)}`, short: `卡 ${d.rb} 次` };
+  return { level, text: "順", short: "順" };
+}
+
+/** 下載速度 kbps → 白話 */
+export function speedText(kbps) {
+  const n = Number(kbps) || 0;
+  if (n <= 0) return "";
+  return n >= 1000 ? (n >= 10000 ? Math.round(n / 1000) : Math.round(n / 100) / 10) + " Mbps" : Math.round(n) + " kbps";
+}
+
+/** 流暢度的補充數字（換台到出畫面、目前緩衝、下載速度）；沒有的就不列 */
+export function smoothDetail(d) {
+  const out = [];
+  if (d && typeof d.zt === "number" && d.zt > 0) out.push("換台 " + secText(d.zt));
+  if (d && typeof d.bf === "number" && d.bf >= 0) out.push("緩衝 " + d.bf + " 秒");
+  if (d && typeof d.bw === "number" && d.bw > 0) out.push("下載 " + speedText(d.bw));
+  return out;
 }
 
 /* ────────────────────────── 裝置紀錄：盒子欄位 + 管理員欄位 ────────────────────────── */

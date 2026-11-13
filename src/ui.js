@@ -25,6 +25,8 @@ import {
   pendingCmd,
   relativeTime,
   sameHomeIp,
+  smoothDetail,
+  smoothness,
 } from "./lib.js";
 import { backupState, combineState, describeSource, freshProbe, historySlots, isValidTgToken, lineReason, reasonText, selfHealText, sourceState, telegramReady, uptime24h } from "./monitor.js";
 import { probeText } from "./probe.js";
@@ -230,6 +232,14 @@ function renderHeadline(ctx, stat, nowMs) {
   if (failing) issues.push(["red", `${failing} 台線上盒子最近載入頻道失敗`]);
   const unstable = devList.filter((d) => onlineState(d, nowMs) === "online" && playHealth(d, nowMs).level === "bad").length;
   if (unstable) issues.push(["yellow", `${unstable} 台盒子播放不穩（一直重連）`]);
+  // 盒子自己回報的卡頓（App 1.0.0.29+）：一台多半是那個家的網路；兩台以上同時卡多半是直播源或線路
+  const stalling = onlineDevs.filter((d) => smoothness(d, nowMs).level === "bad").length;
+  if (stalling >= 2) issues.push(["red", `${stalling} 台盒子同時播放卡頓，多半是直播源主機或線路`]);
+  else if (stalling) issues.push(["yellow", "1 台盒子播放卡頓（近 10 分鐘常卡）"]);
+  const relay = ss && !ss._unreachable && ss.relay && typeof ss.relay === "object" ? ss.relay : null;
+  if (relay && relay.delivery !== "proxy" && relay.direct_ok === false && !down(state)) {
+    issues.push(["yellow", "切片直連 CDN 失效，暫時改由主機代抓（比較慢）"]);
+  }
   if (!config.subscriptionUrl) issues.push(["red", "尚未設定訂閱網址，盒子沒有頻道"]);
   if (config.requireActivation && stat.unauth > 0) issues.push(["yellow", `${stat.unauth} 台盒子未授權`]);
   if (config.forceRefresh) issues.push(["yellow", "強制刷新旗標開著"]);
@@ -334,7 +344,7 @@ export function renderHistoryStrip(mon, nowMs) {
 const ALERT_KIND = {
   src_down: "直播源異常", src_stale: "看門狗沒回報", src_up: "直播源恢復",
   src_down_bk: "主線路異常（有備援）", both_down: "主備線路都異常", bsrc_down: "備援線路異常", bsrc_up: "備援線路恢復",
-  dev_off: "盒子離線", dev_on: "盒子回來", dev_fail: "盒子載入失敗",
+  dev_off: "盒子離線", dev_on: "盒子回來", dev_fail: "盒子載入失敗", dev_stall: "盒子播放卡頓",
 };
 function renderAlertRows(log, nowMs, limit) {
   const rows = (Array.isArray(log) ? log : []).slice(0, limit || 8);
@@ -344,6 +354,80 @@ function renderAlertRows(log, nowMs, limit) {
     const stTxt = st === "sent" ? "已發 Telegram" : st === "muted" ? "靜音時段未發" : st === "no-telegram" ? "未設定 Telegram" : st.startsWith("failed") ? "發送失敗：" + st.slice(8) : st;
     return `<div class="alog-row k-${esc(l.kind)}"><div class="am"><span>${esc(ALERT_KIND[l.kind] || l.kind)} · ${esc(formatTaipeiFull(l.at))}（${esc(relativeTime(l.at, nowMs))}）</span><span>${esc(stTxt)}</span></div>${esc(l.text)}</div>`;
   }).join("")}</div>`;
+}
+
+/**
+ * 播放品質（總覽第二塊）：看得順不順，一眼看完。
+ *   - 盒子自己回報的卡頓、換台速度（App 1.0.0.29+ 心跳）
+ *   - 直播源主機最近 24 小時的播放紀錄、切片走哪條路（代理 2.4+，看門狗 status.json 的 quality / relay）
+ * 兩邊都沒有資料（舊版 App + 舊版代理，或第三方源）就不顯示。
+ */
+export function renderQualityBlock(ctx, nowMs) {
+  const devList = Array.isArray(ctx.devices) ? ctx.devices : [];
+  const ss = ctx.sourceStatus && !ctx.sourceStatus._unreachable ? ctx.sourceStatus : null;
+  const q = ss && ss.quality && typeof ss.quality === "object" ? ss.quality : null;
+  const relay = ss && ss.relay && typeof ss.relay === "object" ? ss.relay : null;
+  const online = devList.filter((d) => onlineState(d, nowMs) === "online");
+  const reporting = online.filter((d) => typeof d.rb === "number");
+  if (!q && !relay && !reporting.length) return "";
+
+  const secs = (ms) => (Math.round(ms / 100) / 10) + " 秒";
+  const tile = (val, label, tone, sub) =>
+    `<div class="q-tile"><div class="q-lab">${esc(label)}</div><div class="q-val ${tone}">${esc(val)}</div><div class="q-sub">${esc(sub || "")}</div></div>`;
+  const tiles = [];
+
+  // 1) 盒子現在順不順
+  if (reporting.length) {
+    const bad = reporting.filter((d) => smoothness(d, nowMs).level === "bad").length;
+    const warn = reporting.filter((d) => smoothness(d, nowMs).level === "warn").length;
+    tiles.push(tile(bad ? `${bad} 台常卡` : warn ? `${warn} 台偶爾卡` : "都很順", "盒子現在", bad ? "bad" : warn ? "warn" : "ok",
+      `${reporting.length} 台線上盒子回報` + (online.length > reporting.length ? `（另 ${online.length - reporting.length} 台是舊版 App）` : "")));
+  } else {
+    tiles.push(tile("—", "盒子現在", "mute", online.length ? "線上盒子都是舊版 App，更新後才會回報" : "目前沒有盒子在線"));
+  }
+
+  // 2) 最近 24 小時（主機紀錄：有人看的每一分鐘有沒有漏片、抓不到切片）
+  if (q && q.minutes_watched > 0) {
+    const bad = q.bad_minutes || 0;
+    const pct = Math.round((1 - bad / q.minutes_watched) * 1000) / 10;
+    tiles.push(tile(pct + "%", "24 小時順暢", pct >= 99 ? "ok" : pct >= 95 ? "warn" : "bad",
+      `看了 ${fmtUptime(q.minutes_watched)}，${bad ? bad + " 分鐘有狀況" : "全程正常"}`));
+  } else if (q) {
+    tiles.push(tile("—", "24 小時順暢", "mute", "這 24 小時沒有人收看"));
+  }
+
+  // 3) 換台速度：盒子回報的中位數；沒有就用主機自己實測的開播時間
+  const zts = reporting.map((d) => d.zt).filter((v) => typeof v === "number" && v > 0).sort((a, b) => a - b);
+  const pm = ss && ss.probe_ms && typeof ss.probe_ms === "object" ? ss.probe_ms : null;
+  if (zts.length) {
+    const mid = zts[Math.floor(zts.length / 2)];
+    tiles.push(tile(secs(mid), "換台速度", mid <= 2500 ? "ok" : mid <= 5000 ? "warn" : "bad", "按下去到出畫面（盒子回報）"));
+  } else if (pm && pm.segment > 0) {
+    const total = (pm.m3u8 || 0) + pm.segment;
+    tiles.push(tile(secs(total), "開播實測", total <= 2500 ? "ok" : total <= 5000 ? "warn" : "bad", `主機自測：清單 ${secs(pm.m3u8 || 0)}＋切片 ${secs(pm.segment)}`));
+  }
+
+  // 4) 影片（切片）走哪條路
+  if (relay) {
+    if (relay.delivery === "proxy") tiles.push(tile("主機代抓", "影片線路", "mute", "設定為一律經主機轉送"));
+    else if (relay.direct_ok === false) tiles.push(tile("主機代抓", "影片線路", "warn", "直連 CDN 失效，暫時經主機轉送（較慢）"));
+    else tiles.push(tile("直連 CDN", "影片線路", "ok", relay.fallback_clients ? `盒子直接向 CDN 下載（${relay.fallback_clients} 個位址暫時代抓）` : "盒子直接向 CDN 下載，不繞主機"));
+  }
+
+  const paused = ss && Array.isArray(ss.channels_paused) ? ss.channels_paused.filter((c) => c && c.name) : [];
+  const pausedNote = paused.length
+    ? `<div class="q-note">⏸ 暫停播出 ${paused.length} 台：${esc(paused.slice(0, 6).map((c) => c.name).join("、"))}${paused.length > 6 ? " 等" : ""}（4gtv 官網下架或改成會員限定；恢復後自動放回原台號）</div>`
+    : "";
+  const watching = relay && Array.isArray(relay.watching) && relay.watching.length ? `正在播 ${relay.watching.slice(0, 3).join("、")}${relay.watching.length > 3 ? " 等" : ""}` : "";
+  const ver = ss && ss.proxy_version ? "代理 " + ss.proxy_version : "";
+  const pill = [watching, ver].filter(Boolean).join(" · ");
+
+  return `
+    <div class="block">
+      <div class="block-head"><span class="block-title"><span class="ic">📶</span>播放品質</span>${pill ? `<span class="count-pill">${esc(pill)}</span>` : ""}</div>
+      <div class="q-grid">${tiles.join("")}</div>
+      ${pausedNote}
+    </div>`;
 }
 
 export function renderOverview(ctx) {
@@ -376,7 +460,10 @@ export function renderOverview(ctx) {
       const ph = playHealth(d, nowMs);
       const phTxt = ph.level === "bad" ? `<span class="ph bad" title="${esc(ph.text)}">⚠ 重連 ${d.pe} 次</span>` : ph.level === "warn" ? `<span class="ph warn">重連 ${d.pe} 次</span>` : "";
       const lnTxt = d.ln === 1 ? `<span class="ph bk" title="主線路連續失敗，盒子自動改用備援線路">備援線路</span>` : "";
-      return `<div class="now-row"><span class="sdot online"></span><span class="nm">${esc(d.nick || d.id)}</span><span class="ch">${esc(d.now)}</span>${lnTxt}${phTxt}<span class="tm">${esc(relativeTime(d.nowAt || d.lastSeen, nowMs))}</span></div>`;
+      const sm = smoothness(d, nowMs);
+      const smTip = [sm.text].concat(smoothDetail(d)).join(" · ");
+      const smTxt = sm.level === "unknown" ? "" : `<span class="ph ${sm.level === "bad" ? "bad" : sm.level === "warn" ? "warn" : "ok"}" title="${esc(smTip)}">${esc(sm.short)}</span>`;
+      return `<div class="now-row"><span class="sdot online"></span><span class="nm">${esc(d.nick || d.id)}</span><span class="ch">${esc(d.now)}</span>${lnTxt}${smTxt}${phTxt}<span class="tm">${esc(relativeTime(d.nowAt || d.lastSeen, nowMs))}</span></div>`;
     })
     .join("");
 
@@ -390,6 +477,9 @@ export function renderOverview(ctx) {
       return `<div class="ver-bar ${old ? "old" : ""}"><span class="mono" style="color:${old ? "var(--gold)" : "var(--text)"}">${esc(v)}${old ? " ↑" : ""}</span><span class="vb"><i style="width:${Math.max(4, Math.round((n / maxV) * 100))}%"></i></span><span class="vn">${n} 台</span></div>`;
     })
     .join("");
+
+  // 播放不穩 = 線上、而且一直重連或常卡
+  const rough = devList.filter((d) => onlineState(d, nowMs) === "online" && (playHealth(d, nowMs).level === "bad" || smoothness(d, nowMs).level === "bad")).length;
 
   const banners = [];
   // 直播源伺服器看門狗（VPS 每 5 分鐘實測頻道解析與切片）；有備援線路時兩條各一條橫幅
@@ -432,6 +522,7 @@ export function renderOverview(ctx) {
 
   return `
     ${renderHeadline(ctx, stat, nowMs)}
+    ${renderQualityBlock(ctx, nowMs)}
     <div class="block">
       <div class="block-head"><span class="block-title"><span class="ic">📊</span>營運概覽</span><span class="count-pill">更新於 ${esc(formatTaipeiFull(new Date().toISOString()))}</span></div>
       <div class="stat-grid">
@@ -440,7 +531,7 @@ export function renderOverview(ctx) {
         <div class="stat-box"><div class="sb-num accent">${stat.today}</div><div class="sb-label">今日上線</div></div>
         <div class="stat-box"><div class="sb-num ${config.requireActivation ? "ok" : "mute"}">${stat.authed}</div><div class="sb-label">已授權</div></div>
         <div class="stat-box"><div class="sb-num ${stat.unauth > 0 && config.requireActivation ? "warn" : "mute"}">${stat.unauth}</div><div class="sb-label">未授權</div></div>
-        <div class="stat-box"><div class="sb-num ${devList.some((d) => onlineState(d, nowMs) === "online" && playHealth(d, nowMs).level === "bad") ? "warn" : "mute"}">${devList.filter((d) => onlineState(d, nowMs) === "online" && playHealth(d, nowMs).level === "bad").length}</div><div class="sb-label">播放不穩</div></div>
+        <div class="stat-box"><div class="sb-num ${rough ? "warn" : "mute"}">${rough}</div><div class="sb-label">播放不穩</div></div>
       </div>
       ${banners.join("")}
     </div>
@@ -713,6 +804,7 @@ export function renderDevicesSection(ctx) {
   const latestVer = ota && ota.version ? ota.version : 0;
   const online = list.filter((d) => onlineState(d, nowMs) === "online").length;
   const onBackup = list.filter((d) => d.ln === 1 && onlineState(d, nowMs) === "online").length;
+  const stallCount = list.filter((d) => onlineState(d, nowMs) === "online" && smoothness(d, nowMs).level !== "ok" && smoothness(d, nowMs).level !== "unknown").length;
   const body = list.length
     ? list.map((d) => renderDeviceCard(d, config, latestVer, nowMs, ctx.homeProxy)).join("")
     : ctx.devicesError
@@ -736,6 +828,7 @@ export function renderDevicesSection(ctx) {
         <button type="button" class="fchip" data-f="blocked" onclick="setDevFilter(this)">已封鎖</button>
         ${latestVer ? `<button type="button" class="fchip" data-f="oldver" onclick="setDevFilter(this)">舊版 App</button>` : ""}
         ${onBackup ? `<button type="button" class="fchip" data-f="backup" onclick="setDevFilter(this)">走備援線路（${onBackup}）</button>` : ""}
+        ${stallCount ? `<button type="button" class="fchip" data-f="stall" onclick="setDevFilter(this)">播放卡頓（${stallCount}）</button>` : ""}
       </div>
       <div class="bulk-row">
         <span class="bulk-label">全部裝置</span>
@@ -799,6 +892,7 @@ export function renderDeviceCard(d, config, latestVer, nowMs, hp) {
       : authActive ? `<span class="badge mute-b">已授權</span>` : "") +
     (blocked ? `<span class="badge danger-b">已封鎖</span>` : "") +
     (onBackupNow ? `<span class="badge info-b" title="主線路連續失敗，盒子自動改用備援線路">備援線路中</span>` : "") +
+    (state === "online" && smoothness(d, nowMs).level === "bad" ? `<span class="badge danger-b" title="近 10 分鐘卡 3 次以上或合計停住 10 秒以上">常卡</span>` : "") +
     (d && d.watch === true ? `<span class="badge info-b" title="離線超過門檻會 Telegram 通知">重點監控</span>` : "") +
     (isOld ? `<span class="badge warn-b" title="最新 v${latestVer}">舊版</span>` : "");
 
@@ -808,9 +902,14 @@ export function renderDeviceCard(d, config, latestVer, nowMs, hp) {
   const ph = playHealth(d, nowMs);
   const phFact = ["播放", ph.level === "unknown" ? "未回報（舊版 App）" : ph.text + (d && d.peAt && ph.level !== "unknown" ? " · " + relativeTime(d.peAt, nowMs) : ""), ph.level === "bad" ? "bad" : ph.level === "warn" ? "warn" : ph.level === "ok" ? "ok" : "mute"];
 
+  // 流暢度（App 1.0.0.29+）：卡頓 + 換台速度、緩衝、下載速度；整列顯示，數字多也不擠
+  const sm = smoothness(d, nowMs);
+  const smText = sm.level === "unknown" ? sm.text : [sm.text].concat(smoothDetail(d)).join(" · ");
+  const stallNow = state === "online" && (sm.level === "bad" || sm.level === "warn");
   const facts = [
     ["授權", authText, authActive ? "ok" : dExpired || (config.requireActivation && !authed) ? "bad" : "mute"],
     srcFact,
+    ["流暢度", smText, sm.level === "bad" ? "bad" : sm.level === "warn" ? "warn" : sm.level === "ok" ? "ok" : "mute", "wide"],
     phFact,
     lineFact,
     ["最後上線", (relativeTime(d && d.lastSeen, nowMs) || "-") + "（" + stateText + "）", state === "online" ? "ok" : "mute"],
@@ -822,7 +921,7 @@ export function renderDeviceCard(d, config, latestVer, nowMs, hp) {
     ["首次上線", d && d.firstSeen ? formatTaipeiFull(d.firstSeen) : "-", "mute"],
     ["回報次數", (d && d.count != null ? d.count : 0) + " 次" + (d && typeof d.up === "number" ? " · App 已開 " + fmtUptime(d.up) : ""), "mute"],
   ];
-  const factsHtml = facts.map((f) => `<div class="fact"><span class="fk">${f[0]}</span><span class="fv ${f[2]}">${esc(f[1])}</span></div>`).join("");
+  const factsHtml = facts.map((f) => `<div class="fact${f[3] ? " " + f[3] : ""}"><span class="fk">${f[0]}</span><span class="fv ${f[2]}">${esc(f[1])}</span></div>`).join("");
 
   const nowRow = d && d.now
     ? `<div class="dev-now"><span class="lbl">📺 正在看</span><span class="val">${esc(d.now)}</span><span class="ago">${esc(relativeTime(d.nowAt || d.lastSeen, nowMs))}</span></div>`
@@ -891,7 +990,7 @@ export function renderDeviceCard(d, config, latestVer, nowMs, hp) {
       ${devForm(idAttr, "delete", "🗑️ 刪除裝置紀錄", "danger", `確定刪除 ${esc(title)} 的紀錄？（盒子下次上線會重新登記，授權會消失）`)}`;
 
   const searchKey = (id + " " + nick + " " + model + " " + (d && d.now ? d.now : "")).toLowerCase().replace(/"/g, "");
-  return `<div class="dev-card${blocked ? " is-blocked" : ""}${onBackupNow ? " on-backup" : ""}" data-search="${esc(searchKey)}" data-online="${state === "online" ? 1 : 0}" data-authed="${authActive ? 1 : 0}" data-blocked="${blocked ? 1 : 0}" data-oldver="${isOld ? 1 : 0}" data-backup="${onBackupNow ? 1 : 0}">
+  return `<div class="dev-card${blocked ? " is-blocked" : ""}${onBackupNow ? " on-backup" : ""}" data-search="${esc(searchKey)}" data-online="${state === "online" ? 1 : 0}" data-authed="${authActive ? 1 : 0}" data-blocked="${blocked ? 1 : 0}" data-oldver="${isOld ? 1 : 0}" data-backup="${onBackupNow ? 1 : 0}" data-stall="${stallNow ? 1 : 0}">
     <div class="dev-head">
       <div class="dev-title"><span class="sdot ${state}" title="${stateText}"></span><div><div class="dev-name">${esc(title)}</div><div class="dev-id mono">${idAttr}</div></div></div>
       <div class="dev-badges">${badges}</div>
@@ -939,7 +1038,7 @@ export function renderAlertsPanel(ctx) {
         <label for="${id}">${label}<span class="hint">${hint}</span></label>
       </div>`;
   const statusBanner = ready
-    ? `<div class="banner on"><span class="bi">🔔</span><div>Telegram 警示 <b>已啟用</b>：直播源異常超過 ${esc(config.alertSourceMin)} 分鐘、恢復、重點盒子離線超過 ${esc(config.alertDeviceOfflineMin)} 分鐘${config.alertBoxFail !== false ? "、盒子載入頻道失敗" : ""}都會通知${config.alertQuiet ? "；靜音時段 " + esc(config.alertQuiet) + " 時" : ""}。${String(config.backupSubscriptionUrl || "").trim() ? "主 / 備援線路各自監控：主線路壞但備援正常標為「較不緊急」，兩條都壞才是緊急。" : ""}</div></div>`
+    ? `<div class="banner on"><span class="bi">🔔</span><div>Telegram 警示 <b>已啟用</b>：直播源異常超過 ${esc(config.alertSourceMin)} 分鐘、恢復、重點盒子離線超過 ${esc(config.alertDeviceOfflineMin)} 分鐘${config.alertBoxFail !== false ? "、盒子載入頻道失敗" : ""}${config.alertStall !== false ? "、盒子播放常卡" : ""}都會通知${config.alertQuiet ? "；靜音時段 " + esc(config.alertQuiet) + " 時" : ""}。${String(config.backupSubscriptionUrl || "").trim() ? "主 / 備援線路各自監控：主線路壞但備援正常標為「較不緊急」，兩條都壞才是緊急。" : ""}</div></div>`
     : `<div class="banner warn"><span class="bi">🔕</span><div>Telegram 警示 <b>尚未啟用</b>。監控每 5 分鐘照樣在跑、事件會記在下方，但不會有人收到通知。照下面三步接上 Telegram，直播源出事你會第一個知道，不必等長輩打電話來。</div></div>`;
 
   return `
@@ -969,6 +1068,7 @@ export function renderAlertsPanel(ctx) {
         <label for="alertQuiet">靜音時段（選填）<span class="hint">台灣時間「起-迄」小時，例如 23-7；此時段不發訊息只記錄</span></label>
         <input type="text" id="alertQuiet" name="alertQuiet" value="${esc(config.alertQuiet || "")}" placeholder="例如 23-7">
         ${sw("alertBoxFail", "盒子回報「載入頻道失敗」時通知", "每台每小時最多一則", config.alertBoxFail !== false)}
+        ${sw("alertStall", "盒子播放常卡時通知", "新版 App 會回報卡頓；連續約 10 分鐘都常卡才通知，每台每小時最多一則", config.alertStall !== false)}
         <div class="btn-row">
           <button type="submit" class="btn btn-primary">💾 儲存警示設定</button>
           <button type="submit" class="btn btn-secondary" formaction="/admin/alerts" name="action" value="test">📨 測試發送</button>

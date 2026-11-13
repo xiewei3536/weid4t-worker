@@ -351,6 +351,7 @@ export async function handleAdminSave(request, env) {
     if (quiet && !/^\d{1,2}\s*-\s*\d{1,2}$/.test(quiet)) return respond(request, false, "靜音時段格式為「起-迄」小時，例如 23-7", null, current);
     updated.alertQuiet = quiet.replace(/\s+/g, "");
     updated.alertBoxFail = form.get("alertBoxFail") === "on";
+    updated.alertStall = form.get("alertStall") === "on";
     if (updated.alertsEnabled && (!updated.tgBotToken || !updated.tgChatId)) {
       return respond(request, false, "要開啟警示，Bot Token 與 Chat ID 都要填", null, current);
     }
@@ -453,6 +454,7 @@ export async function handleAdminTest(request, env) {
       epgUrl: preview.epgUrl,
       groups: preview.groups,
       sample: preview.sample,
+      paused: preview.paused,
       channel,
       stream,
       boxes,
@@ -471,6 +473,7 @@ function parsePlaylistPreview(text) {
   const lines = String(text || "").split(/\r?\n/);
   const groups = {};
   const sample = [];
+  const paused = [];
   let count = 0;
   let epgUrl = "";
   for (const raw of lines) {
@@ -479,6 +482,13 @@ function parsePlaylistPreview(text) {
     if (line.startsWith("#EXTM3U")) {
       const m = line.match(/(?:x-tvg-url|url-tvg)="([^"]+)"/i);
       if (m) epgUrl = m[1];
+      continue;
+    }
+    if (line.startsWith("#EXT-X-WEITV-PAUSED:")) {
+      // 新版清單標出「官網暫時不給看、先不列」的台：#EXT-X-WEITV-PAUSED:<台號>,<台名>
+      const body = line.slice("#EXT-X-WEITV-PAUSED:".length);
+      const i = body.indexOf(",");
+      if (i > 0 && paused.length < 40) paused.push(body.slice(i + 1).trim());
       continue;
     }
     if (!line.startsWith("#EXTINF")) continue;
@@ -492,7 +502,7 @@ function parsePlaylistPreview(text) {
   const groupList = Object.keys(groups)
     .map((k) => ({ name: k, count: groups[k] }))
     .sort((a, b) => b.count - a.count);
-  return { count, epgUrl, groups: groupList, sample };
+  return { count, epgUrl, groups: groupList, sample, paused };
 }
 
 /** 彙整盒子實測來源健康（雲端被擋時也有真實依據） */
@@ -1154,12 +1164,14 @@ export async function handleAdminExport(request, env) {
   if (what === "devices") {
     const devices = await loadDevices(env);
     name = "weitv-devices";
-    rows.push(["編號", "暱稱", "機型", "版本", "授權", "到期", "封鎖", "最後上線", "首次上線", "IP", "正在觀看"]);
+    rows.push(["編號", "暱稱", "機型", "版本", "授權", "到期", "封鎖", "最後上線", "首次上線", "IP", "正在觀看", "近10分鐘卡頓次數", "卡頓秒數", "換台秒數", "下載kbps"]);
     for (const d of devices) {
       rows.push([
         d.id, d.nick || "", d.m || "", d.v || "", d.authorized ? "是" : "否",
         d.expireAt ? formatTaipeiFull(d.expireAt) : (d.authorized ? "永久" : ""),
         d.blocked ? "是" : "否", formatTaipeiFull(d.lastSeen), formatTaipeiFull(d.firstSeen), d.ip || "", d.now || "",
+        typeof d.rb === "number" ? d.rb : "", typeof d.rs === "number" ? Math.round(d.rs / 100) / 10 : "",
+        typeof d.zt === "number" ? Math.round(d.zt / 100) / 10 : "", typeof d.bw === "number" ? d.bw : "",
       ]);
     }
   } else {

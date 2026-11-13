@@ -12,7 +12,9 @@
  */
 
 const IPV4_RE = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/;
-const UA = "WeiTV-Monitor/2.4 (stream-probe)";
+const UA = "WeiTV-Monitor/2.5 (stream-probe)";
+/** 跟新版 App 一樣要「新版清單」（固定台號、官網暫時不給看的台先不列）；舊伺服器與其他來源會忽略這個標頭 */
+const PLAYLIST_HEADERS = { "X-WeiTV-Playlist": "2" };
 /** 切片至少要拿到這麼多才算播得出來（真的切片約 1 MB；錯誤頁只有幾百 bytes） */
 export const MIN_SEGMENT_BYTES = 16 * 1024;
 const READ_BYTES = 64 * 1024;
@@ -59,7 +61,7 @@ export function workerFetchUrl(url, alt) {
 export async function workerFetch(url, init) {
   const first = workerFetchUrl(url, false);
   const second = workerFetchUrl(url, true);
-  const opts = { ...(init || {}), headers: { "User-Agent": UA, ...((init && init.headers) || {}) }, cf: { cacheTtl: 0 } };
+  const opts = { ...(init || {}), headers: { "User-Agent": UA, ...PLAYLIST_HEADERS, ...((init && init.headers) || {}) }, cf: { cacheTtl: 0 } };
   let resp;
   try {
     resp = await fetch(first, opts);
@@ -158,6 +160,17 @@ export function pickProbeChannel(text, baseUrl, prefer) {
   return { name: pick.name, url, total: list.length };
 }
 
+/** 切片網址是不是偉電視代理自己的 /ts/…（跟播放清單同一台主機）；第三方源的切片不能亂加參數 */
+function isRelaySegment(segUrl, playlistUrl) {
+  try {
+    const a = new URL(segUrl);
+    const b = new URL(playlistUrl);
+    return a.host === b.host && a.pathname.startsWith("/ts/");
+  } catch (_) {
+    return false;
+  }
+}
+
 /**
  * 實測一台頻道：m3u8（多畫質再抓第一個子清單）→ 最新一片切片前 64 KB。
  * 回 { ok, step, error, m3u8Ms, segMs, bytes, ts }（step：失敗在哪一步 m3u8 / segment；ts：切片開頭是 MPEG-TS 同步碼）
@@ -181,7 +194,29 @@ export async function probeStream(url) {
     const segs = uris(r.text);
     if (!segs.length) return { ...res, error: "播放清單裡沒有切片" };
     res.step = "segment";
-    const s = await getPrefix(new URL(segs[segs.length - 1], pl).toString(), READ_BYTES, 12000);
+    const segUrl = new URL(segs[segs.length - 1], pl).toString();
+    const good = (x) => !!x && (x.status === 200 || x.status === 206) && x.bytes >= MIN_SEGMENT_BYTES;
+    let s = null;
+    let segErr = "";
+    try {
+      s = await getPrefix(segUrl, READ_BYTES, 12000);
+    } catch (err) {
+      segErr = "切片" + errText(err);
+    }
+    if (!good(s) && isRelaySegment(segUrl, pl)) {
+      // 偉電視代理 2.4 起切片預設回 302，讓盒子直接向 CDN 下載。雲端機房連那個 CDN 不見得通（盒子在台灣，不受影響）
+      // → 請代理代抓再測一次（?proxy=1）；代抓得到就算這條線播得出來，並記下雲端直連 CDN 失敗的原因
+      try {
+        const viaProxy = await getPrefix(segUrl + (segUrl.includes("?") ? "&" : "?") + "proxy=1", READ_BYTES, 12000);
+        if (good(viaProxy)) {
+          res.viaProxy = true;
+          res.cdnError = s ? (s.status !== 200 && s.status !== 206 ? `HTTP ${s.status}` : `只拿到 ${s.bytes} bytes`) : segErr;
+          s = viaProxy;
+          segErr = "";
+        }
+      } catch (_) {}
+    }
+    if (!s) return { ...res, error: segErr };
     res.segMs = s.ms;
     res.bytes = s.bytes;
     res.ts = s.first === 0x47;
@@ -234,6 +269,8 @@ export function probeSummary(p) {
     m3u8Ms: p.stream ? p.stream.m3u8Ms : 0,
     segMs: p.stream ? p.stream.segMs : 0,
     bytes: p.stream ? p.stream.bytes : 0,
+    // 雲端直連 CDN 抓不到、改測主機代抓才成功（盒子在台灣直連 CDN，通常不受影響）
+    viaProxy: !!(p.stream && p.stream.viaProxy),
   };
 }
 
@@ -242,6 +279,6 @@ export function probeText(s) {
   if (!s) return "";
   if (s.lan) return "區網網址，雲端連不到（看家用代理自己的實測）";
   const sec = (ms) => (ms / 1000).toFixed(1) + " 秒";
-  if (s.ok) return `${s.channel || "測試台"} 播放正常（播放清單 ${sec(s.m3u8Ms || 0)}、切片 ${sec(s.segMs || 0)}）`;
+  if (s.ok) return `${s.channel || "測試台"} 播放正常（播放清單 ${sec(s.m3u8Ms || 0)}、切片 ${sec(s.segMs || 0)}${s.viaProxy ? "；雲端連不到 CDN，這次測的是主機代抓" : ""}）`;
   return `播不出來：${s.error || "原因不明"}`;
 }

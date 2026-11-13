@@ -6,7 +6,7 @@
  *      有設備援線路時兩條都讀，各自一套狀態機
  *   2. 記 24 小時健康歷史（15 分鐘一格，主線路），總覽畫成色條與可用率
  *   3. 狀態轉變達門檻 → Telegram 通知管理員：直播源異常與恢復（主線路壞但備援正常 → 較不緊急；兩條都壞 → 緊急）、
- *      重點盒子離線與回來、盒子載入頻道失敗
+ *      重點盒子離線與回來、盒子載入頻道失敗、盒子播放常卡（App 1.0.0.29+ 回報）
  * 所有狀態存 KV 一把 key（mon:state）；沒變化時最多每 15 分鐘寫一次，免費方案也夠用。
  * 順便整理「已授權盒子的公網 IP」（mon:state.homeIps），給家用代理免金鑰登記判斷同一個家用。
  */
@@ -23,6 +23,8 @@ import {
   needsHomeProxy,
   parseIntOr,
   relativeTime,
+  smoothness,
+  speedText,
 } from "./lib.js";
 import { loadDevices } from "./api.js";
 import { probeLine, probeSummary, probeText, workerFetch } from "./probe.js";
@@ -70,7 +72,7 @@ export async function fetchSourceStatus(subscriptionUrl) {
   try {
     resp = await workerFetch(m[1] + "/status.json" + (token ? "?token=" + encodeURIComponent(token) : ""), {
       signal: controller.signal,
-      headers: { "User-Agent": "WeiTV-Admin/2.4", Accept: "application/json" },
+      headers: { "User-Agent": "WeiTV-Admin/2.5", Accept: "application/json" },
     });
   } catch (err) {
     return { _unreachable: err && err.name === "AbortError" ? "逾時" : "連線失敗" };
@@ -433,6 +435,7 @@ export async function runMonitorTick(env, nowMs, opts) {
   }
   const offMs = Math.max(30, parseIntOr(config.alertDeviceOfflineMin, 180)) * 60000;
   const ids = new Set();
+  const stalling = [];   // 這一輪線上、而且回報「常卡」的盒子
   for (const d of devices) {
     if (!d || !d.id) continue;
     ids.add(d.id);
@@ -454,6 +457,16 @@ export async function runMonitorTick(env, nowMs, opts) {
       ds.offAlerted = false;
       changed = true;
     }
+    // 播放卡頓（App 1.0.0.29+ 心跳回報）：記連續幾輪都常卡
+    const sm = offFor < ONLINE_MS ? smoothness(d, nowMs) : null;
+    if (sm && sm.level === "bad") {
+      ds.stallTicks = (ds.stallTicks || 0) + 1;
+      changed = true;
+      stalling.push({ d, ds, name, sm });
+    } else if (ds.stallTicks) {
+      ds.stallTicks = 0;
+      changed = true;
+    }
     if (config.alertBoxFail !== false && d.lastResultAt && d.lastOk === false) {
       const at = Date.parse(d.lastResultAt) || 0;
       if (nowMs - at <= 15 * 60000 && (!ds.failAlertAt || nowMs - ds.failAlertAt >= 3600000)) {
@@ -465,6 +478,26 @@ export async function runMonitorTick(env, nowMs, opts) {
   }
   for (const k of Object.keys(st.dev)) {
     if (!ids.has(k)) { delete st.dev[k]; changed = true; }
+  }
+  // 連續兩輪（約 10 分鐘）都常卡才通知，每台每小時最多一則；一閃而過的不吵
+  if (config.alertStall !== false) {
+    for (const it of stalling) {
+      if (it.ds.stallTicks < 2 || (it.ds.stallAlertAt && nowMs - it.ds.stallAlertAt < 3600000)) continue;
+      it.ds.stallAlertAt = nowMs;
+      const others = stalling.length - 1;
+      const d = it.d;
+      const hint = isDown(state)
+        ? "直播源目前也異常，多半是同一件事。"
+        : others > 0
+        ? `同時還有 ${others} 台盒子也在卡 → 多半是直播源主機或線路，請看管理中心總覽的「播放品質」。`
+        : typeof d.bw === "number" && d.bw > 0 && d.bw < 4000
+        ? `這台的下載速度只有 ${speedText(d.bw)}（看一台約需 2.5 Mbps）→ 多半是那個家的網路或 Wi-Fi 訊號。`
+        : "其他盒子沒有回報卡頓 → 多半是那個家的網路或 Wi-Fi；持續發生再請對方重開分享器、盒子離分享器近一點。";
+      events.push({
+        kind: "dev_stall",
+        text: `📶 <b>盒子播放卡頓</b> ${it.name}\n${it.sm.text}${d.now ? "\n正在看 " + d.now + (d.ln === 1 ? "（備援線路）" : "") : ""}\n${hint}`,
+      });
+    }
   }
 
   // ── 歷史 ──

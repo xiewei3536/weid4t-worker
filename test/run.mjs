@@ -885,9 +885,9 @@ function statusMock(tg, byHost, realFetch) {
   };
 }
 
-await test("2.4：/api/health 回報 build 2.4.1", async () => {
+await test("/api/health 回報 build 2.5.0", async () => {
   const h = (await call(makeEnv(), "/api/health")).json;
-  assert.equal(h.build, "2.4.1");
+  assert.equal(h.build, "2.5.0");
 });
 
 await test("2.3：備援直播源 — 驗證、儲存、下發條件、舊表單不清掉、操作紀錄與歷史遮罩 token、直播源分頁兩顆測試鈕", async () => {
@@ -1762,6 +1762,236 @@ await test("2.4：家用代理回報播放實測 — 存下精簡結果、失敗
   const page = await call(env, "/admin/partial?name=home");
   assert.match(page.text, /家用代理自己實測播不出來（切片回 HTTP 502）/);
   assert.match(page.text, /播放實測（代理每 5 分鐘自己播一台/);
+});
+
+await test("2.5：心跳流暢度（rb / rs / zt / bf / bw）— 存進 dev:、變常卡與恢復立刻寫；裝置卡、總覽、篩選", async () => {
+  const env = makeEnv({ config: { version: 1, subscriptionUrl: "http://src/list.m3u" } });
+  await call(env, "/api/config?id=tv-1&m=Box&v=1.0.0.29&now=%E6%B0%91%E8%A6%96&pe=0&ln=0&rb=0&zt=900&bf=16&bw=44000");
+  let dev = await env.CONFIG_KV.get("dev:tv-1", { type: "json" });
+  assert.equal(dev.rb, 0);
+  assert.equal(dev.zt, 900);
+  assert.equal(dev.bf, 16);
+  assert.equal(dev.bw, 44000);
+  let o = await call(env, "/admin/partial?name=overview");
+  assert.match(o.text, /播放品質/);
+  assert.match(o.text, /都很順/);
+  assert.match(o.text, /換台速度/);
+  assert.match(o.text, /0\.9 秒/);
+  assert.match(o.text, /class="ph ok"[^>]*>順</);
+  assert.ok(!o.text.includes("播放卡頓"));
+  // 偶爾卡一次：照節流，不立刻寫
+  let w = env.CONFIG_KV.writes;
+  await call(env, "/api/config?id=tv-1&v=1.0.0.29&ln=0&rb=1&rs=800");
+  assert.equal(env.CONFIG_KV.writes, w, "偶爾卡一次不立刻寫");
+  // 變常卡：立刻寫
+  await call(env, "/api/config?id=tv-1&v=1.0.0.29&ln=0&rb=4&rs=12500&bf=2&bw=1800");
+  assert.equal(env.CONFIG_KV.writes, w + 1, "變常卡要立刻寫");
+  dev = await env.CONFIG_KV.get("dev:tv-1", { type: "json" });
+  assert.equal(dev.rb, 4);
+  assert.equal(dev.rs, 12500);
+  assert.ok(dev.rbAt);
+  const p = await call(env, "/admin/partial?name=devices");
+  assert.match(p.text, /常卡：近 10 分鐘卡 4 次、共停 13 秒/);
+  assert.match(p.text, /下載 1\.8 Mbps/);
+  assert.match(p.text, /緩衝 2 秒/);
+  assert.match(p.text, /data-stall="1"/);
+  assert.match(p.text, /播放卡頓（1）/);
+  assert.match(p.text, /danger-b"[^>]*>常卡</);
+  o = await call(env, "/admin/partial?name=overview");
+  assert.match(o.text, /1 台常卡/);
+  assert.match(o.text, /1 台盒子播放卡頓/);
+  assert.match(o.text, /head-card (yellow|red)/);
+  assert.match(o.text, /class="ph bad"[^>]*>常卡 4 次</);
+  // 恢復：立刻寫
+  w = env.CONFIG_KV.writes;
+  await call(env, "/api/config?id=tv-1&v=1.0.0.29&ln=0&rb=0");
+  assert.equal(env.CONFIG_KV.writes, w + 1, "從常卡恢復要立刻寫");
+  dev = await env.CONFIG_KV.get("dev:tv-1", { type: "json" });
+  assert.equal(dev.rb, 0);
+  assert.equal(dev.rs, 0);
+  // 舊版 App 沒帶 rb → 流暢度「未回報」，不影響燈號
+  await call(env, "/api/config?id=tv-old&v=1.0.0.28&pe=0", { ip: "1.2.3.5" });
+  const p2 = await call(env, "/admin/partial?name=devices");
+  assert.match(p2.text, /未回報（舊版 App）/);
+  // 匯出多了流暢度欄位
+  const csv = await call(env, "/admin/export?what=devices");
+  assert.match(csv.text, /近10分鐘卡頓次數/);
+});
+
+await test("2.5：流暢度判定 — 門檻、過期不算、白話", async () => {
+  const lib = await import("../src/lib.js");
+  assert.equal(lib.stallLevel(0, 0), "ok");
+  assert.equal(lib.stallLevel(1, 500), "warn");
+  assert.equal(lib.stallLevel(2, 10000), "bad", "合計停住 10 秒就算常卡");
+  assert.equal(lib.stallLevel(3, 900), "bad", "卡 3 次就算常卡");
+  const now = Date.now();
+  const fresh = new Date(now - 60000).toISOString();
+  assert.equal(lib.smoothness({ rb: 0, rbAt: fresh }, now).level, "ok");
+  assert.equal(lib.smoothness({ rb: 5, rs: 20000, rbAt: fresh }, now).level, "bad");
+  assert.equal(lib.smoothness({ rb: 5, rs: 20000, rbAt: new Date(now - 30 * 60000).toISOString() }, now).level, "ok", "30 分鐘前的回報不算現在卡");
+  assert.equal(lib.smoothness({ pe: 0 }, now).level, "unknown");
+  assert.equal(lib.speedText(44000), "44 Mbps");
+  assert.equal(lib.speedText(2500), "2.5 Mbps");
+  assert.equal(lib.speedText(800), "800 kbps");
+  assert.deepEqual(lib.smoothDetail({ zt: 900, bf: 16, bw: 44000 }), ["換台 0.9 秒", "緩衝 16 秒", "下載 44 Mbps"]);
+  assert.equal(lib.actionText("flush_ipchange"), "出口 IP 變動，已更新播放網址（不中斷播放）");
+  assert.equal(lib.actionText("flush_reconnect"), "VPN 重連，已更新播放網址（不中斷播放）");
+  assert.equal(lib.actionText("flush_stale"), "播放網址失效，已重新解析（不中斷播放）");
+});
+
+await test("2.5：監控 — 盒子連續兩輪常卡才發 Telegram、每台每小時一則；多台同時卡提示是線路；可關閉", async () => {
+  const { runMonitorTick } = await import("../src/monitor.js");
+  const realFetch = globalThis.fetch;
+  const okStatus = () => ({ healthy: true, consecutive_failures: 0, public_ip: "1.1.1.1", checked_at_ms: Date.now() });
+  try {
+    // 一台常卡、下載速度很低 → 提示是那個家的網路
+    let tg = [];
+    globalThis.fetch = tgMock(tg, okStatus, realFetch);
+    let env = makeEnv({ config: { version: 1, subscriptionUrl: MAIN, alertsEnabled: true, tgBotToken: TOK, tgChatId: "42" } });
+    const t0 = Date.now();
+    await call(env, "/api/config?id=tv-1&v=1.0.0.29&now=%E6%B0%91%E8%A6%96&ln=0&rb=5&rs=23000&bw=3200");
+    let r = await runMonitorTick(env, t0 + 1000);
+    assert.equal(r.events.filter((e) => e.kind === "dev_stall").length, 0, "第一輪先不吵");
+    r = await runMonitorTick(env, t0 + 5 * 60000);
+    assert.equal(r.events.filter((e) => e.kind === "dev_stall").length, 1);
+    assert.match(tg[0], /盒子播放卡頓/);
+    assert.match(tg[0], /近 10 分鐘卡 5 次、共停 23 秒/);
+    assert.match(tg[0], /正在看 民視/);
+    assert.match(tg[0], /下載速度只有 3\.2 Mbps/);
+    r = await runMonitorTick(env, t0 + 10 * 60000);
+    assert.equal(r.events.length, 0, "一小時內不重複");
+    const page = await call(env, "/admin/partial?name=alerts");
+    assert.match(page.text, /盒子播放卡頓/);
+    assert.match(page.text, /name="alertStall"/);
+
+    // 兩台同時卡 → 提示多半是直播源或線路
+    tg = [];
+    globalThis.fetch = tgMock(tg, okStatus, realFetch);
+    env = makeEnv({ config: { version: 1, subscriptionUrl: MAIN, alertsEnabled: true, tgBotToken: TOK, tgChatId: "42" } });
+    const t1 = Date.now();
+    await call(env, "/api/config?id=tv-a&v=1.0.0.29&ln=0&rb=4&rs=15000&bw=40000", { ip: "1.2.3.6" });
+    await call(env, "/api/config?id=tv-b&v=1.0.0.29&ln=0&rb=6&rs=30000&bw=38000", { ip: "1.2.3.7" });
+    await runMonitorTick(env, t1 + 1000);
+    r = await runMonitorTick(env, t1 + 5 * 60000);
+    assert.equal(r.events.filter((e) => e.kind === "dev_stall").length, 2);
+    assert.ok(tg.every((t) => /同時還有 1 台盒子也在卡/.test(t)), tg.join("\n---\n"));
+    const o = await call(env, "/admin/partial?name=overview");
+    assert.match(o.text, /2 台盒子同時播放卡頓/);
+    assert.match(o.text, /head-card red/);
+
+    // 關掉就不通知
+    tg = [];
+    globalThis.fetch = tgMock(tg, okStatus, realFetch);
+    env = makeEnv({ config: { version: 1, subscriptionUrl: MAIN, alertsEnabled: true, tgBotToken: TOK, tgChatId: "42", alertStall: false } });
+    const t2 = Date.now();
+    await call(env, "/api/config?id=tv-1&v=1.0.0.29&ln=0&rb=5&rs=23000");
+    await runMonitorTick(env, t2 + 1000);
+    r = await runMonitorTick(env, t2 + 5 * 60000);
+    assert.equal(r.events.length, 0);
+    assert.equal(tg.length, 0);
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+});
+
+await test("2.5：看門狗 v5 — 總覽「播放品質」（24 小時順暢、開播實測、影片線路、暫停播出）、新處置代碼、直連失效亮黃燈", async () => {
+  const env = makeEnv({ config: { version: 1, subscriptionUrl: MAIN } });
+  const realFetch = globalThis.fetch;
+  const status = {
+    healthy: true, consecutive_failures: 0, public_ip: "1.1.1.1", checked_at_ms: Date.now(), version: 5, proxy_version: "2.4.0",
+    last_action: "flush_reconnect", last_action_at: new Date(Date.now() - 60000).toISOString(),
+    probe_ms: { m3u8: 600, segment: 900 },
+    quality: { hours: 24, minutes_watched: 400, bad_minutes: 2, gaps: 1 },
+    relay: { delivery: "auto", direct_ok: true, streams: 1, watching: ["民視第一台"], fallback_clients: 0 },
+    channels_paused: [{ name: "好消息", number: 7 }, { name: "八大綜藝台", number: 10 }], channels_listed: 116,
+  };
+  globalThis.fetch = tgMock([], () => status, realFetch);
+  try {
+    let o = await call(env, "/admin/partial?name=overview");
+    assert.match(o.text, /播放品質/);
+    assert.match(o.text, /99\.5%/);
+    assert.match(o.text, /看了 6 小時 40 分，2 分鐘有狀況/);
+    assert.match(o.text, /開播實測/);
+    assert.match(o.text, /1\.5 秒/);
+    assert.match(o.text, /直連 CDN/);
+    assert.match(o.text, /暫停播出 2 台：好消息、八大綜藝台/);
+    assert.match(o.text, /代理 2\.4\.0/);
+    assert.match(o.text, /正在播 民視第一台/);
+    assert.match(o.text, /VPN 重連，已更新播放網址（不中斷播放）/);
+    assert.match(o.text, /head-card green/);
+    // 直連 CDN 失效 → 黃燈 + 改由主機代抓
+    status.relay = { delivery: "auto", direct_ok: false, direct_error: "HTTP 403", streams: 0, watching: [] };
+    o = await call(env, "/admin/partial?name=overview");
+    assert.match(o.text, /切片直連 CDN 失效/);
+    assert.match(o.text, /主機代抓/);
+    assert.match(o.text, /head-card yellow/);
+    // 舊版代理（沒有 quality / relay）又沒有盒子回報 → 不顯示這一塊
+    delete status.quality;
+    delete status.relay;
+    delete status.probe_ms;
+    o = await call(env, "/admin/partial?name=overview");
+    assert.ok(!o.text.includes("播放品質"));
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+});
+
+await test("2.5：雲端實測 — 帶新版清單標頭；切片 302 到 CDN 雲端抓不到 → 改測主機代抓（?proxy=1）仍算播得出來；清單預覽列出暫停的台", async () => {
+  const env = makeEnv({ config: { version: 1, subscriptionUrl: MAIN } });
+  const realFetch = globalThis.fetch;
+  const base = chainMock([], {}, realFetch);
+  const hdrs = [];
+  const segUrls = [];
+  let cdnOk = false;
+  globalThis.fetch = async (url, init) => {
+    const u = unIp(String(url));
+    hdrs.push(init && init.headers ? init.headers["X-WeiTV-Playlist"] : undefined);
+    if (u.includes("/channel?type=m3u")) {
+      return new Response('#EXTM3U\n#EXT-X-WEITV-PAUSED:7,好消息\n#EXT-X-WEITV-PAUSED:10,八大綜藝台\n#EXTINF:-1 tvg-id="4gtv-4gtv003" tvg-chno="1" group-title="綜合",民視第一台\nhttp://1.2.3.4:5050/?id=4gtv-4gtv003&token=T\n');
+    }
+    if (u.includes("/?id=4gtv-4gtv003")) return new Response("#EXTM3U\n#EXT-X-TARGETDURATION:4\n#EXT-X-START:TIME-OFFSET=-20\n#EXTINF:4,\n/ts/4gtv-4gtv003/seq-1-aaa.ts\n#EXTINF:4,\n/ts/4gtv-4gtv003/seq-2-bbb.ts\n");
+    if (u.includes("/ts/")) {
+      segUrls.push(u);
+      // 沒帶 proxy=1 = 代理回 302 轉去 CDN，雲端機房連那個 CDN 被擋
+      if (!u.includes("proxy=1") && !cdnOk) return new Response("cdn says no", { status: 403 });
+      return new Response(SEG);
+    }
+    return base(url, init);
+  };
+  try {
+    let r = await call(env, "/admin/test", { method: "POST", body: { subscriptionUrl: MAIN } });
+    assert.equal(r.json.ok, true, r.text);
+    assert.equal(r.json.channelCount, 1);
+    assert.deepEqual(r.json.paused, ["好消息", "八大綜藝台"]);
+    assert.equal(r.json.stream.ok, true, JSON.stringify(r.json.stream));
+    assert.equal(r.json.stream.viaProxy, true);
+    assert.equal(r.json.stream.cdnError, "HTTP 403");
+    assert.ok(segUrls.length === 2 && /seq-2-bbb\.ts$/.test(segUrls[0]) && /seq-2-bbb\.ts\?proxy=1$/.test(segUrls[1]), segUrls.join(" "));
+    assert.ok(hdrs.length >= 4 && hdrs.every((h) => h === "2"), "每個對來源的請求都帶 X-WeiTV-Playlist: 2");
+    // CDN 連得到 → 不必代抓
+    cdnOk = true;
+    segUrls.length = 0;
+    r = await call(env, "/admin/test", { method: "POST", body: { subscriptionUrl: MAIN } });
+    assert.equal(r.json.stream.ok, true);
+    assert.ok(!r.json.stream.viaProxy);
+    assert.equal(segUrls.length, 1);
+    // 第三方源（切片不在同一台主機的 /ts/）失敗就是失敗，不亂加參數重試
+    const pr = await import("../src/probe.js");
+    globalThis.fetch = async (url) => {
+      const u = String(url);
+      if (u.includes("list.m3u8")) return new Response("#EXTM3U\n#EXTINF:4,\nhttps://cdn.other.test/a/seg1.ts\n");
+      segUrls.push(u);
+      return new Response("nope", { status: 404 });
+    };
+    segUrls.length = 0;
+    const s = await pr.probeStream("https://tv.other.test/list.m3u8");
+    assert.equal(s.ok, false);
+    assert.match(s.error, /切片回 HTTP 404/);
+    assert.equal(segUrls.length, 1);
+    assert.match(pr.probeText({ ok: true, channel: "民視第一台", m3u8Ms: 800, segMs: 1100, viaProxy: true }), /雲端連不到 CDN，這次測的是主機代抓/);
+  } finally {
+    globalThis.fetch = realFetch;
+  }
 });
 
 console.log(`\n${passed} passed, ${failures.length} failed`);
