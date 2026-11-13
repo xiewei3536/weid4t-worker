@@ -323,6 +323,7 @@ export const ACTION_TEXT = {
   flush_stale: "播放網址失效，已重新解析（不中斷播放）",
   flush_ipchange: "出口 IP 變動，已更新播放網址（不中斷播放）",
   flush_reconnect: "VPN 重連，已更新播放網址（不中斷播放）",
+  flush_upstream: "上游一時不通，已清快取重新解析（不中斷播放）",
   renew_nord_credentials: "Nord 憑證失效，已自動換新",
   restart_nginx: "重啟對外入口 nginx",
 };
