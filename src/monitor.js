@@ -166,10 +166,7 @@ export function selfHealText(ss) {
   const a = typeof sh.forced_reresolves === "number" && sh.forced_reresolves >= 0 ? sh.forced_reresolves : null;
   const b = typeof sh.session_resets === "number" && sh.session_resets >= 0 ? sh.session_resets : null;
   if (a == null && b == null) return "";
-  // 代理 2.4.1：官網（Cloudflare）對全新連線出驗證頁、代理靠原本的連線照常解析 → 提醒這段時間別重啟直播源
-  const fresh = typeof sh.fresh_session_blocked === "number" && sh.fresh_session_blocked > 0 && !sh.web_blocked;
-  return `代理自動修復 ${(a || 0) + (b || 0)} 次（重抓失效網址 ${a || 0}、重設連線 ${b || 0}）`
-    + (fresh ? "；官網曾擋下新連線，這段時間別重啟直播源" : "");
+  return `代理自動修復 ${(a || 0) + (b || 0)} 次（重抓失效網址 ${a || 0}、重設連線 ${b || 0}）`;
 }
 
 function defaultLineState(state) {

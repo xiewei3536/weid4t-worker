@@ -1118,8 +1118,6 @@ await test("2.3：看門狗新處置代碼與原因白話；status.json 的 self
   assert.match(monitor.selfHealText({ self_heal: { forced_reresolves: 3, session_resets: 2 } }), /^代理自動修復 5 次/);
   assert.equal(monitor.selfHealText({ healthy: true }), "");
   assert.equal(monitor.selfHealText({ self_heal: { other: 1 } }), "");
-  assert.match(monitor.selfHealText({ self_heal: { forced_reresolves: 1, session_resets: 0, fresh_session_blocked: 2, web_blocked: false } }), /別重啟直播源$/);
-  assert.doesNotMatch(monitor.selfHealText({ self_heal: { forced_reresolves: 1, session_resets: 0, fresh_session_blocked: 0 } }), /別重啟/);
   const env = makeEnv({ config: { version: 1, subscriptionUrl: MAIN } });
   const realFetch = globalThis.fetch;
   let withHeal = true;
